@@ -14,11 +14,15 @@ export class SceneManager {
 
         this.currentLevel = 0; // 0: 全局, 1: 产线, 2: 单机
         this.furnaces = [];
+        this.batchRenderers = [];
         this.lineConfig = []; // 产线配置（由 setLineConfig 注入）
         this.lineDeviceRanges = []; // 每条产线在 furnaces 数组中的起止索引
         this.disposed = false;
         this.animationFrameId = null;
         this.boundOnWindowResize = this.onWindowResize.bind(this);
+        this.labelsVisible = false;
+        this.frameCount = 0;
+        this.lastFrameTime = performance.now();
 
         this.initScene();
         this.initCamera();
@@ -84,15 +88,14 @@ export class SceneManager {
     }
 
     initRenderer() {
-        this.renderer = new THREE.WebGLRenderer({ antialias: true });
+        this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
         this.renderer.setSize(this.width, this.height);
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
         this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
         this.renderer.toneMappingExposure = 1.0; // 有了真实环境光后，曝光度降回标准值
         
-        // 开启基础软阴影，避免高开销导致的黑屏
-        this.renderer.shadowMap.enabled = true;
-        this.renderer.shadowMap.type = THREE.PCFShadowMap;
+        // 多设备大屏优先保证帧率，默认关闭实时阴影，后续可做质量档位。
+        this.renderer.shadowMap.enabled = false;
         
         this.container.appendChild(this.renderer.domElement);
     }
@@ -121,18 +124,7 @@ export class SceneManager {
         // 主光源，产生基础阴影
         const dirLight = new THREE.DirectionalLight(0xffffff, 2.5);
         dirLight.position.set(30, 40, 20); // 侧上方的厂房顶灯视角
-        dirLight.castShadow = true;
-        // 配置基础阴影相机
-        dirLight.shadow.mapSize.width = 1024;
-        dirLight.shadow.mapSize.height = 1024;
-        dirLight.shadow.camera.near = 0.5;
-        dirLight.shadow.camera.far = 150;
-        const d = 50;
-        dirLight.shadow.camera.left = -d;
-        dirLight.shadow.camera.right = d;
-        dirLight.shadow.camera.top = d;
-        dirLight.shadow.camera.bottom = -d;
-        dirLight.shadow.bias = -0.0005; // 消除阴影条纹伪影
+        dirLight.castShadow = false;
         this.scene.add(dirLight);
     }
 
@@ -151,7 +143,8 @@ export class SceneManager {
         this.raycaster.setFromCamera(this.mouse, this.camera);
         
         // 找出所有可以被点击的炉子
-        const intersects = this.raycaster.intersectObjects(this.furnaces, true);
+        const visibleFurnaces = this.furnaces.filter(furnace => furnace.visible);
+        const intersects = this.raycaster.intersectObjects(visibleFurnaces, true);
 
         if (intersects.length > 0) {
             // 点击到了模型
@@ -182,6 +175,12 @@ export class SceneManager {
         this.scene.add(furnace);
         this.updatables.push(furnace);
         this.furnaces.push(furnace);
+    }
+
+    addBatchRenderer(batchRenderer) {
+        this.scene.add(batchRenderer);
+        this.updatables.push(batchRenderer);
+        this.batchRenderers.push(batchRenderer);
     }
 
     /**
@@ -262,6 +261,7 @@ export class SceneManager {
             f.setLabelVisible(false);
             f.setXRayMode(false);
         });
+        this.labelsVisible = false;
     }
 
     flyToWorkshop(wsIdx) {
@@ -277,6 +277,7 @@ export class SceneManager {
             f.setXRayMode(false);
             f.setLabelVisible(false);
         });
+        this.labelsVisible = false;
     }
 
     flyToLine(globalLineIndex) {
@@ -304,6 +305,7 @@ export class SceneManager {
             f.setXRayMode(false);
             f.setLabelVisible(isMatch);
         });
+        this.labelsVisible = true;
     }
 
     flyToDevice(device) {
@@ -331,6 +333,7 @@ export class SceneManager {
                 f.setXRayMode(false);
             }
         });
+        this.labelsVisible = false;
     }
 
     goUp() {
@@ -417,21 +420,36 @@ export class SceneManager {
         this.camera.aspect = this.width / this.height;
         this.camera.updateProjectionMatrix();
         this.renderer.setSize(this.width, this.height);
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
         this.labelRenderer.setSize(this.width, this.height);
     }
 
     animate() {
         if (this.disposed) return;
         this.animationFrameId = requestAnimationFrame(this.animate.bind(this));
-        const delta = 0.016;
+        const now = performance.now();
+        const delta = Math.min((now - this.lastFrameTime) / 1000, 0.05);
+        this.lastFrameTime = now;
         for (const obj of this.updatables) {
-            if (obj.update) obj.update(delta);
+            if (obj.visible && obj.update) obj.update(delta);
         }
 
         this.controls.update();
         // 恢复原生高性能渲染，不用 Composer
         this.renderer.render(this.scene, this.camera);
-        this.labelRenderer.render(this.scene, this.camera);
+        this.frameCount += 1;
+        if (this.frameCount % 15 === 0) {
+            window.__DASHBOARD_RENDERER_INFO__ = {
+                calls: this.renderer.info.render.calls,
+                triangles: this.renderer.info.render.triangles,
+                lines: this.renderer.info.render.lines,
+                points: this.renderer.info.render.points,
+                pixelRatio: this.renderer.getPixelRatio()
+            };
+        }
+        if (this.labelsVisible) {
+            this.labelRenderer.render(this.scene, this.camera);
+        }
     }
 
     /**
@@ -451,6 +469,9 @@ export class SceneManager {
         // 销毁所有炉子模型的几何体和材质
         this.furnaces.forEach(f => {
             if (f.dispose) f.dispose();
+        });
+        this.batchRenderers.forEach(batchRenderer => {
+            if (batchRenderer.dispose) batchRenderer.dispose();
         });
 
         // 销毁渲染器

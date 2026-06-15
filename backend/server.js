@@ -16,11 +16,17 @@ const uploadsDir = path.join(__dirname, 'uploads', 'models');
 if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
 }
+const assetsDir = path.join(__dirname, 'assets');
+const assetModelsDir = path.join(assetsDir, 'models');
+if (!fs.existsSync(assetModelsDir)) {
+    fs.mkdirSync(assetModelsDir, { recursive: true });
+}
 
 // 中间件
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/assets', express.static(assetsDir));
 
 // API 路由
 app.use('/api/config', require('./routes/config'));

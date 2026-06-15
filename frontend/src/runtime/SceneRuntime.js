@@ -1,5 +1,6 @@
 import { SceneManager } from '../three/SceneManager.js';
 import { applyRealtimeToDeviceModel, createConfiguredDeviceModel } from './DeviceRenderer.js';
+import { createBatchedDeviceRenderer, getBatchableModelInfo } from './BatchDeviceRenderer.js';
 
 function flattenDeviceDefinitions(workshops) {
     const definitions = [];
@@ -39,12 +40,45 @@ export class SceneRuntime {
         this.sceneManager = new SceneManager(this.containerElement, onLevelChange, onDeviceSelect);
 
         const definitions = flattenDeviceDefinitions(workshops || []);
-        const deviceModels = await Promise.all(definitions.map(async (definition) => ({
-            ...definition,
-            deviceModel: await createConfiguredDeviceModel(definition, models || [])
-        })));
+        const results = new Array(definitions.length);
+        const batchGroups = new Map();
 
-        deviceModels.forEach(({ deviceCfg, deviceModel }) => {
+        definitions.forEach((definition, index) => {
+            const modelInfo = getBatchableModelInfo(definition.deviceCfg, models || []);
+            if (!modelInfo) return;
+            const batchKey = `${modelInfo.id}:${modelInfo.file_path}`;
+            if (!batchGroups.has(batchKey)) {
+                batchGroups.set(batchKey, { modelInfo, items: [] });
+            }
+            batchGroups.get(batchKey).items.push({ definition, index });
+        });
+
+        const batchedIndexes = new Set();
+        for (const group of batchGroups.values()) {
+            if (group.items.length < 2) continue;
+            const batch = await createBatchedDeviceRenderer(
+                group.modelInfo,
+                group.items.map(item => item.definition)
+            );
+            this.sceneManager.addBatchRenderer(batch.batchRenderer);
+            group.items.forEach((item, localIndex) => {
+                results[item.index] = {
+                    ...item.definition,
+                    deviceModel: batch.deviceModels[localIndex]
+                };
+                batchedIndexes.add(item.index);
+            });
+        }
+
+        await Promise.all(definitions.map(async (definition, index) => {
+            if (batchedIndexes.has(index)) return;
+            results[index] = {
+                ...definition,
+                deviceModel: await createConfiguredDeviceModel(definition, models || [])
+            };
+        }));
+
+        results.forEach(({ deviceCfg, deviceModel }) => {
             this.sceneManager.addFurnace(deviceModel);
             this.furnaces.set(deviceCfg.id, deviceModel);
             if (onDeviceRegistered) onDeviceRegistered(deviceCfg);

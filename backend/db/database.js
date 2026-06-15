@@ -266,6 +266,8 @@ function seedDefaults() {
         seedSettings();
     }
 
+    seedModelAssets();
+
     // 初始化默认车间
     const workshopsCount = db.prepare('SELECT COUNT(*) as cnt FROM workshops').get();
     if (workshopsCount.cnt === 0) {
@@ -292,7 +294,7 @@ function seedDefaults() {
                     const deviceName = `${globalIdx + 1}# 多用炉`;
                     const posX = (di - 2) * 14;
                     const posZ = -li * 16;
-                    insertDevice.run(deviceId, deviceName, lineId, 'builtin_furnace', posX, 0, posZ, di);
+                    insertDevice.run(deviceId, deviceName, lineId, 'box_atmosphere_furnace', posX, 0, posZ, di);
                 }
             }
         });
@@ -300,6 +302,24 @@ function seedDefaults() {
     }
 
     seedPlatformDefaults();
+}
+
+function seedModelAssets() {
+    db.prepare(`INSERT OR IGNORE INTO models (
+        id, name, file_path, asset_type, tags, default_scale, metadata
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+        'box_atmosphere_furnace',
+        '箱式气氛多用炉低模',
+        '/assets/models/box_atmosphere_furnace.glb',
+        'model',
+        JSON.stringify(['heat_treatment', 'atmosphere_furnace', 'low_poly']),
+        1.0,
+        JSON.stringify({
+            source: 'generated',
+            polygonProfile: 'low_poly',
+            intendedUse: 'realtime_dashboard'
+        })
+    );
 }
 
 function seedPlatformDefaults() {
@@ -329,7 +349,7 @@ function seedPlatformDefaults() {
     const templateCount = db.prepare('SELECT COUNT(*) as cnt FROM device_templates').get();
     if (templateCount.cnt === 0) {
         db.prepare('INSERT INTO device_templates (id, name, model_type, default_config) VALUES (?, ?, ?, ?)')
-            .run('tpl_multipurpose_furnace', '多用炉模板', 'builtin_furnace', JSON.stringify({ category: 'furnace', realtimeProfile: 'heat_treatment' }));
+            .run('tpl_multipurpose_furnace', '多用炉模板', 'box_atmosphere_furnace', JSON.stringify({ category: 'furnace', realtimeProfile: 'heat_treatment' }));
     }
 
     const widgetCount = db.prepare('SELECT COUNT(*) as cnt FROM widgets').get();

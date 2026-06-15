@@ -21,9 +21,17 @@ export class FurnaceModel extends THREE.Group {
         this.userData.id = id;
 
         // 动画状态缓存
-        this.fanRunning = false;
-        this.stirRunning = false;
-        this.oilPumpOn = false;
+        this.fanRunning = null;
+        this.stirRunning = null;
+        this.oilPumpOn = null;
+        this.frontDoorOpen = null;
+        this.middleDoorOpen = null;
+        this.chainForward = null;
+        this.xRayEnabled = null;
+        this.lastTempText = null;
+        this.lastCarbonText = null;
+        this.lastDeviceQuality = null;
+        this.lastAlarm = null;
 
         this.buildModel();
         this.createLabel();
@@ -369,8 +377,8 @@ export class FurnaceModel extends THREE.Group {
         // ===== 16. 开启全局阴影 =====
         this.traverse((child) => {
             if (child.isMesh) {
-                child.castShadow = true;
-                child.receiveShadow = true;
+                child.castShadow = false;
+                child.receiveShadow = false;
             }
         });
     }
@@ -391,6 +399,8 @@ export class FurnaceModel extends THREE.Group {
 
         this.labelObj = new CSS2DObject(div);
         this.labelDiv = div;
+        this.tempEl = div.querySelector(`#temp-${this.furnaceId}`);
+        this.carbonEl = div.querySelector(`#carbon-${this.furnaceId}`);
         this.labelAnchor.add(this.labelObj);
     }
 
@@ -401,12 +411,16 @@ export class FurnaceModel extends THREE.Group {
     }
 
     setXRayMode(enable) {
+        if (this.xRayEnabled === enable) return;
+        this.xRayEnabled = enable;
+
         const targetOpacity = enable ? 0.15 : 1.0;
         const targetDepthWrite = !enable;
 
         const materialsToFade = [this.matBody, this.matBodyDark, this.matDoor, this.matPipe];
         
         materialsToFade.forEach(mat => {
+            gsap.killTweensOf(mat);
             mat.transparent = enable;
             mat.depthWrite = targetDepthWrite;
             gsap.to(mat, { opacity: targetOpacity, duration: 1.0 });
@@ -417,23 +431,37 @@ export class FurnaceModel extends THREE.Group {
 
     updateData(data) {
         // 更新标签数字
-        const tempEl = document.getElementById(`temp-${this.furnaceId}`);
-        const carbonEl = document.getElementById(`carbon-${this.furnaceId}`);
-        if (tempEl) tempEl.innerText = data.analog?.actual_temp ?? '--';
-        if (carbonEl) carbonEl.innerText = data.analog?.actual_carbon ?? '--';
+        const tempText = data.analog?.actual_temp ?? '--';
+        const carbonText = data.analog?.actual_carbon ?? '--';
+        if (this.tempEl && this.lastTempText !== tempText) {
+            this.tempEl.innerText = tempText;
+            this.lastTempText = tempText;
+        }
+        if (this.carbonEl && this.lastCarbonText !== carbonText) {
+            this.carbonEl.innerText = carbonText;
+            this.lastCarbonText = carbonText;
+        }
 
         // 电机状态 → 颜色 + 旋转标记
-        this.fanRunning = data.motors?.fan_motor;
-        this.stirRunning = data.motors?.stir_motor;
-        this.oilPumpOn = data.motors?.oil_pump;
-
-        this.updateMotorColor(this.fanMotorBody, this.fanRunning);
-        this.updateMotorColor(this.stirMotorBody, this.stirRunning);
-        this.updateIndicator(this.oilPumpIndicator, this.oilPumpOn);
+        const nextFanRunning = !!data.motors?.fan_motor;
+        const nextStirRunning = !!data.motors?.stir_motor;
+        const nextOilPumpOn = !!data.motors?.oil_pump;
+        if (this.fanRunning !== nextFanRunning) {
+            this.fanRunning = nextFanRunning;
+            this.updateMotorColor(this.fanMotorBody, this.fanRunning);
+        }
+        if (this.stirRunning !== nextStirRunning) {
+            this.stirRunning = nextStirRunning;
+            this.updateMotorColor(this.stirMotorBody, this.stirRunning);
+        }
+        if (this.oilPumpOn !== nextOilPumpOn) {
+            this.oilPumpOn = nextOilPumpOn;
+            this.updateIndicator(this.oilPumpIndicator, this.oilPumpOn);
+        }
 
         // 门动画
-        this.animateDoor(this.frontDoor, data.doors?.front_door_open, this._frontDoorClosedY);
-        this.animateDoor(this.middleDoor, data.doors?.middle_door_open, this._middleDoorClosedY);
+        this.animateDoor('frontDoorOpen', this.frontDoor, data.doors?.front_door_open, this._frontDoorClosedY);
+        this.animateDoor('middleDoorOpen', this.middleDoor, data.doors?.middle_door_open, this._middleDoorClosedY);
 
         // 推拉链 + 料盘
         this.animateChain(data.mechanisms?.push_chain_forward);
@@ -448,11 +476,16 @@ export class FurnaceModel extends THREE.Group {
 
         // 报警 → 整机变红
         const deviceQuality = this.resolveDeviceQuality(data);
+        const isAlarm = !!data.status?.alarm;
+        if (this.lastDeviceQuality === deviceQuality && this.lastAlarm === isAlarm) return;
+        this.lastDeviceQuality = deviceQuality;
+        this.lastAlarm = isAlarm;
+
         if (deviceQuality === 'bad') {
             this.heatingChamber.material.emissive.setHex(0x552222);
         } else if (deviceQuality === 'stale') {
             this.heatingChamber.material.emissive.setHex(0x554000);
-        } else if (data.status?.alarm) {
+        } else if (isAlarm) {
             this.heatingChamber.material.emissive.setHex(0x550000);
         } else {
             this.heatingChamber.material.emissive.setHex(0x000000);
@@ -488,15 +521,25 @@ export class FurnaceModel extends THREE.Group {
         }
     }
 
-    animateDoor(doorGroup, isOpen, closedY) {
+    animateDoor(stateKey, doorGroup, isOpen, closedY) {
+        const nextOpen = !!isOpen;
+        if (this[stateKey] === nextOpen) return;
+        this[stateKey] = nextOpen;
+
         // 门打开 = 向上升起到炉顶上方
-        const targetY = isOpen ? closedY + 2.8 : closedY;
+        const targetY = nextOpen ? closedY + 2.8 : closedY;
+        gsap.killTweensOf(doorGroup.position);
         gsap.to(doorGroup.position, { y: targetY, duration: 1.2, ease: "power2.inOut" });
     }
 
     animateChain(isForward) {
+        const nextForward = !!isForward;
+        if (this.chainForward === nextForward) return;
+        this.chainForward = nextForward;
+
         // 推拉链推到前室 = Z轴正向移动
-        const targetZ = isForward ? 3 : this._chainBaseZ;
+        const targetZ = nextForward ? 3 : this._chainBaseZ;
+        gsap.killTweensOf(this.pushChain.position);
         gsap.to(this.pushChain.position, { z: targetZ, duration: 2.0, ease: "power1.inOut" });
     }
 

@@ -7,7 +7,7 @@ import { FurnaceModel } from './FurnaceModel.js';
 const loader = new GLTFLoader();
 const modelCache = new Map();
 
-function resolveBackendAssetUrl(filePath) {
+export function resolveBackendAssetUrl(filePath) {
     if (!filePath) return '';
     if (/^https?:\/\//i.test(filePath)) return filePath;
 
@@ -17,7 +17,7 @@ function resolveBackendAssetUrl(filePath) {
     return `${protocol}//${host}:3001${normalizedPath}`;
 }
 
-function loadGltf(url) {
+export function loadGltf(url) {
     if (!modelCache.has(url)) {
         const promise = new Promise((resolve, reject) => {
             loader.load(url, (gltf) => {
@@ -49,8 +49,8 @@ function collectMaterials(object, targetSet) {
     object.traverse((child) => {
         if (!child.isMesh) return;
 
-        child.castShadow = true;
-        child.receiveShadow = true;
+        child.castShadow = false;
+        child.receiveShadow = false;
 
         if (Array.isArray(child.material)) {
             child.material = child.material.map((mat) => mat.clone());
@@ -74,6 +74,10 @@ class ImportedDeviceModel extends THREE.Group {
         this.userData.defaultScale = Number(modelInfo.default_scale || 1);
 
         this.materials = new Set();
+        this.lastTempText = null;
+        this.lastCarbonText = null;
+        this.lastVisualState = null;
+        this.xRayEnabled = null;
         this.createStatusLight();
         this.createLabel();
     }
@@ -130,6 +134,9 @@ class ImportedDeviceModel extends THREE.Group {
     }
 
     setXRayMode(enable) {
+        if (this.xRayEnabled === enable) return;
+        this.xRayEnabled = enable;
+
         const opacity = enable ? 0.25 : 1;
         this.materials.forEach((mat) => {
             mat.transparent = enable;
@@ -140,12 +147,24 @@ class ImportedDeviceModel extends THREE.Group {
     }
 
     updateData(data) {
-        if (this.tempEl) this.tempEl.innerText = data.analog?.actual_temp ?? '--';
-        if (this.carbonEl) this.carbonEl.innerText = data.analog?.actual_carbon ?? '--';
+        const tempText = data.analog?.actual_temp ?? '--';
+        const carbonText = data.analog?.actual_carbon ?? '--';
+        if (this.tempEl && this.lastTempText !== tempText) {
+            this.tempEl.innerText = tempText;
+            this.lastTempText = tempText;
+        }
+        if (this.carbonEl && this.lastCarbonText !== carbonText) {
+            this.carbonEl.innerText = carbonText;
+            this.lastCarbonText = carbonText;
+        }
 
         const deviceQuality = this.resolveDeviceQuality(data);
         const isAlarm = !!data.status?.alarm;
         const isRunning = !!data.status?.running;
+        const visualState = `${deviceQuality}:${isAlarm}:${isRunning}`;
+        if (this.lastVisualState === visualState) return;
+        this.lastVisualState = visualState;
+
         if (deviceQuality === 'bad') {
             this.statusLight.material.color.setHex(0xd96060);
             this.statusLight.material.emissive.setHex(0xd96060);
