@@ -2,6 +2,14 @@ const express = require('express');
 const router = express.Router();
 const { getDb } = require('../db/database');
 
+function nullableNumber(value) {
+    return value === undefined || value === null || value === '' ? null : Number(value);
+}
+
+function numberWithDefault(value, defaultValue) {
+    return value === undefined || value === null || value === '' ? defaultValue : Number(value);
+}
+
 // GET /api/datapoints?device_id=xxx - 获取设备的所有点位映射
 router.get('/', (req, res) => {
     const db = getDb();
@@ -18,16 +26,28 @@ router.get('/', (req, res) => {
 // POST /api/datapoints - 创建点位映射
 router.post('/', (req, res) => {
     const db = getDb();
-    const { device_id, name, label, plc_tag, data_type, unit, alarm_high, alarm_low } = req.body;
+    const {
+        device_id, name, label, plc_tag, data_type, category, value_role,
+        scale, offset, display_format, unit, alarm_high, alarm_low
+    } = req.body;
     if (!device_id || !name || !label || !plc_tag) {
         return res.status(400).json({ error: '设备ID、数据项名称、显示标签和PLC地址不能为空' });
     }
     try {
-        const result = db.prepare(`INSERT INTO data_points (device_id, name, label, plc_tag, data_type, unit, alarm_high, alarm_low) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        const result = db.prepare(`INSERT INTO data_points (
+                        device_id, name, label, plc_tag, data_type, category, value_role,
+                        scale, offset, display_format, unit, alarm_high, alarm_low
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
             device_id, name, label, plc_tag,
-            data_type || 'WORD', unit || '', 
-            alarm_high || null, alarm_low || null
+            data_type || 'WORD',
+            category || '',
+            value_role || '',
+            numberWithDefault(scale, 1),
+            numberWithDefault(offset, 0),
+            display_format || '',
+            unit || '',
+            nullableNumber(alarm_high),
+            nullableNumber(alarm_low)
         );
         res.json({ success: true, id: result.lastInsertRowid });
     } catch (e) {
@@ -38,10 +58,23 @@ router.post('/', (req, res) => {
 // PUT /api/datapoints/:id - 更新点位映射
 router.put('/:id', (req, res) => {
     const db = getDb();
-    const { name, label, plc_tag, data_type, unit, alarm_high, alarm_low } = req.body;
-    db.prepare(`UPDATE data_points SET name=?, label=?, plc_tag=?, data_type=?, unit=?, alarm_high=?, alarm_low=? WHERE id=?`).run(
-        name, label, plc_tag, data_type || 'WORD', unit || '',
-        alarm_high || null, alarm_low || null,
+    const {
+        name, label, plc_tag, data_type, category, value_role,
+        scale, offset, display_format, unit, alarm_high, alarm_low
+    } = req.body;
+    db.prepare(`UPDATE data_points SET
+                name=?, label=?, plc_tag=?, data_type=?, category=?, value_role=?,
+                scale=?, offset=?, display_format=?, unit=?, alarm_high=?, alarm_low=?
+                WHERE id=?`).run(
+        name, label, plc_tag, data_type || 'WORD',
+        category || '',
+        value_role || '',
+        numberWithDefault(scale, 1),
+        numberWithDefault(offset, 0),
+        display_format || '',
+        unit || '',
+        nullableNumber(alarm_high),
+        nullableNumber(alarm_low),
         req.params.id
     );
     res.json({ success: true });
@@ -64,10 +97,26 @@ router.post('/batch', (req, res) => {
 
     const batchSave = db.transaction(() => {
         db.prepare('DELETE FROM data_points WHERE device_id = ?').run(device_id);
-        const insert = db.prepare(`INSERT INTO data_points (device_id, name, label, plc_tag, data_type, unit, alarm_high, alarm_low) 
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+        const insert = db.prepare(`INSERT INTO data_points (
+                                    device_id, name, label, plc_tag, data_type, category, value_role,
+                                    scale, offset, display_format, unit, alarm_high, alarm_low
+                                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
         for (const p of points) {
-            insert.run(device_id, p.name, p.label, p.plc_tag, p.data_type || 'WORD', p.unit || '', p.alarm_high || null, p.alarm_low || null);
+            insert.run(
+                device_id,
+                p.name,
+                p.label,
+                p.plc_tag,
+                p.data_type || 'WORD',
+                p.category || '',
+                p.value_role || '',
+                numberWithDefault(p.scale, 1),
+                numberWithDefault(p.offset, 0),
+                p.display_format || '',
+                p.unit || '',
+                nullableNumber(p.alarm_high),
+                nullableNumber(p.alarm_low)
+            );
         }
     });
 

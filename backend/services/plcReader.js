@@ -239,31 +239,53 @@ class PlcReader {
         info.points.forEach(point => {
             const addr = point.plc_tag;
             const rawValue = rawValues[addr];
-            const value = this._convertValue(rawValue, point.data_type);
+            const convertedValue = this._convertValue(rawValue, point.data_type);
+            const value = this._applyScaleOffset(convertedValue, point);
+            const category = this._resolveCategory(point);
+            const fieldName = point.value_role || point.name;
 
-            // 根据点位名称自动分类到对应的数据组
-            const name = point.name;
-            if (name.includes('temp') || name.includes('carbon') || name.includes('setpoint') || 
-                name.includes('current') || name.includes('pressure') || name.includes('flow')) {
-                data.analog[name] = value;
-            } else if (name.includes('motor') || name.includes('fan') || name.includes('stir') || 
-                       name.includes('pump') || name.includes('oil_pump')) {
-                data.motors[name] = value;
-            } else if (name.includes('door')) {
-                data.doors[name] = value;
-            } else if (name.includes('chain') || name.includes('push') || name.includes('pull') || 
-                       name.includes('mechanism')) {
-                data.mechanisms[name] = value;
-            } else if (name.includes('running') || name.includes('alarm') || name.includes('status') || 
-                       name.includes('fault') || name.includes('ready')) {
-                data.status[name] = value;
-            } else {
-                // 未分类的放入 analog
-                data.analog[name] = value;
-            }
+            data[category][fieldName] = value;
         });
 
         return data;
+    }
+
+    _resolveCategory(point) {
+        const configured = String(point.category || '').trim().toLowerCase();
+        if (['analog', 'status', 'motors', 'doors', 'mechanisms'].includes(configured)) {
+            return configured;
+        }
+
+        // 兼容旧点位：没有配置分类时，仍按名称做兜底推断。
+        const name = String(point.name || '').toLowerCase();
+        if (name.includes('temp') || name.includes('carbon') || name.includes('setpoint') ||
+            name.includes('current') || name.includes('pressure') || name.includes('flow')) {
+            return 'analog';
+        }
+        if (name.includes('motor') || name.includes('fan') || name.includes('stir') ||
+            name.includes('pump') || name.includes('oil_pump')) {
+            return 'motors';
+        }
+        if (name.includes('door')) return 'doors';
+        if (name.includes('chain') || name.includes('push') || name.includes('pull') ||
+            name.includes('mechanism')) {
+            return 'mechanisms';
+        }
+        if (name.includes('running') || name.includes('alarm') || name.includes('status') ||
+            name.includes('fault') || name.includes('ready')) {
+            return 'status';
+        }
+        return 'analog';
+    }
+
+    _applyScaleOffset(value, point) {
+        if (typeof value !== 'number' || Number.isNaN(value)) return value;
+
+        const scale = Number(point.scale ?? 1);
+        const offset = Number(point.offset ?? 0);
+        const safeScale = Number.isFinite(scale) ? scale : 1;
+        const safeOffset = Number.isFinite(offset) ? offset : 0;
+        return parseFloat((value * safeScale + safeOffset).toFixed(3));
     }
 
     _convertValue(rawValue, dataType) {

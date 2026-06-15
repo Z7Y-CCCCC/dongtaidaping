@@ -107,16 +107,43 @@ async function deleteDevice(id) {
 const selectedDeviceForPoints = ref('')
 const dataPoints = ref([])
 const isPointsDirty = ref(false)
+const pointCategories = [
+    { value: '', label: '自动' },
+    { value: 'analog', label: '模拟量' },
+    { value: 'status', label: '状态' },
+    { value: 'motors', label: '电机' },
+    { value: 'doors', label: '炉门' },
+    { value: 'mechanisms', label: '机构' }
+]
 
 async function loadDataPoints() {
     if (!selectedDeviceForPoints.value) { dataPoints.value = []; return }
-    dataPoints.value = await adminApi.getDataPoints(selectedDeviceForPoints.value)
+    const points = await adminApi.getDataPoints(selectedDeviceForPoints.value)
+    dataPoints.value = points.map(p => ({
+        ...p,
+        category: p.category || '',
+        value_role: p.value_role || '',
+        scale: p.scale ?? 1,
+        offset: p.offset ?? 0,
+        display_format: p.display_format || ''
+    }))
     isPointsDirty.value = false
 }
 
 function addDataPoint() {
     dataPoints.value.push({
-        name: '', label: '', plc_tag: '', data_type: 'WORD', unit: '', alarm_high: null, alarm_low: null
+        name: '',
+        label: '',
+        plc_tag: '',
+        data_type: 'WORD',
+        category: '',
+        value_role: '',
+        scale: 1,
+        offset: 0,
+        display_format: '',
+        unit: '',
+        alarm_high: null,
+        alarm_low: null
     })
     isPointsDirty.value = true
 }
@@ -502,37 +529,48 @@ const tabs = [
                     </div>
 
                     <div v-if="selectedDeviceForPoints">
-                        <table class="data-table points-table">
-                            <thead>
-                                <tr>
-                                    <th>数据项名称</th><th>显示标签</th><th>PLC 地址</th>
-                                    <th>数据类型</th><th>单位</th><th>报警上限</th><th>报警下限</th><th></th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <tr v-for="(p, idx) in dataPoints" :key="idx">
-                                    <td><input v-model="p.name" @input="markPointsDirty" class="input input-sm" placeholder="actual_temp" /></td>
-                                    <td><input v-model="p.label" @input="markPointsDirty" class="input input-sm" placeholder="实际温度" /></td>
-                                    <td><input v-model="p.plc_tag" @input="markPointsDirty" class="input input-sm" placeholder="DB1.DBW3000" /></td>
-                                    <td>
-                                        <select v-model="p.data_type" @change="markPointsDirty" class="input input-sm">
-                                            <option value="BOOL">BOOL (DBX)</option>
-                                            <option value="WORD">WORD (DBW)</option>
-                                            <option value="INT">INT (DBW signed)</option>
-                                            <option value="DWORD">DWORD (DBD)</option>
-                                            <option value="REAL">REAL (DBD float)</option>
-                                        </select>
-                                    </td>
-                                    <td><input v-model="p.unit" @input="markPointsDirty" class="input input-sm" placeholder="°C" style="width:60px" /></td>
-                                    <td><input v-model.number="p.alarm_high" @input="markPointsDirty" type="number" class="input input-sm" style="width:80px" /></td>
-                                    <td><input v-model.number="p.alarm_low" @input="markPointsDirty" type="number" class="input input-sm" style="width:80px" /></td>
-                                    <td><button @click="removeDataPoint(idx)" class="btn btn-danger btn-sm">✕</button></td>
-                                </tr>
-                                <tr v-if="dataPoints.length === 0">
-                                    <td colspan="8" style="text-align:center; padding: 20px; color: #8c8c8c;">该设备暂无点位配置，请手动添加或从其他设备复制。</td>
-                                </tr>
-                            </tbody>
-                        </table>
+                        <div class="table-scroll">
+                            <table class="data-table points-table">
+                                <thead>
+                                    <tr>
+                                        <th>数据项名称</th><th>显示标签</th><th>PLC 地址</th>
+                                        <th>数据类型</th><th>分类</th><th>输出字段</th>
+                                        <th>比例</th><th>偏移</th><th>单位</th><th>报警上限</th><th>报警下限</th><th></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="(p, idx) in dataPoints" :key="idx">
+                                        <td><input v-model="p.name" @input="markPointsDirty" class="input input-sm" placeholder="actual_temp" /></td>
+                                        <td><input v-model="p.label" @input="markPointsDirty" class="input input-sm" placeholder="实际温度" /></td>
+                                        <td><input v-model="p.plc_tag" @input="markPointsDirty" class="input input-sm" placeholder="DB1.DBW3000" /></td>
+                                        <td>
+                                            <select v-model="p.data_type" @change="markPointsDirty" class="input input-sm">
+                                                <option value="BOOL">BOOL (DBX)</option>
+                                                <option value="WORD">WORD (DBW)</option>
+                                                <option value="INT">INT (DBW signed)</option>
+                                                <option value="DWORD">DWORD (DBD)</option>
+                                                <option value="REAL">REAL (DBD float)</option>
+                                            </select>
+                                        </td>
+                                        <td>
+                                            <select v-model="p.category" @change="markPointsDirty" class="input input-sm">
+                                                <option v-for="category in pointCategories" :key="category.value" :value="category.value">{{ category.label }}</option>
+                                            </select>
+                                        </td>
+                                        <td><input v-model="p.value_role" @input="markPointsDirty" class="input input-sm" placeholder="默认同名称" /></td>
+                                        <td><input v-model.number="p.scale" @input="markPointsDirty" type="number" step="0.001" class="input input-sm number-input" /></td>
+                                        <td><input v-model.number="p.offset" @input="markPointsDirty" type="number" step="0.001" class="input input-sm number-input" /></td>
+                                        <td><input v-model="p.unit" @input="markPointsDirty" class="input input-sm unit-input" placeholder="°C" /></td>
+                                        <td><input v-model.number="p.alarm_high" @input="markPointsDirty" type="number" class="input input-sm number-input" /></td>
+                                        <td><input v-model.number="p.alarm_low" @input="markPointsDirty" type="number" class="input input-sm number-input" /></td>
+                                        <td><button @click="removeDataPoint(idx)" class="btn btn-danger btn-sm">✕</button></td>
+                                    </tr>
+                                    <tr v-if="dataPoints.length === 0">
+                                        <td colspan="12" style="text-align:center; padding: 20px; color: #8c8c8c;">该设备暂无点位配置，请手动添加或从其他设备复制。</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
 
                         <div style="margin-top:15px;display:flex; justify-content: space-between; align-items: center;">
                             <button @click="addDataPoint" class="btn">+ 手动添加数据项</button>
@@ -764,8 +802,17 @@ const tabs = [
 .data-table tbody tr:hover { background: #fafafa; }
 .data-table code { color: #c41d7f; background: #fff0f6; border: 1px solid #ffadd2; padding: 2px 6px; border-radius: 3px; font-family: monospace; }
 
+.table-scroll {
+    width: 100%;
+    overflow-x: auto;
+}
+.points-table {
+    min-width: 1320px;
+}
 .points-table td { padding: 8px 4px; }
 .points-table .input-sm { width: 100%; }
+.points-table .number-input { width: 90px; }
+.points-table .unit-input { width: 70px; }
 
 .device-group { margin-bottom: 40px; }
 .group-title { color: #262626; font-size: 16px; margin-bottom: 16px; font-weight: 500; padding-left: 10px; border-left: 4px solid #1890ff; }

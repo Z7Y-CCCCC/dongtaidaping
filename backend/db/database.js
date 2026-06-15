@@ -59,6 +59,11 @@ function initTables() {
             label TEXT NOT NULL,
             plc_tag TEXT NOT NULL,
             data_type TEXT DEFAULT 'WORD',
+            category TEXT DEFAULT '',
+            value_role TEXT DEFAULT '',
+            scale REAL DEFAULT 1,
+            offset REAL DEFAULT 0,
+            display_format TEXT DEFAULT '',
             unit TEXT DEFAULT '',
             alarm_high REAL,
             alarm_low REAL
@@ -81,11 +86,19 @@ function initTables() {
         );
     `);
 
-    // 数据库迁移：如果旧的 lines 表没有 workshop_id，则增加该字段
-    const columns = db.prepare("PRAGMA table_info(lines)").all();
-    const hasWorkshopId = columns.some(c => c.name === 'workshop_id');
-    if (!hasWorkshopId) {
-        db.prepare("ALTER TABLE lines ADD COLUMN workshop_id TEXT REFERENCES workshops(id) ON DELETE CASCADE").run();
+    ensureColumn('lines', 'workshop_id', 'TEXT REFERENCES workshops(id) ON DELETE CASCADE');
+    ensureColumn('data_points', 'category', "TEXT DEFAULT ''");
+    ensureColumn('data_points', 'value_role', "TEXT DEFAULT ''");
+    ensureColumn('data_points', 'scale', 'REAL DEFAULT 1');
+    ensureColumn('data_points', 'offset', 'REAL DEFAULT 0');
+    ensureColumn('data_points', 'display_format', "TEXT DEFAULT ''");
+}
+
+function ensureColumn(tableName, columnName, definition) {
+    const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
+    const exists = columns.some(c => c.name === columnName);
+    if (!exists) {
+        db.prepare(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`).run();
     }
 }
 
