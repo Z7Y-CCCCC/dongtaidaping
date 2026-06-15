@@ -24,6 +24,9 @@ class DataEngine {
         this.simulator = null;
         this.currentMode = null;
         this.plcStatus = { status: 'idle', message: '未启动' };
+        this.alarmState = new Map();
+        this.lastMetricSnapshotAt = 0;
+        this.metricSnapshotIntervalMs = 5000;
     }
 
     /**
@@ -88,6 +91,91 @@ class DataEngine {
         };
     }
 
+    _publishRealtimeData(deviceDataArray) {
+        if (!Array.isArray(deviceDataArray) || deviceDataArray.length === 0) return;
+        this._recordMetrics(deviceDataArray);
+        this._recordAlarmEvents(deviceDataArray);
+        this.wsServer.broadcastDeviceData(deviceDataArray);
+    }
+
+    _recordMetrics(deviceDataArray) {
+        try {
+            const now = Date.now();
+            if (now - this.lastMetricSnapshotAt < this.metricSnapshotIntervalMs) return;
+            this.lastMetricSnapshotAt = now;
+
+            const db = getDb();
+            const totalDevices = deviceDataArray.length;
+            const runningDevices = deviceDataArray.filter(d => !!d.status?.running).length;
+            const alarmDevices = deviceDataArray.filter(d => !!d.status?.alarm).length;
+            const onlineDevices = deviceDataArray.filter(d => this._deviceQuality(d) !== 'bad').length;
+            const avgTemp = this._avg(deviceDataArray.map(d => Number(d.analog?.actual_temp)).filter(Number.isFinite));
+            const currentOutput = Math.round(runningDevices * 180 + Math.max(0, avgTemp - 760));
+            const dailyTarget = Math.max(totalDevices * 250, 1);
+            const overallOee = totalDevices ? Math.max(0, Math.min(99.9, (runningDevices / totalDevices) * 92 - alarmDevices * 4)) : 0;
+            const energyConsumption = Math.round((avgTemp || 0) * Math.max(runningDevices, 1) * 0.72);
+
+            db.prepare(`INSERT INTO metric_snapshots (
+                current_output, daily_target, overall_oee, energy_consumption,
+                running_devices, alarm_devices, online_devices, total_devices
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+                currentOutput,
+                dailyTarget,
+                parseFloat(overallOee.toFixed(1)),
+                energyConsumption,
+                runningDevices,
+                alarmDevices,
+                onlineDevices,
+                totalDevices
+            );
+        } catch (e) {
+            console.warn('[DataEngine] 指标快照写入失败:', e.message);
+        }
+    }
+
+    _recordAlarmEvents(deviceDataArray) {
+        try {
+            const db = getDb();
+            const insertEvent = db.prepare(`INSERT INTO event_logs (
+                event_type, level, source_id, title, message, value, quality
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+
+            deviceDataArray.forEach(deviceData => {
+                const id = deviceData.furnace_id;
+                const alarm = !!deviceData.status?.alarm;
+                const previous = this.alarmState.get(id) || false;
+
+                if (alarm !== previous) {
+                    insertEvent.run(
+                        'alarm',
+                        alarm ? 'critical' : 'info',
+                        id,
+                        alarm ? `${deviceData.furnace_name || id} 报警触发` : `${deviceData.furnace_name || id} 报警恢复`,
+                        alarm ? '设备实时数据出现报警状态' : '报警状态已恢复',
+                        String(alarm),
+                        this._deviceQuality(deviceData)
+                    );
+                    this.alarmState.set(id, alarm);
+                }
+            });
+        } catch (e) {
+            console.warn('[DataEngine] 事件履历写入失败:', e.message);
+        }
+    }
+
+    _deviceQuality(deviceData) {
+        const groups = deviceData.quality || {};
+        const values = Object.values(groups).flatMap(group => Object.values(group || {}));
+        if (values.includes('bad')) return 'bad';
+        if (values.includes('stale')) return 'stale';
+        return 'good';
+    }
+
+    _avg(values) {
+        if (!values.length) return 0;
+        return values.reduce((sum, value) => sum + value, 0) / values.length;
+    }
+
     // ==================== 内部启动方法 ====================
 
     /**
@@ -101,7 +189,7 @@ class DataEngine {
         this.mqttBridge.start(
             // 收到外部 MQTT 数据时也推给 WebSocket（兼容外部数据源）
             (externalData) => {
-                this.wsServer.broadcastDeviceData([externalData]);
+                this._publishRealtimeData([externalData]);
             },
             (statusInfo) => {
                 console.log(`[MqttBridge] ${statusInfo.status}: ${statusInfo.message}`);
@@ -118,7 +206,7 @@ class DataEngine {
                     this.mqttBridge.publishDeviceData(deviceDataArray);
                 }
                 // b. 同时直接 WebSocket 推送（不依赖 MQTT 回环）
-                this.wsServer.broadcastDeviceData(deviceDataArray);
+                this._publishRealtimeData(deviceDataArray);
             },
             (statusInfo) => {
                 this.plcStatus = statusInfo;
@@ -136,7 +224,7 @@ class DataEngine {
         this.plcReader = new PlcReader();
         this.plcReader.start(
             (deviceDataArray) => {
-                this.wsServer.broadcastDeviceData(deviceDataArray);
+                this._publishRealtimeData(deviceDataArray);
             },
             (statusInfo) => {
                 this.plcStatus = statusInfo;
@@ -154,7 +242,7 @@ class DataEngine {
         this.simulator = new Simulator();
         this.simulator.start(
             (deviceDataArray) => {
-                this.wsServer.broadcastDeviceData(deviceDataArray);
+                this._publishRealtimeData(deviceDataArray);
             },
             (statusInfo) => {
                 this.plcStatus = statusInfo;

@@ -137,6 +137,38 @@ class Simulator {
                 },
                 mechanisms: {
                     push_chain_forward: state.push_chain_forward
+                },
+                quality: {
+                    analog: {
+                        actual_temp: 'good',
+                        setpoint_temp: 'good',
+                        actual_carbon: 'good',
+                        setpoint_carbon: 'good'
+                    },
+                    status: {
+                        running: 'good',
+                        alarm: 'good'
+                    },
+                    motors: {
+                        fan_motor: 'good',
+                        stir_motor: 'good',
+                        oil_pump: 'good'
+                    },
+                    doors: {
+                        front_door_open: 'good',
+                        middle_door_open: 'good'
+                    },
+                    mechanisms: {
+                        push_chain_forward: 'good'
+                    }
+                },
+                pointMeta: {
+                    'analog.actual_temp': { label: '实际温度', unit: '°C', display_format: '0.0' },
+                    'analog.setpoint_temp': { label: '设定温度', unit: '°C', display_format: '0' },
+                    'analog.actual_carbon': { label: '实际碳势', unit: '%', display_format: '0.000' },
+                    'analog.setpoint_carbon': { label: '设定碳势', unit: '%', display_format: '0.000' },
+                    'status.running': { label: '运行状态', unit: '', display_format: '' },
+                    'status.alarm': { label: '报警状态', unit: '', display_format: '' }
                 }
             });
         });

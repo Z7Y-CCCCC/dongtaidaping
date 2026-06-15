@@ -28,7 +28,7 @@ router.post('/', (req, res) => {
     const db = getDb();
     const {
         device_id, name, label, plc_tag, data_type, category, value_role,
-        scale, offset, display_format, unit, alarm_high, alarm_low
+        quality, scale, offset, expression, display_format, unit, alarm_high, alarm_low
     } = req.body;
     if (!device_id || !name || !label || !plc_tag) {
         return res.status(400).json({ error: '设备ID、数据项名称、显示标签和PLC地址不能为空' });
@@ -36,14 +36,16 @@ router.post('/', (req, res) => {
     try {
         const result = db.prepare(`INSERT INTO data_points (
                         device_id, name, label, plc_tag, data_type, category, value_role,
-                        scale, offset, display_format, unit, alarm_high, alarm_low
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+                        quality, scale, offset, expression, display_format, unit, alarm_high, alarm_low
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
             device_id, name, label, plc_tag,
             data_type || 'WORD',
             category || '',
             value_role || '',
+            quality || 'good',
             numberWithDefault(scale, 1),
             numberWithDefault(offset, 0),
+            expression || '',
             display_format || '',
             unit || '',
             nullableNumber(alarm_high),
@@ -60,17 +62,19 @@ router.put('/:id', (req, res) => {
     const db = getDb();
     const {
         name, label, plc_tag, data_type, category, value_role,
-        scale, offset, display_format, unit, alarm_high, alarm_low
+        quality, scale, offset, expression, display_format, unit, alarm_high, alarm_low
     } = req.body;
     db.prepare(`UPDATE data_points SET
-                name=?, label=?, plc_tag=?, data_type=?, category=?, value_role=?,
-                scale=?, offset=?, display_format=?, unit=?, alarm_high=?, alarm_low=?
+                name=?, label=?, plc_tag=?, data_type=?, category=?, value_role=?, quality=?,
+                scale=?, offset=?, expression=?, display_format=?, unit=?, alarm_high=?, alarm_low=?
                 WHERE id=?`).run(
         name, label, plc_tag, data_type || 'WORD',
         category || '',
         value_role || '',
+        quality || 'good',
         numberWithDefault(scale, 1),
         numberWithDefault(offset, 0),
+        expression || '',
         display_format || '',
         unit || '',
         nullableNumber(alarm_high),
@@ -99,8 +103,8 @@ router.post('/batch', (req, res) => {
         db.prepare('DELETE FROM data_points WHERE device_id = ?').run(device_id);
         const insert = db.prepare(`INSERT INTO data_points (
                                     device_id, name, label, plc_tag, data_type, category, value_role,
-                                    scale, offset, display_format, unit, alarm_high, alarm_low
-                                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+                                    quality, scale, offset, expression, display_format, unit, alarm_high, alarm_low
+                                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
         for (const p of points) {
             insert.run(
                 device_id,
@@ -110,8 +114,10 @@ router.post('/batch', (req, res) => {
                 p.data_type || 'WORD',
                 p.category || '',
                 p.value_role || '',
+                p.quality || 'good',
                 numberWithDefault(p.scale, 1),
                 numberWithDefault(p.offset, 0),
+                p.expression || '',
                 p.display_format || '',
                 p.unit || '',
                 nullableNumber(p.alarm_high),

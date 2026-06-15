@@ -233,21 +233,44 @@ class PlcReader {
             status: {},
             motors: {},
             doors: {},
-            mechanisms: {}
+            mechanisms: {},
+            quality: {
+                analog: {},
+                status: {},
+                motors: {},
+                doors: {},
+                mechanisms: {}
+            },
+            pointMeta: {}
         };
 
         info.points.forEach(point => {
             const addr = point.plc_tag;
             const rawValue = rawValues[addr];
             const convertedValue = this._convertValue(rawValue, point.data_type);
-            const value = this._applyScaleOffset(convertedValue, point);
+            const scaledValue = this._applyScaleOffset(convertedValue, point);
+            const value = this._applyExpression(scaledValue, point);
             const category = this._resolveCategory(point);
             const fieldName = point.value_role || point.name;
+            const quality = this._resolveQuality(rawValue, point);
 
             data[category][fieldName] = value;
+            data.quality[category][fieldName] = quality;
+            data.pointMeta[`${category}.${fieldName}`] = {
+                label: point.label,
+                unit: point.unit || '',
+                display_format: point.display_format || ''
+            };
         });
 
         return data;
+    }
+
+    _resolveQuality(rawValue, point) {
+        if (rawValue === undefined || rawValue === null) return 'bad';
+        const configured = String(point.quality || '').trim().toLowerCase();
+        if (['good', 'stale', 'bad'].includes(configured)) return configured;
+        return 'good';
     }
 
     _resolveCategory(point) {
@@ -286,6 +309,22 @@ class PlcReader {
         const safeScale = Number.isFinite(scale) ? scale : 1;
         const safeOffset = Number.isFinite(offset) ? offset : 0;
         return parseFloat((value * safeScale + safeOffset).toFixed(3));
+    }
+
+    _applyExpression(value, point) {
+        const expression = String(point.expression || '').trim();
+        if (!expression || typeof value !== 'number' || Number.isNaN(value)) return value;
+
+        // 只允许围绕 x 的基础四则运算，避免把点位表达式变成任意脚本入口。
+        if (!/^[xX0-9+\-*/().\s]+$/.test(expression)) return value;
+
+        try {
+            const fn = new Function('x', `"use strict"; return (${expression});`);
+            const result = Number(fn(value));
+            return Number.isFinite(result) ? parseFloat(result.toFixed(3)) : value;
+        } catch (e) {
+            return value;
+        }
     }
 
     _convertValue(rawValue, dataType) {

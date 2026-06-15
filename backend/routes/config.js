@@ -2,6 +2,15 @@ const express = require('express');
 const router = express.Router();
 const { getDb } = require('../db/database');
 
+function safeJsonParse(value, fallback) {
+    if (!value) return fallback;
+    try {
+        return JSON.parse(value);
+    } catch (e) {
+        return fallback;
+    }
+}
+
 // GET /api/config - 输出完整的工厂配置（大屏前端启动时拉取）
 router.get('/', (req, res) => {
     const db = getDb();
@@ -43,11 +52,34 @@ router.get('/', (req, res) => {
 
     // 3. 模型库
     const models = db.prepare('SELECT * FROM models').all();
+    const activeProject = db.prepare('SELECT * FROM projects WHERE is_active = 1 LIMIT 1').get()
+        || db.prepare('SELECT * FROM projects ORDER BY created_at ASC LIMIT 1').get();
+    const activeScene = activeProject
+        ? (db.prepare('SELECT * FROM scenes WHERE project_id = ? AND is_active = 1 LIMIT 1').get(activeProject.id)
+            || db.prepare('SELECT * FROM scenes WHERE project_id = ? ORDER BY sort_order ASC LIMIT 1').get(activeProject.id))
+        : null;
+    const widgets = activeScene
+        ? db.prepare('SELECT * FROM widgets WHERE scene_id = ? ORDER BY sort_order ASC').all(activeScene.id)
+        : [];
 
     res.json({
         settings,
         workshops: workshopsWithLines,
-        models
+        models,
+        platform: {
+            activeProject,
+            activeScene: activeScene ? {
+                ...activeScene,
+                layout: safeJsonParse(activeScene.layout_json, {}),
+                camera: safeJsonParse(activeScene.camera_json, {}),
+                theme: safeJsonParse(activeScene.theme_json, {})
+            } : null,
+            widgets: widgets.map(widget => ({
+                ...widget,
+                config: safeJsonParse(widget.config_json, {}),
+                binding: safeJsonParse(widget.binding_json, {})
+            }))
+        }
     });
 });
 

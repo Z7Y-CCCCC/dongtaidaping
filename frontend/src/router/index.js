@@ -1,10 +1,9 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import App from '../App.vue'
-import AdminPanel from '../views/AdminPanel.vue'
 
 const routes = [
     { path: '/', component: App },
-    { path: '/admin', component: AdminPanel }
+    { path: '/admin', component: () => import('../views/AdminPanel.vue') }
 ]
 
 const router = createRouter({

@@ -1,9 +1,11 @@
 import * as THREE from 'three';
 import { CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { clone as cloneObject3D } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { FurnaceModel } from './FurnaceModel.js';
 
 const loader = new GLTFLoader();
+const modelCache = new Map();
 
 function resolveBackendAssetUrl(filePath) {
     if (!filePath) return '';
@@ -16,9 +18,21 @@ function resolveBackendAssetUrl(filePath) {
 }
 
 function loadGltf(url) {
-    return new Promise((resolve, reject) => {
-        loader.load(url, resolve, undefined, reject);
-    });
+    if (!modelCache.has(url)) {
+        const promise = new Promise((resolve, reject) => {
+            loader.load(url, (gltf) => {
+                const root = gltf.scene || gltf.scenes?.[0];
+                if (!root) {
+                    reject(new Error('模型文件中没有可用场景'));
+                    return;
+                }
+                normalizeModelRoot(root);
+                resolve(root);
+            }, undefined, reject);
+        });
+        modelCache.set(url, promise);
+    }
+    return modelCache.get(url);
 }
 
 function normalizeModelRoot(root) {
@@ -66,11 +80,9 @@ class ImportedDeviceModel extends THREE.Group {
 
     async load() {
         const url = resolveBackendAssetUrl(this.modelInfo.file_path);
-        const gltf = await loadGltf(url);
-        const root = gltf.scene || gltf.scenes?.[0];
-        if (!root) throw new Error('模型文件中没有可用场景');
+        const cachedRoot = await loadGltf(url);
+        const root = cloneObject3D(cachedRoot);
 
-        normalizeModelRoot(root);
         collectMaterials(root, this.materials);
         this.modelRoot = root;
         this.add(root);
@@ -131,9 +143,18 @@ class ImportedDeviceModel extends THREE.Group {
         if (this.tempEl) this.tempEl.innerText = data.analog?.actual_temp ?? '--';
         if (this.carbonEl) this.carbonEl.innerText = data.analog?.actual_carbon ?? '--';
 
+        const deviceQuality = this.resolveDeviceQuality(data);
         const isAlarm = !!data.status?.alarm;
         const isRunning = !!data.status?.running;
-        if (isAlarm) {
+        if (deviceQuality === 'bad') {
+            this.statusLight.material.color.setHex(0xd96060);
+            this.statusLight.material.emissive.setHex(0xd96060);
+            this.statusLight.material.emissiveIntensity = 0.75;
+        } else if (deviceQuality === 'stale') {
+            this.statusLight.material.color.setHex(0xf0b35a);
+            this.statusLight.material.emissive.setHex(0xf0b35a);
+            this.statusLight.material.emissiveIntensity = 0.55;
+        } else if (isAlarm) {
             this.statusLight.material.color.setHex(0xff3333);
             this.statusLight.material.emissive.setHex(0xff3333);
             this.statusLight.material.emissiveIntensity = 0.9;
@@ -146,6 +167,13 @@ class ImportedDeviceModel extends THREE.Group {
             this.statusLight.material.emissive.setHex(0x000000);
             this.statusLight.material.emissiveIntensity = 0;
         }
+    }
+
+    resolveDeviceQuality(data) {
+        const values = Object.values(data.quality || {}).flatMap(group => Object.values(group || {}));
+        if (values.includes('bad')) return 'bad';
+        if (values.includes('stale')) return 'stale';
+        return 'good';
     }
 
     update() {}

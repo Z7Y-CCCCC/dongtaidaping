@@ -419,8 +419,8 @@ export class FurnaceModel extends THREE.Group {
         // 更新标签数字
         const tempEl = document.getElementById(`temp-${this.furnaceId}`);
         const carbonEl = document.getElementById(`carbon-${this.furnaceId}`);
-        if (tempEl) tempEl.innerText = data.analog?.actual_temp || '--';
-        if (carbonEl) carbonEl.innerText = data.analog?.actual_carbon || '--';
+        if (tempEl) tempEl.innerText = data.analog?.actual_temp ?? '--';
+        if (carbonEl) carbonEl.innerText = data.analog?.actual_carbon ?? '--';
 
         // 电机状态 → 颜色 + 旋转标记
         this.fanRunning = data.motors?.fan_motor;
@@ -447,11 +447,23 @@ export class FurnaceModel extends THREE.Group {
         }
 
         // 报警 → 整机变红
-        if (data.status?.alarm) {
+        const deviceQuality = this.resolveDeviceQuality(data);
+        if (deviceQuality === 'bad') {
+            this.heatingChamber.material.emissive.setHex(0x552222);
+        } else if (deviceQuality === 'stale') {
+            this.heatingChamber.material.emissive.setHex(0x554000);
+        } else if (data.status?.alarm) {
             this.heatingChamber.material.emissive.setHex(0x550000);
         } else {
             this.heatingChamber.material.emissive.setHex(0x000000);
         }
+    }
+
+    resolveDeviceQuality(data) {
+        const values = Object.values(data.quality || {}).flatMap(group => Object.values(group || {}));
+        if (values.includes('bad')) return 'bad';
+        if (values.includes('stale')) return 'stale';
+        return 'good';
     }
 
     updateMotorColor(motorMesh, isRunning) {

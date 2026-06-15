@@ -36,24 +36,44 @@ export class SceneManager {
     initScene() {
         this.scene = new THREE.Scene();
         
-        // 模拟真实的明亮车间环境色（真实车间不会那么白，带一点深灰蓝）
-        const envColor = 0x8a9ba8; 
+        // 真实车间观感：偏暖灰环境、环氧地坪、通道标线和尺度网格。
+        const envColor = 0x59636c;
         this.scene.background = new THREE.Color(envColor);
-        this.scene.fog = new THREE.FogExp2(envColor, 0.005); 
+        this.scene.fog = new THREE.FogExp2(envColor, 0.0035);
 
-        // 添加真实的物理地面，模拟车间环氧树脂地坪
         const groundGeo = new THREE.PlaneGeometry(500, 500);
         const groundMat = new THREE.MeshStandardMaterial({
-            color: 0x5a636b,      // 调整为偏深的灰色，压住画面重心
-            roughness: 0.4,       // 稍微粗糙一点，模拟真实地面
+            color: 0x3f464d,
+            roughness: 0.52,
             metalness: 0.1,
             depthWrite: true
         });
         const ground = new THREE.Mesh(groundGeo, groundMat);
         ground.rotation.x = -Math.PI / 2;
         ground.position.y = -0.1;
-        ground.receiveShadow = true; // 地面接收阴影
+        ground.receiveShadow = true;
         this.scene.add(ground);
+
+        const grid = new THREE.GridHelper(420, 42, 0x6f7b84, 0x4c545c);
+        grid.position.y = -0.085;
+        grid.material.opacity = 0.32;
+        grid.material.transparent = true;
+        this.scene.add(grid);
+
+        const aisleMat = new THREE.MeshStandardMaterial({ color: 0x2d3338, roughness: 0.65, metalness: 0.05 });
+        const aisle = new THREE.Mesh(new THREE.PlaneGeometry(420, 8), aisleMat);
+        aisle.rotation.x = -Math.PI / 2;
+        aisle.position.set(0, -0.075, 8);
+        aisle.receiveShadow = true;
+        this.scene.add(aisle);
+
+        const lineMat = new THREE.MeshBasicMaterial({ color: 0xf0b35a });
+        [-4.1, 4.1].forEach(z => {
+            const line = new THREE.Mesh(new THREE.PlaneGeometry(420, 0.18), lineMat);
+            line.rotation.x = -Math.PI / 2;
+            line.position.set(0, -0.065, 8 + z);
+            this.scene.add(line);
+        });
     }
 
     initCamera() {

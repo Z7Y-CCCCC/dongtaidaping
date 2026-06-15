@@ -29,6 +29,7 @@ app.use('/api/lines', require('./routes/lines'));
 app.use('/api/devices', require('./routes/devices'));
 app.use('/api/datapoints', require('./routes/datapoints'));
 app.use('/api/settings', require('./routes/settings'));
+app.use('/api/platform', require('./routes/platform'));
 
 // 模型文件上传 (使用 multer)
 const multer = require('multer');
@@ -59,15 +60,20 @@ app.post('/api/models/upload', upload.single('modelFile'), (req, res) => {
     }
     const { getDb } = require('./db/database');
     const db = getDb();
-    const { id, name } = req.body;
+    const { id, name, asset_type, tags, metadata, default_scale } = req.body;
     const filePath = `/uploads/models/${req.file.filename}`;
 
     try {
-        db.prepare('INSERT OR REPLACE INTO models (id, name, file_path, default_scale) VALUES (?, ?, ?, ?)').run(
+        db.prepare(`INSERT OR REPLACE INTO models (
+            id, name, file_path, asset_type, tags, default_scale, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
             id || req.file.filename.replace(/\.[^.]+$/, ''),
             name || req.file.originalname,
             filePath,
-            1.0
+            asset_type || 'model',
+            tags || '[]',
+            Number.isFinite(Number(default_scale)) ? Number(default_scale) : 1.0,
+            metadata || '{}'
         );
         res.json({ success: true, filePath });
     } catch (e) {
@@ -97,7 +103,12 @@ app.delete('/api/models/:id', (req, res) => {
     const db = getDb();
     const model = db.prepare('SELECT * FROM models WHERE id = ?').get(req.params.id);
     if (model && model.file_path) {
-        const fullPath = path.join(__dirname, model.file_path);
+        const relativePath = model.file_path.replace(/^[/\\]+/, '');
+        const fullPath = path.resolve(__dirname, relativePath);
+        const allowedRoot = path.resolve(uploadsDir);
+        if (fullPath !== allowedRoot && !fullPath.startsWith(allowedRoot + path.sep)) {
+            return res.status(400).json({ error: '模型文件路径不合法' });
+        }
         if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
     }
     db.prepare('DELETE FROM models WHERE id = ?').run(req.params.id);

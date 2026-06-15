@@ -2,6 +2,15 @@ const express = require('express');
 const router = express.Router();
 const { getDb } = require('../db/database');
 
+function numberWithDefault(value, defaultValue) {
+    return value === undefined || value === null || value === '' ? defaultValue : Number(value);
+}
+
+function stringifyJson(value) {
+    if (typeof value === 'string') return value;
+    return JSON.stringify(value || {});
+}
+
 // GET /api/devices - 获取所有设备（可按产线过滤）
 router.get('/', (req, res) => {
     const db = getDb();
@@ -28,18 +37,26 @@ router.get('/:id', (req, res) => {
 // POST /api/devices - 创建设备
 router.post('/', (req, res) => {
     const db = getDb();
-    const { id, name, line_id, model_type, model_file, pos_x, pos_y, pos_z, rotation_y, scale, sort_order } = req.body;
+    const { id, name, line_id, model_type, model_file, template_id, instance_config, pos_x, pos_y, pos_z, rotation_y, scale, sort_order } = req.body;
     if (!id || !name || !line_id) {
         return res.status(400).json({ error: '设备ID、名称和所属产线不能为空' });
     }
     try {
-        db.prepare(`INSERT INTO devices (id, name, line_id, model_type, model_file, pos_x, pos_y, pos_z, rotation_y, scale, sort_order) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        db.prepare(`INSERT INTO devices (
+                        id, name, line_id, model_type, model_file, template_id, instance_config,
+                        pos_x, pos_y, pos_z, rotation_y, scale, sort_order
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
             id, name, line_id, 
             model_type || 'builtin_furnace', 
             model_file || null,
-            pos_x || 0, pos_y || 0, pos_z || 0, 
-            rotation_y || 0, scale || 1.0, sort_order || 0
+            template_id || '',
+            stringifyJson(instance_config),
+            numberWithDefault(pos_x, 0),
+            numberWithDefault(pos_y, 0),
+            numberWithDefault(pos_z, 0),
+            numberWithDefault(rotation_y, 0),
+            numberWithDefault(scale, 1.0),
+            numberWithDefault(sort_order, 0)
         );
         res.json({ success: true, id });
     } catch (e) {
@@ -50,12 +67,19 @@ router.post('/', (req, res) => {
 // PUT /api/devices/:id - 更新设备
 router.put('/:id', (req, res) => {
     const db = getDb();
-    const { name, line_id, model_type, model_file, pos_x, pos_y, pos_z, rotation_y, scale, sort_order } = req.body;
-    db.prepare(`UPDATE devices SET name=?, line_id=?, model_type=?, model_file=?, 
-                pos_x=?, pos_y=?, pos_z=?, rotation_y=?, scale=?, sort_order=? WHERE id=?`).run(
+    const { name, line_id, model_type, model_file, template_id, instance_config, pos_x, pos_y, pos_z, rotation_y, scale, sort_order } = req.body;
+    db.prepare(`UPDATE devices SET name=?, line_id=?, model_type=?, model_file=?,
+                template_id=?, instance_config=?, pos_x=?, pos_y=?, pos_z=?,
+                rotation_y=?, scale=?, sort_order=? WHERE id=?`).run(
         name, line_id, model_type, model_file,
-        pos_x || 0, pos_y || 0, pos_z || 0,
-        rotation_y || 0, scale || 1.0, sort_order || 0,
+        template_id || '',
+        stringifyJson(instance_config),
+        numberWithDefault(pos_x, 0),
+        numberWithDefault(pos_y, 0),
+        numberWithDefault(pos_z, 0),
+        numberWithDefault(rotation_y, 0),
+        numberWithDefault(scale, 1.0),
+        numberWithDefault(sort_order, 0),
         req.params.id
     );
     res.json({ success: true });

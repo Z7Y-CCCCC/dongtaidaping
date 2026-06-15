@@ -59,8 +59,8 @@ async function deleteLine(id) {
 const devices = ref([])
 const showDeviceForm = ref(false)
 const editingDevice = reactive({
-    id: '', name: '', line_id: '', model_type: 'builtin_furnace', model_file: '',
-    pos_x: 0, pos_y: 0, pos_z: 0, rotation_y: 0, scale: 1.0
+    id: '', name: '', line_id: '', model_type: 'builtin_furnace', model_file: '', template_id: '', instance_config: '{}',
+    pos_x: 0, pos_y: 0, pos_z: 0, rotation_y: 0, scale: 1.0, sort_order: 0
 })
 const isEditMode = ref(false)
 
@@ -72,21 +72,26 @@ function openCreateDevice() {
     isEditMode.value = false
     Object.assign(editingDevice, { 
         id: '', name: '', line_id: lines.value[0]?.id || '', 
-        model_type: 'builtin_furnace', model_file: '',
-        pos_x: 0, pos_y: 0, pos_z: 0, rotation_y: 0, scale: 1.0 
+        model_type: 'builtin_furnace', model_file: '', template_id: '', instance_config: '{}',
+        pos_x: 0, pos_y: 0, pos_z: 0, rotation_y: 0, scale: 1.0, sort_order: devices.value.length
     })
     showDeviceForm.value = true
 }
 
 function openEditDevice(d) {
     isEditMode.value = true
-    Object.assign(editingDevice, d)
+    Object.assign(editingDevice, { ...d, instance_config: d.instance_config || '{}' })
     showDeviceForm.value = true
 }
 
 async function saveDevice() {
     if (!editingDevice.id || !editingDevice.name || !editingDevice.line_id) {
         return alert('请填写设备ID、名称和所属产线')
+    }
+    try {
+        JSON.parse(editingDevice.instance_config || '{}')
+    } catch (e) {
+        return alert('实例配置 JSON 格式不正确')
     }
     if (isEditMode.value) {
         await adminApi.updateDevice(editingDevice.id, { ...editingDevice })
@@ -115,6 +120,11 @@ const pointCategories = [
     { value: 'doors', label: '炉门' },
     { value: 'mechanisms', label: '机构' }
 ]
+const pointQualities = [
+    { value: 'good', label: '正常' },
+    { value: 'stale', label: '过期' },
+    { value: 'bad', label: '坏点' }
+]
 
 async function loadDataPoints() {
     if (!selectedDeviceForPoints.value) { dataPoints.value = []; return }
@@ -123,8 +133,10 @@ async function loadDataPoints() {
         ...p,
         category: p.category || '',
         value_role: p.value_role || '',
+        quality: p.quality || 'good',
         scale: p.scale ?? 1,
         offset: p.offset ?? 0,
+        expression: p.expression || '',
         display_format: p.display_format || ''
     }))
     isPointsDirty.value = false
@@ -138,8 +150,10 @@ function addDataPoint() {
         data_type: 'WORD',
         category: '',
         value_role: '',
+        quality: 'good',
         scale: 1,
         offset: 0,
+        expression: '',
         display_format: '',
         unit: '',
         alarm_high: null,
@@ -226,6 +240,8 @@ const settings = reactive({
     // PLC 连接超时与重试
     plc_timeout: '5000',
     plc_retry_interval: '10000',
+    realtime_stale_ms: '6000',
+    display_mode: 'industrial_twin',
     // 视角模式
     camera_mode: 'auto'
 })
@@ -289,10 +305,115 @@ async function deleteModel(id) {
     await loadModels()
 }
 
+// ============ 现场编排器 ============
+const platform = ref({ scenes: [], widgets: [], activeScene: null, activeProject: null })
+const newWidget = reactive({
+    id: '',
+    widget_type: 'text',
+    title: '自定义文本',
+    x: 8,
+    y: 1,
+    w: 6,
+    h: 2,
+    sort_order: 10,
+    visible: true,
+    configText: '{\n  "text": "现场提示 {value}",\n  "tone": "normal"\n}',
+    bindingText: '{\n  "path": "metrics.current_output"\n}'
+})
+
+async function loadPlatform() {
+    const data = await adminApi.getPlatform()
+    platform.value = {
+        ...data,
+        widgets: (data.widgets || []).map(widget => ({
+            ...widget,
+            visible: !!widget.visible,
+            configText: JSON.stringify(widget.config || {}, null, 2),
+            bindingText: JSON.stringify(widget.binding || {}, null, 2)
+        }))
+    }
+}
+
+async function saveActiveScene() {
+    const scene = platform.value.activeScene
+    if (!scene) return
+    await adminApi.updateScene(scene.id, {
+        name: scene.name,
+        scene_type: scene.scene_type,
+        layout: scene.layout,
+        camera: scene.camera,
+        theme: scene.theme,
+        is_active: true,
+        sort_order: scene.sort_order
+    })
+    alert('场景配置已保存')
+    await loadPlatform()
+}
+
+async function saveWidget(widget) {
+    let parsedConfig = {}
+    let parsedBinding = {}
+    try {
+        parsedConfig = JSON.parse(widget.configText || '{}')
+        parsedBinding = JSON.parse(widget.bindingText || '{}')
+    } catch (e) {
+        return alert('组件配置或绑定 JSON 格式不正确')
+    }
+    await adminApi.updateWidget(widget.id, {
+        widget_type: widget.widget_type,
+        title: widget.title,
+        config: parsedConfig,
+        binding: parsedBinding,
+        x: widget.x,
+        y: widget.y,
+        w: widget.w,
+        h: widget.h,
+        sort_order: widget.sort_order,
+        visible: !!widget.visible
+    })
+    await loadPlatform()
+}
+
+async function createWidget() {
+    if (!platform.value.activeScene) return alert('当前没有可用场景')
+    if (!newWidget.id || !newWidget.widget_type) return alert('请填写组件 ID 和类型')
+    let parsedConfig = {}
+    let parsedBinding = {}
+    try {
+        parsedConfig = JSON.parse(newWidget.configText || '{}')
+        parsedBinding = JSON.parse(newWidget.bindingText || '{}')
+    } catch (e) {
+        return alert('组件配置或绑定 JSON 格式不正确')
+    }
+    const result = await adminApi.createWidget({
+        id: newWidget.id,
+        scene_id: platform.value.activeScene.id,
+        widget_type: newWidget.widget_type,
+        title: newWidget.title,
+        config: parsedConfig,
+        binding: parsedBinding,
+        x: newWidget.x,
+        y: newWidget.y,
+        w: newWidget.w,
+        h: newWidget.h,
+        sort_order: newWidget.sort_order,
+        visible: !!newWidget.visible
+    })
+    if (result.error) return alert(result.error)
+    newWidget.id = `widget_text_${Date.now()}`
+    await loadPlatform()
+}
+
+async function deleteWidget(id) {
+    if (!confirm(`确定删除组件 ${id}？`)) return
+    await adminApi.deleteWidget(id)
+    await loadPlatform()
+}
+
 // ============ 生命周期 ============
 onMounted(async () => {
     await loadWorkshops()
-    await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels()])
+    await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform()])
     if (!newLine.workshop_id && workshops.value.length > 0) {
         newLine.workshop_id = workshops.value[0].id
     }
@@ -323,6 +444,7 @@ const tabs = [
     { key: 'lines', label: '🏭 产线管理', icon: '🏭' },
     { key: 'devices', label: '🔧 设备管理', icon: '🔧' },
     { key: 'models', label: '📦 模型库', icon: '📦' },
+    { key: 'platform', label: '🧩 现场编排', icon: '🧩' },
     { key: 'points', label: '📡 点位映射', icon: '📡' },
     { key: 'settings', label: '⚙️ 连接设置', icon: '⚙️' }
 ]
@@ -434,11 +556,19 @@ const tabs = [
                                         <option v-for="m in models" :key="m.id" :value="m.id">{{ m.name }}</option>
                                     </select>
                                 </label>
+                                <label>设备模板
+                                    <select v-model="editingDevice.template_id" class="input">
+                                        <option value="">不使用模板</option>
+                                        <option v-for="tpl in platform.deviceTemplates || []" :key="tpl.id" :value="tpl.id">{{ tpl.name }}</option>
+                                    </select>
+                                </label>
                                 <label>X 坐标<input v-model.number="editingDevice.pos_x" type="number" class="input" /></label>
                                 <label>Y 坐标<input v-model.number="editingDevice.pos_y" type="number" class="input" /></label>
                                 <label>Z 坐标<input v-model.number="editingDevice.pos_z" type="number" class="input" /></label>
                                 <label>旋转角度(Y)<input v-model.number="editingDevice.rotation_y" type="number" step="0.1" class="input" /></label>
                                 <label>缩放比例<input v-model.number="editingDevice.scale" type="number" step="0.1" class="input" /></label>
+                                <label>排序<input v-model.number="editingDevice.sort_order" type="number" class="input" /></label>
+                                <label style="grid-column:1 / -1">实例配置 JSON<textarea v-model="editingDevice.instance_config" class="input widget-json" placeholder='{"caption":"1#炉","animationProfile":"furnace"}'></textarea></label>
                             </div>
                             <div class="modal-actions">
                                 <button @click="saveDevice" class="btn btn-primary">保存</button>
@@ -503,6 +633,123 @@ const tabs = [
                     </table>
                 </div>
 
+                <!-- ======== 现场编排器 ======== -->
+                <div v-if="activeTab === 'platform'" class="tab-content">
+                    <h2>现场编排器</h2>
+                    <p class="desc">管理当前项目、场景、组件布局和发布版本。工程师后续通过这里调整画面，不再改源码。</p>
+
+                    <div class="settings-section" v-if="platform.activeProject">
+                        <h3 class="section-title">项目与当前场景</h3>
+                        <div class="settings-grid" v-if="platform.activeScene">
+                            <label>项目名称
+                                <input :value="platform.activeProject.name" disabled class="input" />
+                            </label>
+                            <label>场景名称
+                                <input v-model="platform.activeScene.name" class="input" />
+                            </label>
+                            <label>场景类型
+                                <select v-model="platform.activeScene.scene_type" class="input">
+                                    <option value="factory_overview">工厂总览</option>
+                                    <option value="workshop_overview">车间总览</option>
+                                    <option value="line_overview">产线总览</option>
+                                    <option value="device_detail">设备详情</option>
+                                </select>
+                            </label>
+                            <label>主题预设
+                                <select v-model="platform.activeScene.theme.preset" class="input">
+                                    <option value="industrial_twin">真实工业数字孪生</option>
+                                    <option value="classic_blue">经典科技蓝</option>
+                                </select>
+                            </label>
+                            <label>相机模式
+                                <select v-model="platform.activeScene.camera.mode" class="input">
+                                    <option value="auto">自动</option>
+                                    <option value="4level">四级运镜</option>
+                                    <option value="3level">三级运镜</option>
+                                </select>
+                            </label>
+                            <label>数据过期阈值(ms)
+                                <input v-model.number="platform.activeScene.camera.staleMs" type="number" class="input" />
+                            </label>
+                        </div>
+                        <button @click="saveActiveScene" class="btn btn-primary" style="margin-top:16px;">保存当前场景</button>
+                    </div>
+
+                    <div class="settings-section" style="margin-top:24px;">
+                        <h3 class="section-title">组件布局</h3>
+                        <div class="table-scroll">
+                            <table class="data-table platform-table">
+                                <thead>
+                                    <tr>
+                                        <th>显示</th><th>ID</th><th>类型</th><th>标题</th>
+                                        <th>X</th><th>Y</th><th>W</th><th>H</th><th>排序</th><th>配置 JSON</th><th>绑定 JSON</th><th>操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="widget in platform.widgets" :key="widget.id">
+                                        <td><input v-model="widget.visible" type="checkbox" /></td>
+                                        <td><code>{{ widget.id }}</code></td>
+                                        <td>
+                                            <select v-model="widget.widget_type" class="input input-sm">
+                                                <option value="navigation">导航</option>
+                                                <option value="metrics">指标</option>
+                                                <option value="trend">趋势</option>
+                                                <option value="alarm_list">报警列表</option>
+                                                <option value="marquee">跑马灯</option>
+                                                <option value="text">文本</option>
+                                            </select>
+                                        </td>
+                                        <td><input v-model="widget.title" class="input input-sm" /></td>
+                                        <td><input v-model.number="widget.x" type="number" class="input input-sm coord-input" /></td>
+                                        <td><input v-model.number="widget.y" type="number" class="input input-sm coord-input" /></td>
+                                        <td><input v-model.number="widget.w" type="number" class="input input-sm coord-input" /></td>
+                                        <td><input v-model.number="widget.h" type="number" class="input input-sm coord-input" /></td>
+                                        <td><input v-model.number="widget.sort_order" type="number" class="input input-sm coord-input" /></td>
+                                        <td><textarea v-model="widget.configText" class="input widget-json"></textarea></td>
+                                        <td><textarea v-model="widget.bindingText" class="input widget-json"></textarea></td>
+                                        <td>
+                                            <button @click="saveWidget(widget)" class="btn btn-primary btn-sm">保存</button>
+                                            <button @click="deleteWidget(widget.id)" class="btn btn-danger btn-sm" style="margin-left:6px;">删除</button>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="widget-create-row">
+                            <input v-model="newWidget.id" class="input" placeholder="组件ID，如 widget_text_notice" />
+                            <select v-model="newWidget.widget_type" class="input">
+                                <option value="text">文本</option>
+                                <option value="metrics">指标</option>
+                                <option value="trend">趋势</option>
+                                <option value="alarm_list">报警列表</option>
+                                <option value="marquee">跑马灯</option>
+                            </select>
+                            <input v-model="newWidget.title" class="input" placeholder="标题" />
+                            <input v-model.number="newWidget.x" type="number" class="input coord-input" placeholder="X" />
+                            <input v-model.number="newWidget.y" type="number" class="input coord-input" placeholder="Y" />
+                            <input v-model.number="newWidget.w" type="number" class="input coord-input" placeholder="W" />
+                            <input v-model.number="newWidget.h" type="number" class="input coord-input" placeholder="H" />
+                            <textarea v-model="newWidget.configText" class="input widget-json" title="组件配置 JSON"></textarea>
+                            <textarea v-model="newWidget.bindingText" class="input widget-json" title="数据绑定 JSON"></textarea>
+                            <button @click="createWidget" class="btn btn-primary">+ 新增组件</button>
+                        </div>
+                    </div>
+
+                    <div class="settings-section" style="margin-top:24px;">
+                        <h3 class="section-title">发布版本</h3>
+                        <table class="data-table">
+                            <thead><tr><th>版本</th><th>当前</th><th>发布时间</th></tr></thead>
+                            <tbody>
+                                <tr v-for="release in platform.releases" :key="release.id">
+                                    <td>{{ release.version }}</td>
+                                    <td>{{ release.is_current ? '是' : '否' }}</td>
+                                    <td>{{ release.created_at }}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
                 <!-- ======== 点位映射 ======== -->
                 <div v-if="activeTab === 'points'" class="tab-content">
                     <h2>PLC 点位映射</h2>
@@ -534,8 +781,8 @@ const tabs = [
                                 <thead>
                                     <tr>
                                         <th>数据项名称</th><th>显示标签</th><th>PLC 地址</th>
-                                        <th>数据类型</th><th>分类</th><th>输出字段</th>
-                                        <th>比例</th><th>偏移</th><th>单位</th><th>报警上限</th><th>报警下限</th><th></th>
+                                        <th>数据类型</th><th>分类</th><th>输出字段</th><th>默认质量</th>
+                                        <th>比例</th><th>偏移</th><th>表达式</th><th>显示格式</th><th>单位</th><th>报警上限</th><th>报警下限</th><th></th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -558,15 +805,22 @@ const tabs = [
                                             </select>
                                         </td>
                                         <td><input v-model="p.value_role" @input="markPointsDirty" class="input input-sm" placeholder="默认同名称" /></td>
+                                        <td>
+                                            <select v-model="p.quality" @change="markPointsDirty" class="input input-sm">
+                                                <option v-for="quality in pointQualities" :key="quality.value" :value="quality.value">{{ quality.label }}</option>
+                                            </select>
+                                        </td>
                                         <td><input v-model.number="p.scale" @input="markPointsDirty" type="number" step="0.001" class="input input-sm number-input" /></td>
                                         <td><input v-model.number="p.offset" @input="markPointsDirty" type="number" step="0.001" class="input input-sm number-input" /></td>
+                                        <td><input v-model="p.expression" @input="markPointsDirty" class="input input-sm" placeholder="如 x/10" /></td>
+                                        <td><input v-model="p.display_format" @input="markPointsDirty" class="input input-sm unit-input" placeholder="0.0" /></td>
                                         <td><input v-model="p.unit" @input="markPointsDirty" class="input input-sm unit-input" placeholder="°C" /></td>
                                         <td><input v-model.number="p.alarm_high" @input="markPointsDirty" type="number" class="input input-sm number-input" /></td>
                                         <td><input v-model.number="p.alarm_low" @input="markPointsDirty" type="number" class="input input-sm number-input" /></td>
                                         <td><button @click="removeDataPoint(idx)" class="btn btn-danger btn-sm">✕</button></td>
                                     </tr>
                                     <tr v-if="dataPoints.length === 0">
-                                        <td colspan="12" style="text-align:center; padding: 20px; color: #8c8c8c;">该设备暂无点位配置，请手动添加或从其他设备复制。</td>
+                                        <td colspan="15" style="text-align:center; padding: 20px; color: #8c8c8c;">该设备暂无点位配置，请手动添加或从其他设备复制。</td>
                                     </tr>
                                 </tbody>
                             </table>
@@ -613,6 +867,15 @@ const tabs = [
                                         <option value="auto">自动 (单车间3级 / 多车间4级)</option>
                                         <option value="4level">强制 4 级 (全局->车间->产线->设备)</option>
                                         <option value="3level">强制 3 级 (直接进车间->产线->设备)</option>
+                                    </select>
+                                </label>
+                                <label>实时数据过期阈值 (ms)
+                                    <input v-model="settings.realtime_stale_ms" type="number" class="input" placeholder="6000" />
+                                </label>
+                                <label>显示模式
+                                    <select v-model="settings.display_mode" class="input">
+                                        <option value="industrial_twin">真实工业数字孪生</option>
+                                        <option value="classic_blue">经典科技蓝</option>
                                     </select>
                                 </label>
                             </div>
@@ -807,12 +1070,34 @@ const tabs = [
     overflow-x: auto;
 }
 .points-table {
-    min-width: 1320px;
+    min-width: 1680px;
 }
 .points-table td { padding: 8px 4px; }
 .points-table .input-sm { width: 100%; }
 .points-table .number-input { width: 90px; }
 .points-table .unit-input { width: 70px; }
+.platform-table {
+    min-width: 1560px;
+}
+.coord-input {
+    width: 70px;
+}
+.widget-json {
+    width: 260px;
+    height: 64px;
+    font-family: Consolas, monospace;
+    resize: vertical;
+}
+.widget-create-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: flex-start;
+    padding: 14px;
+    margin-top: 16px;
+    border: 1px dashed #d9d9d9;
+    background: #fafafa;
+}
 
 .device-group { margin-bottom: 40px; }
 .group-title { color: #262626; font-size: 16px; margin-bottom: 16px; font-weight: 500; padding-left: 10px; border-left: 4px solid #1890ff; }

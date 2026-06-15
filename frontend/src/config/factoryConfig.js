@@ -8,6 +8,7 @@ const factoryConfig = reactive({
     workshops: [],
     lines: [],
     models: [],
+    platform: {},
     loaded: false
 })
 
@@ -32,6 +33,7 @@ async function loadConfig() {
         // 由于 config.js 返回的是 workshops -> lines，我们把它拍平赋给 factoryConfig.lines 方便原有逻辑使用
         factoryConfig.lines = factoryConfig.workshops.flatMap(ws => ws.lines)
         factoryConfig.models = data.models || []
+        factoryConfig.platform = data.platform || {}
         factoryConfig.loaded = true
         
         console.log(`✅ 工厂配置加载完成: ${factoryConfig.workshops.length} 个车间, ${factoryConfig.lines.length} 条产线`)
@@ -84,6 +86,22 @@ function useFallbackConfig() {
     factoryConfig.lines = fallbackLines
     
     factoryConfig.models = []
+    factoryConfig.platform = {
+        activeProject: { id: 'project_default', name: '离线演示项目' },
+        activeScene: {
+            id: 'scene_factory_overview',
+            name: '工厂总览',
+            camera: { mode: 'auto', staleMs: 6000 },
+            theme: { preset: 'industrial_twin' }
+        },
+        widgets: [
+            { id: 'widget_navigation', widget_type: 'navigation', title: '层级导航', visible: 1 },
+            { id: 'widget_metrics', widget_type: 'metrics', title: '生产指标', visible: 1, config: { compact: true } },
+            { id: 'widget_trend', widget_type: 'trend', title: '历史趋势', visible: 1, config: { metric: 'avg_temp' } },
+            { id: 'widget_alarms', widget_type: 'alarm_list', title: '报警履历', visible: 1, config: { limit: 5 } },
+            { id: 'widget_marquee', widget_type: 'marquee', title: '实时日志', visible: 1, config: { speed: 30 } }
+        ]
+    }
     factoryConfig.loaded = true
     console.warn('⚠️ 使用回退配置（后端不可用）')
 }
@@ -106,6 +124,7 @@ export function useFactoryConfig() {
             return line ? line.devices : []
         },
         getAllDevices: () => factoryConfig.lines.flatMap(l => l.devices),
+        getPlatform: () => factoryConfig.platform,
         getSetting: (key, defaultValue = '') => factoryConfig.settings[key] || defaultValue,
         getMqttBroker: () => factoryConfig.settings.mqtt_broker || 'ws://broker.emqx.io:8083/mqtt',
         getMqttTopicPrefix: () => factoryConfig.settings.mqtt_topic_prefix || 'factory/Line1',
@@ -152,4 +171,13 @@ export const adminApi = {
     async getModels() { return (await fetch(`${API_BASE}/models`)).json() },
     async uploadModel(formData) { return (await fetch(`${API_BASE}/models/upload`, { method: 'POST', body: formData })).json() },
     async deleteModel(id) { return (await fetch(`${API_BASE}/models/${id}`, { method: 'DELETE' })).json() },
+
+    // 平台编排
+    async getPlatform() { return (await fetch(`${API_BASE}/platform`)).json() },
+    async updateScene(id, data) { return (await fetch(`${API_BASE}/platform/scenes/${id}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
+    async createWidget(data) { return (await fetch(`${API_BASE}/platform/widgets`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
+    async updateWidget(id, data) { return (await fetch(`${API_BASE}/platform/widgets/${id}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
+    async deleteWidget(id) { return (await fetch(`${API_BASE}/platform/widgets/${id}`, { method: 'DELETE' })).json() },
+    async getEvents(limit = 50) { return (await fetch(`${API_BASE}/platform/events?limit=${limit}`)).json() },
+    async createEvent(data) { return (await fetch(`${API_BASE}/platform/events`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
 }
