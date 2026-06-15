@@ -5,7 +5,7 @@
  * 数据引擎（dataEngine）通过此模块把设备实时数据推送给所有已连接的前端客户端。
  * 
  * 消息协议：
- * - 服务端 → 客户端: { type: "device_data", payload: { furnace_id, ... } }
+ * - 服务端 → 客户端: { type: "realtime_frame", payload: { seq, timestamp, devices: [] } }
  * - 服务端 → 客户端: { type: "plc_status", payload: { status, message } }
  * - 客户端 → 服务端: { type: "ping" }  →  回复 { type: "pong" }
  */
@@ -16,6 +16,7 @@ class WsServer {
     constructor() {
         this.wss = null;
         this.clients = new Set();
+        this.sequence = 0;
     }
 
     /**
@@ -60,23 +61,26 @@ class WsServer {
     }
 
     /**
-     * 向所有客户端广播设备数据
+     * 向所有客户端广播一个采集周期的设备数据帧
      * @param {Array} deviceDataArray - 所有设备的实时数据数组
      */
     broadcastDeviceData(deviceDataArray) {
         if (!this.wss || this.wss.clients.size === 0) return;
+        if (!Array.isArray(deviceDataArray) || deviceDataArray.length === 0) return;
 
-        // 逐台设备分别推送（前端按 furnace_id 匹配设备）
-        deviceDataArray.forEach(deviceData => {
-            const message = JSON.stringify({
-                type: 'device_data',
-                payload: deviceData
-            });
-            this.wss.clients.forEach(client => {
-                if (client.readyState === 1) { // WebSocket.OPEN
-                    client.send(message);
-                }
-            });
+        const message = JSON.stringify({
+            type: 'realtime_frame',
+            payload: {
+                seq: ++this.sequence,
+                timestamp: Date.now(),
+                devices: deviceDataArray
+            }
+        });
+
+        this.wss.clients.forEach(client => {
+            if (client.readyState === 1) { // WebSocket.OPEN
+                client.send(message);
+            }
         });
     }
 

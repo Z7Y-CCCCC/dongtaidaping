@@ -1,7 +1,7 @@
 <script setup>
 import { onMounted, onUnmounted, ref, reactive, computed } from 'vue'
 import { SceneManager } from './three/SceneManager'
-import { FurnaceModel } from './three/FurnaceModel'
+import { createDeviceModel } from './three/ModelFactory.js'
 import { useFactoryConfig } from './config/factoryConfig.js'
 import * as echarts from 'echarts'
 
@@ -94,8 +94,26 @@ const productionData = reactive({
 })
 
 const furnaces = new Map()
+const latestDeviceDataMap = new Map()
+let reconnectTimer = null
+let isUnmounted = false
+
+function handleWorkshopSelected(e) {
+  currentWorkshop.value = e.detail
+  currentLevel.value = 1
+}
+
+function handleLineSelected(e) {
+  currentLine.value = e.detail
+  currentLevel.value = 2
+}
+
+function handleFactorySelected() {
+  currentLevel.value = 0
+}
 
 onMounted(async () => {
+  isUnmounted = false
   // 时钟更新
   updateTime()
   timer = setInterval(updateTime, 1000)
@@ -114,31 +132,49 @@ onMounted(async () => {
   sceneManager = new SceneManager(
     threeContainer.value, 
     (level) => { currentLevel.value = level },
-    (deviceId) => { selectedDeviceId.value = deviceId }
+    (deviceId) => {
+      selectedDeviceId.value = deviceId
+      const cachedData = latestDeviceDataMap.get(deviceId)
+      if (cachedData) Object.assign(selectedDeviceData, cachedData)
+    }
   )
 
   // 3. 根据配置动态创建设备
   const workshops = getWorkshops()
   let gLineIdx = 0;
+  const deviceDefs = []
   workshops.forEach((ws, wsIdx) => {
     (ws.lines || []).forEach((line) => {
       const lineDevices = line.devices || []
       lineDevices.forEach((deviceCfg, devIdx) => {
-        const furnace = new FurnaceModel(deviceCfg.id, deviceCfg.name)
-        furnace.position.set(
-          deviceCfg.pos_x ?? (devIdx - 2) * 14, 
-          deviceCfg.pos_y ?? 0, 
-          deviceCfg.pos_z ?? -gLineIdx * 16 - wsIdx * 20
-        )
-        if (deviceCfg.rotation_y) furnace.rotation.y = deviceCfg.rotation_y
-        if (deviceCfg.scale && deviceCfg.scale !== 1.0) furnace.scale.setScalar(deviceCfg.scale)
-        
-        sceneManager.addFurnace(furnace)
-        deviceStatusMap[deviceCfg.id] = { name: deviceCfg.name, temp: '--', carbon: '--', running: false, alarm: false }
-        furnaces.set(deviceCfg.id, furnace)
+        deviceDefs.push({ deviceCfg, devIdx, wsIdx, gLineIdx })
       })
       gLineIdx++;
     })
+  })
+
+  const deviceModels = await Promise.all(deviceDefs.map(async (def) => {
+    const deviceModel = await createDeviceModel(def.deviceCfg, factoryConfig.models || [])
+    return { ...def, deviceModel }
+  }))
+
+  deviceModels.forEach(({ deviceCfg, devIdx, wsIdx, gLineIdx, deviceModel }) => {
+    deviceModel.position.set(
+      deviceCfg.pos_x ?? (devIdx - 2) * 14,
+      deviceCfg.pos_y ?? 0,
+      deviceCfg.pos_z ?? -gLineIdx * 16 - wsIdx * 20
+    )
+    if (deviceCfg.rotation_y) deviceModel.rotation.y = deviceCfg.rotation_y
+
+    const defaultScale = deviceModel.userData?.defaultScale || 1
+    const configuredScale = deviceCfg.scale || 1
+    if (defaultScale !== 1 || configuredScale !== 1) {
+      deviceModel.scale.setScalar(defaultScale * configuredScale)
+    }
+
+    sceneManager.addFurnace(deviceModel)
+    deviceStatusMap[deviceCfg.id] = { name: deviceCfg.name, temp: '--', carbon: '--', running: false, alarm: false }
+    furnaces.set(deviceCfg.id, deviceModel)
   })
 
   // 4. 通知 SceneManager 拓扑信息
@@ -149,17 +185,9 @@ onMounted(async () => {
   initWebSocket()
   
   // 监听来自 3D 场景的运镜事件
-  window.addEventListener('workshop-selected', (e) => {
-    currentWorkshop.value = e.detail;
-    currentLevel.value = 1;
-  });
-  window.addEventListener('line-selected', (e) => {
-    currentLine.value = e.detail;
-    currentLevel.value = 2;
-  });
-  window.addEventListener('factory-selected', () => {
-    currentLevel.value = 0;
-  });
+  window.addEventListener('workshop-selected', handleWorkshopSelected);
+  window.addEventListener('line-selected', handleLineSelected);
+  window.addEventListener('factory-selected', handleFactorySelected);
 
   // 初始化 ECharts
   setTimeout(() => {
@@ -170,8 +198,16 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  isUnmounted = true
   clearInterval(timer)
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
   window.removeEventListener('resize', resizeCharts)
+  window.removeEventListener('workshop-selected', handleWorkshopSelected)
+  window.removeEventListener('line-selected', handleLineSelected)
+  window.removeEventListener('factory-selected', handleFactorySelected)
   // 销毁 ECharts 实例
   if (pieChart1) { pieChart1.dispose(); pieChart1 = null }
   if (pieChart2) { pieChart2.dispose(); pieChart2 = null }
@@ -268,7 +304,36 @@ let wsClient = null
 const wsConnected = ref(false)
 const plcStatusText = ref('等待连接...')
 
+function applyDeviceRealtimeData(data) {
+  if (!data?.furnace_id) return
+
+  const furnace = furnaces.get(data.furnace_id)
+  if (!furnace) return
+
+  latestDeviceDataMap.set(data.furnace_id, data)
+  furnace.updateData(data)
+
+  deviceStatusMap[data.furnace_id] = {
+    name: data.furnace_name,
+    temp: data.analog?.actual_temp,
+    carbon: data.analog?.actual_carbon,
+    running: data.status?.running,
+    alarm: data.status?.alarm
+  }
+
+  if (currentLevel.value === 3 && selectedDeviceId.value === data.furnace_id) {
+    Object.assign(selectedDeviceData, data)
+  }
+}
+
 function initWebSocket() {
+  if (isUnmounted) return
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+
   // WebSocket 连接后端，统一接收所有实时数据
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const wsHost = window.location.hostname || 'localhost'
@@ -287,23 +352,11 @@ function initWebSocket() {
     try {
       const msg = JSON.parse(event.data)
       
-      if (msg.type === 'device_data') {
-        const data = msg.payload
-        const furnace = furnaces.get(data.furnace_id)
-        if (furnace) {
-          furnace.updateData(data)
-          // 更新设备总览卡片的状态
-          deviceStatusMap[data.furnace_id] = {
-            name: data.furnace_name,
-            temp: data.analog?.actual_temp,
-            carbon: data.analog?.actual_carbon,
-            running: data.status?.running,
-            alarm: data.status?.alarm
-          }
-          if (currentLevel.value === 2 && selectedDeviceId.value === data.furnace_id) {
-            Object.assign(selectedDeviceData, data)
-          }
-        }
+      if (msg.type === 'realtime_frame') {
+        const devices = msg.payload?.devices || []
+        devices.forEach(applyDeviceRealtimeData)
+      } else if (msg.type === 'device_data') {
+        applyDeviceRealtimeData(msg.payload)
       } else if (msg.type === 'plc_status') {
         plcStatusText.value = msg.payload.message || msg.payload.status
       }
@@ -311,10 +364,11 @@ function initWebSocket() {
   }
 
   wsClient.onclose = () => {
+    if (isUnmounted) return
     console.log('[大屏] WebSocket 断开，5秒后重连...')
     wsConnected.value = false
     plcStatusText.value = '连接断开，重连中...'
-    setTimeout(() => initWebSocket(), 5000)
+    reconnectTimer = setTimeout(() => initWebSocket(), 5000)
   }
 
   wsClient.onerror = (err) => {

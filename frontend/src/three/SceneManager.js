@@ -16,6 +16,9 @@ export class SceneManager {
         this.furnaces = [];
         this.lineConfig = []; // 产线配置（由 setLineConfig 注入）
         this.lineDeviceRanges = []; // 每条产线在 furnaces 数组中的起止索引
+        this.disposed = false;
+        this.animationFrameId = null;
+        this.boundOnWindowResize = this.onWindowResize.bind(this);
 
         this.initScene();
         this.initCamera();
@@ -27,7 +30,7 @@ export class SceneManager {
 
         this.updatables = [];
 
-        window.addEventListener('resize', this.onWindowResize.bind(this));
+        window.addEventListener('resize', this.boundOnWindowResize);
     }
 
     initScene() {
@@ -116,41 +119,43 @@ export class SceneManager {
     initRaycaster() {
         this.raycaster = new THREE.Raycaster();
         this.mouse = new THREE.Vector2();
+        this.boundOnCanvasClick = this.handleCanvasClick.bind(this);
+        this.renderer.domElement.addEventListener('click', this.boundOnCanvasClick);
+    }
 
-        // 监听单击进入下一级
-        this.renderer.domElement.addEventListener('click', (e) => {
-            this.mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
-            this.mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+    handleCanvasClick(e) {
+        const rect = this.renderer.domElement.getBoundingClientRect();
+        this.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        this.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
-            this.raycaster.setFromCamera(this.mouse, this.camera);
-            
-            // 找出所有可以被点击的炉子
-            const intersects = this.raycaster.intersectObjects(this.furnaces, true);
+        this.raycaster.setFromCamera(this.mouse, this.camera);
+        
+        // 找出所有可以被点击的炉子
+        const intersects = this.raycaster.intersectObjects(this.furnaces, true);
 
-            if (intersects.length > 0) {
-                // 点击到了模型
-                let object = intersects[0].object;
-                while (object.parent && !object.userData.isDevice) { object = object.parent; }
-                if (!object.userData.isDevice) return;
+        if (intersects.length > 0) {
+            // 点击到了模型
+            let object = intersects[0].object;
+            while (object.parent && !object.userData.isDevice) { object = object.parent; }
+            if (!object.userData.isDevice) return;
 
-                const idx = this.furnaces.indexOf(object);
-                const info = this.getDeviceLineInfo(idx);
-                if (!info) return;
+            const idx = this.furnaces.indexOf(object);
+            const info = this.getDeviceLineInfo(idx);
+            if (!info) return;
 
-                if (this.currentLevel === 0) {
-                    // 全局视角点击，进入对应车间
-                    this.flyToWorkshop(info.workshopIdx);
-                    window.dispatchEvent(new CustomEvent('workshop-selected', { detail: info.workshopIdx }));
-                } else if (this.currentLevel === 1) {
-                    // 车间视角点击，进入对应产线
-                    this.flyToLine(info.globalLineIndex);
-                    window.dispatchEvent(new CustomEvent('line-selected', { detail: info.globalLineIndex }));
-                } else if (this.currentLevel === 2) {
-                    // 产线视角点击，进入设备详情
-                    this.flyToDevice(object);
-                }
+            if (this.currentLevel === 0) {
+                // 全局视角点击，进入对应车间
+                this.flyToWorkshop(info.workshopIdx);
+                window.dispatchEvent(new CustomEvent('workshop-selected', { detail: info.workshopIdx }));
+            } else if (this.currentLevel === 1) {
+                // 车间视角点击，进入对应产线
+                this.flyToLine(info.globalLineIndex);
+                window.dispatchEvent(new CustomEvent('line-selected', { detail: info.globalLineIndex }));
+            } else if (this.currentLevel === 2) {
+                // 产线视角点击，进入设备详情
+                this.flyToDevice(object);
             }
-        });
+        }
     }
 
     addFurnace(furnace) {
@@ -396,7 +401,8 @@ export class SceneManager {
     }
 
     animate() {
-        requestAnimationFrame(this.animate.bind(this));
+        if (this.disposed) return;
+        this.animationFrameId = requestAnimationFrame(this.animate.bind(this));
         const delta = 0.016;
         for (const obj of this.updatables) {
             if (obj.update) obj.update(delta);
@@ -412,7 +418,15 @@ export class SceneManager {
      * 销毁渲染器和所有资源，防止路由切换时 WebGL 上下文泄漏
      */
     dispose() {
-        window.removeEventListener('resize', this.onWindowResize.bind(this));
+        this.disposed = true;
+        if (this.animationFrameId) {
+            cancelAnimationFrame(this.animationFrameId);
+            this.animationFrameId = null;
+        }
+        window.removeEventListener('resize', this.boundOnWindowResize);
+        if (this.renderer?.domElement && this.boundOnCanvasClick) {
+            this.renderer.domElement.removeEventListener('click', this.boundOnCanvasClick);
+        }
         
         // 销毁所有炉子模型的几何体和材质
         this.furnaces.forEach(f => {

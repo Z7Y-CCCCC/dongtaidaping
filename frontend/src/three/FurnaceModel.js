@@ -407,6 +407,7 @@ export class FurnaceModel extends THREE.Group {
         const materialsToFade = [this.matBody, this.matBodyDark, this.matDoor, this.matPipe];
         
         materialsToFade.forEach(mat => {
+            mat.transparent = enable;
             mat.depthWrite = targetDepthWrite;
             gsap.to(mat, { opacity: targetOpacity, duration: 1.0 });
         });
@@ -498,5 +499,16 @@ export class FurnaceModel extends THREE.Group {
         if (this.stirRunning && this.stirBlades) {
             this.stirBlades.rotation.y += delta * 5;
         }
+    }
+
+    dispose() {
+        this.traverse((child) => {
+            if (child.geometry) child.geometry.dispose();
+            if (Array.isArray(child.material)) {
+                child.material.forEach((mat) => mat.dispose());
+            } else if (child.material) {
+                child.material.dispose();
+            }
+        });
     }
 }
