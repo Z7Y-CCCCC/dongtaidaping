@@ -53,9 +53,7 @@ async function loadConfig() {
 function useFallbackConfig() {
     factoryConfig.settings = {
         factory_name: '智能热处理数字孪生控制中心',
-        mqtt_broker: 'ws://broker.emqx.io:8083/mqtt',
-        mqtt_topic_prefix: 'factory/Line1',
-        data_mode: 'simulation'
+        data_mode: 'integrated_plc'
     }
     
     const lineNames = ['A 产线', 'B 产线', 'C 产线', 'D 产线']
@@ -126,8 +124,6 @@ export function useFactoryConfig() {
         getAllDevices: () => factoryConfig.lines.flatMap(l => l.devices),
         getPlatform: () => factoryConfig.platform,
         getSetting: (key, defaultValue = '') => factoryConfig.settings[key] || defaultValue,
-        getMqttBroker: () => factoryConfig.settings.mqtt_broker || 'ws://broker.emqx.io:8083/mqtt',
-        getMqttTopicPrefix: () => factoryConfig.settings.mqtt_topic_prefix || 'factory/Line1',
         getFactoryName: () => factoryConfig.settings.factory_name || '智能热处理数字孪生控制中心'
     }
 }
@@ -166,10 +162,14 @@ export const adminApi = {
     // 设置
     async getSettings() { return (await fetch(`${API_BASE}/settings`)).json() },
     async saveSettings(data) { return (await fetch(`${API_BASE}/settings`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
+    async getDatabaseConfig() { return (await fetch(`${API_BASE}/database/config`)).json() },
+    async testDatabaseConfig(data) { return (await fetch(`${API_BASE}/database/test`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
+    async saveDatabaseConfig(data) { return (await fetch(`${API_BASE}/database/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
 
     // 模型
     async getModels() { return (await fetch(`${API_BASE}/models`)).json() },
     async uploadModel(formData) { return (await fetch(`${API_BASE}/models/upload`, { method: 'POST', body: formData })).json() },
+    async updateModel(id, data) { return (await fetch(`${API_BASE}/models/${id}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
     async deleteModel(id) { return (await fetch(`${API_BASE}/models/${id}`, { method: 'DELETE' })).json() },
 
     // 平台编排

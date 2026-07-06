@@ -12,6 +12,18 @@ const STATUS_COLORS = {
     idle: new THREE.Color(0x666666)
 };
 
+const BUILTIN_BATCH_MODELS = {
+    transfer_cart: {
+        id: 'transfer_cart',
+        name: '轨道料车 / 取料小车（程序化低模）',
+        file_path: null,
+        default_scale: 1,
+        default_label_y: 1.62,
+        default_status_light_y: 1.25,
+        metadata: JSON.stringify({ source: 'procedural', batchable: true })
+    }
+};
+
 const tempMatrix = new THREE.Matrix4();
 const tempPosition = new THREE.Vector3();
 const tempQuaternion = new THREE.Quaternion();
@@ -37,12 +49,90 @@ function modelMetadata(modelInfo) {
     return parseJson(modelInfo?.metadata, {});
 }
 
+function createBatchMaterial(sourceMaterial) {
+    const material = new THREE.MeshLambertMaterial({
+        color: sourceMaterial?.color?.clone?.() || new THREE.Color(0xd8ddd8),
+        map: sourceMaterial?.map || null,
+        transparent: false,
+        opacity: 1,
+        depthWrite: true
+    });
+    material.name = sourceMaterial?.name || sourceMaterial?.uuid || 'batch_material';
+    return material;
+}
+
+function createCompactMaterial(name, color) {
+    const material = new THREE.MeshLambertMaterial({
+        color,
+        transparent: false,
+        depthWrite: true
+    });
+    material.name = name;
+    return material;
+}
+
+function createTranslatedBox(size, position) {
+    const geometry = new THREE.BoxGeometry(...size);
+    geometry.applyMatrix4(new THREE.Matrix4().makeTranslation(...position));
+    return geometry;
+}
+
+function createCompactTransferCartParts() {
+    const materials = {
+        rail: createCompactMaterial('cart_rail', 0x2b3033),
+        sleeper: createCompactMaterial('cart_sleeper', 0x4b5357),
+        chassis: createCompactMaterial('cart_chassis', 0x343b40),
+        deck: createCompactMaterial('cart_deck', 0xb8c0c4),
+        accent: createCompactMaterial('cart_accent', 0xd9a441),
+        wheel: createCompactMaterial('cart_wheel', 0x171a1c),
+        load: createCompactMaterial('cart_load', 0x748087)
+    };
+    const grouped = new Map();
+    const addBox = (key, size, position) => {
+        if (!grouped.has(key)) grouped.set(key, []);
+        grouped.get(key).push(createTranslatedBox(size, position));
+    };
+
+    addBox('rail', [4.8, 0.08, 0.08], [0, 0.04, -0.86]);
+    addBox('rail', [4.8, 0.08, 0.08], [0, 0.04, 0.86]);
+    [-1.8, -0.9, 0, 0.9, 1.8].forEach((x) => {
+        addBox('sleeper', [0.16, 0.05, 2.05], [x, 0.01, 0]);
+    });
+    addBox('chassis', [2.9, 0.28, 1.42], [0, 0.42, 0]);
+    addBox('deck', [2.55, 0.16, 1.18], [0, 0.66, 0]);
+    addBox('accent', [0.16, 0.74, 1.24], [1.35, 0.94, 0]);
+    addBox('accent', [0.16, 0.48, 1.24], [-1.35, 0.82, 0]);
+    addBox('load', [1.34, 0.34, 0.82], [-0.18, 0.93, 0]);
+    [-0.95, 0.95].forEach((x) => {
+        [-0.72, 0.72].forEach((z) => {
+            addBox('wheel', [0.18, 0.4, 0.4], [x, 0.26, z]);
+        });
+    });
+
+    const parts = [];
+    const rootBox = new THREE.Box3();
+    grouped.forEach((geometries, key) => {
+        const geometry = geometries.length === 1 ? geometries[0] : mergeGeometries(geometries, false);
+        geometry.computeBoundingBox();
+        geometry.computeBoundingSphere();
+        rootBox.union(geometry.boundingBox);
+        parts.push({ key, geometry, material: materials[key] });
+    });
+
+    return { parts, rootBox };
+}
+
 export function getBatchableModelInfo(deviceCfg, models = []) {
     const modelInfo = models.find(item => item.id === deviceCfg.model_type);
+    if (BUILTIN_BATCH_MODELS[deviceCfg.model_type] && !modelInfo?.file_path) {
+        return BUILTIN_BATCH_MODELS[deviceCfg.model_type];
+    }
+
     if (!modelInfo || modelInfo.id === 'builtin_furnace' || !modelInfo.file_path) return null;
 
     const metadata = modelMetadata(modelInfo);
     if (metadata.batchable === false) return null;
+    if (Array.isArray(metadata.partBindings) && metadata.partBindings.length > 0) return null;
     return modelInfo;
 }
 
@@ -56,7 +146,7 @@ function collectMergedParts(root) {
         const material = Array.isArray(child.material) ? child.material[0] : child.material;
         const key = material.name || material.uuid;
         if (!grouped.has(key)) {
-            grouped.set(key, { material: material.clone(), geometries: [] });
+            grouped.set(key, { material: createBatchMaterial(material), geometries: [] });
         }
 
         const geometry = child.geometry.clone();
@@ -69,8 +159,6 @@ function collectMergedParts(root) {
         const geometry = geometries.length === 1 ? geometries[0] : mergeGeometries(geometries, false);
         geometry.computeBoundingBox();
         geometry.computeBoundingSphere();
-        material.transparent = false;
-        material.depthWrite = true;
         parts.push({ key, geometry, material });
     });
 
@@ -96,12 +184,13 @@ function getDefinitionTransform(definition, modelInfo) {
 }
 
 class BatchedDeviceProxy extends THREE.Group {
-    constructor(definition, index, batchRenderer, modelInfo, rootBox) {
+    constructor(definition, index, batchRenderer, modelInfo, rootBox, options = {}) {
         super();
         const { deviceCfg } = definition;
         const transform = getDefinitionTransform(definition, modelInfo);
 
         this.deviceConfig = deviceCfg;
+        this.modelInfo = modelInfo;
         this.batchRenderer = batchRenderer;
         this.instanceIndex = index;
         this.furnaceId = deviceCfg.id;
@@ -119,8 +208,12 @@ class BatchedDeviceProxy extends THREE.Group {
         this.worldBox = new THREE.Box3();
         this.raycastPoint = new THREE.Vector3();
         this.xRayEnabled = false;
+        this.isTransferCart = modelInfo.id === 'transfer_cart';
         this.lastTempText = null;
         this.lastCarbonText = null;
+        this.pendingTempText = '--';
+        this.pendingCarbonText = '--';
+        this.lastRealtimeData = null;
 
         this.installVisibleTracker();
         this.createLabel();
@@ -148,24 +241,49 @@ class BatchedDeviceProxy extends THREE.Group {
         div.className = 'furnace-label';
         div.style.opacity = '0';
         div.style.transition = 'opacity 0.5s';
-        div.innerHTML = `
-            <div class="header">${this.furnaceName}</div>
-            <div class="data-row">温度: <span data-field="temp">--</span> °C</div>
-            <div class="data-row">碳势: <span data-field="carbon">--</span> %</div>
-        `;
+        div.innerHTML = this.isTransferCart
+            ? `
+                <div class="header">${this.furnaceName}</div>
+                <div class="data-row">速度: <span data-field="temp">--</span></div>
+                <div class="data-row">状态: <span data-field="carbon">待机</span></div>
+            `
+            : `
+                <div class="header">${this.furnaceName}</div>
+                <div class="data-row">温度: <span data-field="temp">--</span> °C</div>
+                <div class="data-row">碳势: <span data-field="carbon">--</span> %</div>
+            `;
 
         this.tempEl = div.querySelector('[data-field="temp"]');
         this.carbonEl = div.querySelector('[data-field="carbon"]');
         this.labelDiv = div;
         this.labelObj = new CSS2DObject(div);
+        this.labelObj.visible = false;
         this.labelAnchor = new THREE.Object3D();
-        this.labelAnchor.position.set(0, numberOrDefault(this.userData.instanceConfig.labelY, 3.3), 0);
+        this.labelAnchor.position.set(
+            0,
+            numberOrDefault(this.userData.instanceConfig.labelY, numberOrDefault(this.modelInfo.default_label_y, 3.3)),
+            0
+        );
         this.add(this.labelAnchor);
         this.labelAnchor.add(this.labelObj);
     }
 
     setLabelVisible(visible) {
-        if (this.labelDiv) this.labelDiv.style.opacity = visible ? '1' : '0';
+        const nextVisible = !!visible;
+        if (this.labelObj) this.labelObj.visible = nextVisible;
+        if (this.labelDiv) this.labelDiv.style.opacity = nextVisible ? '1' : '0';
+        if (nextVisible) this.renderLabelText();
+    }
+
+    renderLabelText() {
+        if (this.tempEl && this.lastTempText !== this.pendingTempText) {
+            this.tempEl.innerText = this.pendingTempText;
+            this.lastTempText = this.pendingTempText;
+        }
+        if (this.carbonEl && this.lastCarbonText !== this.pendingCarbonText) {
+            this.carbonEl.innerText = this.pendingCarbonText;
+            this.lastCarbonText = this.pendingCarbonText;
+        }
     }
 
     setXRayMode(enable) {
@@ -176,16 +294,15 @@ class BatchedDeviceProxy extends THREE.Group {
     }
 
     updateData(data) {
-        const tempText = data.analog?.actual_temp ?? '--';
-        const carbonText = data.analog?.actual_carbon ?? '--';
-        if (this.tempEl && this.lastTempText !== tempText) {
-            this.tempEl.innerText = tempText;
-            this.lastTempText = tempText;
+        this.lastRealtimeData = data;
+        if (this.isTransferCart) {
+            this.pendingTempText = data.analog?.cart_speed ?? data.analog?.speed ?? data.motors?.cart_speed ?? data.motors?.speed ?? '--';
+            this.pendingCarbonText = data.status?.running ? '运行' : data.status?.alarm ? '报警' : '待机';
+        } else {
+            this.pendingTempText = data.analog?.actual_temp ?? '--';
+            this.pendingCarbonText = data.analog?.actual_carbon ?? '--';
         }
-        if (this.carbonEl && this.lastCarbonText !== carbonText) {
-            this.carbonEl.innerText = carbonText;
-            this.lastCarbonText = carbonText;
-        }
+        if (this.labelObj?.visible) this.renderLabelText();
         this.batchRenderer.updateInstanceState(this.instanceIndex, data);
     }
 
@@ -209,7 +326,7 @@ class BatchedDeviceProxy extends THREE.Group {
 }
 
 class DeviceBatchRenderer extends THREE.Group {
-    constructor(modelInfo, parts, rootBox, definitions) {
+    constructor(modelInfo, parts, rootBox, definitions, options = {}) {
         super();
         this.modelInfo = modelInfo;
         this.rootBox = rootBox;
@@ -219,7 +336,7 @@ class DeviceBatchRenderer extends THREE.Group {
         this.statusColorHexes = new Array(definitions.length).fill(null);
         this.statusLightOffsets = definitions.map(definition => {
             const cfg = parseJson(definition.deviceCfg.instance_config, {});
-            return numberOrDefault(cfg.statusLightY, 2.8);
+            return numberOrDefault(cfg.statusLightY, numberOrDefault(modelInfo.default_status_light_y, 2.8));
         });
         this.dirtyIndexes = new Set();
         this.transformSnapshots = definitions.map(() => ({
@@ -236,6 +353,10 @@ class DeviceBatchRenderer extends THREE.Group {
         }));
         this.lastXRayMode = null;
         this.xRayDirty = true;
+        this.options = options;
+        const metadata = modelMetadata(modelInfo);
+        this.showStatusLight = options.showStatusLight === true || metadata.runtime?.showStatusLight === true;
+        this.supportsXRay = options.supportsXRay === true || metadata.runtime?.allowXRay === true;
 
         parts.forEach(({ geometry, material, key }) => {
             const mesh = new THREE.InstancedMesh(geometry, material, definitions.length);
@@ -248,7 +369,9 @@ class DeviceBatchRenderer extends THREE.Group {
             this.add(mesh);
         });
 
-        this.createStatusLights(definitions.length);
+        if (this.showStatusLight) {
+            this.createStatusLights(definitions.length);
+        }
     }
 
     createStatusLights(count) {
@@ -264,10 +387,10 @@ class DeviceBatchRenderer extends THREE.Group {
     }
 
     createProxy(definition, index) {
-        const proxy = new BatchedDeviceProxy(definition, index, this, this.modelInfo, this.rootBox);
+        const proxy = new BatchedDeviceProxy(definition, index, this, this.modelInfo, this.rootBox, this.options);
         this.proxies[index] = proxy;
         this.markInstanceDirty(index);
-        this.updateInstanceColor(index, STATUS_COLORS.idle);
+        if (this.showStatusLight) this.updateInstanceColor(index, STATUS_COLORS.idle);
         return proxy;
     }
 
@@ -286,6 +409,7 @@ class DeviceBatchRenderer extends THREE.Group {
         if (!proxy || !snapshot) return false;
 
         return snapshot.visible !== proxy.visible
+            || snapshot.detailActive !== proxy.detailActive
             || snapshot.px !== proxy.position.x
             || snapshot.py !== proxy.position.y
             || snapshot.pz !== proxy.position.z
@@ -303,6 +427,7 @@ class DeviceBatchRenderer extends THREE.Group {
         if (!proxy || !snapshot) return;
 
         snapshot.visible = proxy.visible;
+        snapshot.detailActive = proxy.detailActive;
         snapshot.px = proxy.position.x;
         snapshot.py = proxy.position.y;
         snapshot.pz = proxy.position.z;
@@ -315,6 +440,7 @@ class DeviceBatchRenderer extends THREE.Group {
     }
 
     updateInstanceState(index, data) {
+        if (!this.showStatusLight) return;
         const quality = resolveDeviceQuality(data);
         const color = quality === 'bad'
             ? STATUS_COLORS.bad
@@ -329,6 +455,7 @@ class DeviceBatchRenderer extends THREE.Group {
     }
 
     updateInstanceColor(index, color) {
+        if (!this.statusLightMesh) return;
         const colorHex = color.getHex();
         if (this.statusColorHexes[index] === colorHex) return;
         this.statusColorHexes[index] = colorHex;
@@ -340,7 +467,7 @@ class DeviceBatchRenderer extends THREE.Group {
         const proxy = this.proxies[index];
         if (!proxy) return;
 
-        const visibleScale = proxy.visible ? 1 : 0;
+        const visibleScale = proxy.visible && !proxy.detailActive ? 1 : 0;
         tempPosition.copy(proxy.position);
         tempQuaternion.setFromEuler(proxy.rotation);
         tempScale.copy(proxy.scale).multiplyScalar(visibleScale);
@@ -350,10 +477,12 @@ class DeviceBatchRenderer extends THREE.Group {
             mesh.setMatrixAt(index, tempMatrix);
         });
 
-        tempPosition.set(0, this.statusLightOffsets[index], 0).applyMatrix4(tempMatrix);
-        tempScale.setScalar(visibleScale);
-        tempMatrix.compose(tempPosition, identityQuaternion, tempScale);
-        this.statusLightMesh.setMatrixAt(index, tempMatrix);
+        if (this.statusLightMesh) {
+            tempPosition.set(0, this.statusLightOffsets[index], 0).applyMatrix4(tempMatrix);
+            tempScale.setScalar(visibleScale);
+            tempMatrix.compose(tempPosition, identityQuaternion, tempScale);
+            this.statusLightMesh.setMatrixAt(index, tempMatrix);
+        }
         this.rememberTransform(index);
     }
 
@@ -375,12 +504,13 @@ class DeviceBatchRenderer extends THREE.Group {
         this.instancedMeshes.forEach(mesh => {
             mesh.instanceMatrix.needsUpdate = true;
         });
-        this.statusLightMesh.instanceMatrix.needsUpdate = true;
+        if (this.statusLightMesh) this.statusLightMesh.instanceMatrix.needsUpdate = true;
     }
 
     reconcileXRayMode() {
         if (!this.xRayDirty) return;
         this.xRayDirty = false;
+        if (!this.supportsXRay) return;
         const enable = this.proxies.some(proxy => proxy?.visible && proxy.xRayEnabled);
         if (this.lastXRayMode === enable) return;
         this.lastXRayMode = enable;
@@ -407,10 +537,18 @@ class DeviceBatchRenderer extends THREE.Group {
             this.statusLightMesh.geometry.dispose();
             this.statusLightMesh.material.dispose();
         }
+        this.proxies.forEach(proxy => proxy?.dispose?.());
     }
 }
 
 export async function createBatchedDeviceRenderer(modelInfo, definitions) {
+    if (modelInfo.id === 'transfer_cart') {
+        const { parts, rootBox } = createCompactTransferCartParts();
+        const batchRenderer = new DeviceBatchRenderer(modelInfo, parts, rootBox, definitions, { showStatusLight: true });
+        const deviceModels = definitions.map((definition, index) => batchRenderer.createProxy(definition, index));
+        return { batchRenderer, deviceModels };
+    }
+
     const root = await loadGltf(resolveBackendAssetUrl(modelInfo.file_path));
     const { parts, rootBox } = collectMergedParts(root);
     const batchRenderer = new DeviceBatchRenderer(modelInfo, parts, rootBox, definitions);

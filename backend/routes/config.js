@@ -1,9 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const { getDb } = require('../db/database');
+const { mergeBuiltinModels } = require('../services/builtinModels');
 
 function safeJsonParse(value, fallback) {
     if (!value) return fallback;
+    if (typeof value === 'object') return value;
     try {
         return JSON.parse(value);
     } catch (e) {
@@ -11,76 +13,94 @@ function safeJsonParse(value, fallback) {
     }
 }
 
-// GET /api/config - 输出完整的工厂配置（大屏前端启动时拉取）
-router.get('/', (req, res) => {
-    const db = getDb();
+function isAuxiliaryDevice(device) {
+    const config = safeJsonParse(device?.instance_config, {});
+    return device?.model_type === 'transfer_cart'
+        || config.role === 'transfer_cart'
+        || config.role === 'auxiliary'
+        || config.sceneObject === true;
+}
 
-    // 1. 全局设置
-    const settingsRows = db.prepare('SELECT * FROM settings').all();
-    const settings = {};
-    settingsRows.forEach(r => { settings[r.key] = r.value; });
+router.get('/', async (req, res) => {
+    try {
+        const db = await getDb();
 
-    // 2. 车间、产线和设备
-    const workshops = db.prepare('SELECT * FROM workshops ORDER BY sort_order ASC').all();
-    const lines = db.prepare('SELECT * FROM lines ORDER BY sort_order ASC').all();
-    const allDevices = db.prepare('SELECT * FROM devices ORDER BY line_id, sort_order ASC').all();
-    const allPoints = db.prepare('SELECT * FROM data_points ORDER BY device_id').all();
+        const settingsRows = await db.all('SELECT * FROM settings');
+        const settings = {};
+        settingsRows.forEach(r => { settings[r.key] = r.value; });
 
-    // 按设备 ID 分组点位
-    const pointsByDevice = {};
-    allPoints.forEach(p => {
-        if (!pointsByDevice[p.device_id]) pointsByDevice[p.device_id] = [];
-        pointsByDevice[p.device_id].push(p);
-    });
+        const workshops = await db.all('SELECT * FROM workshops ORDER BY sort_order ASC');
+        const lines = await db.all('SELECT * FROM `lines` ORDER BY sort_order ASC');
+        const allDevices = await db.all('SELECT * FROM devices ORDER BY line_id, sort_order ASC');
+        const allPoints = await db.all('SELECT * FROM data_points ORDER BY device_id');
 
-    // 按产线 ID 分组设备
-    const linesWithDevices = lines.map(line => {
-        const devices = allDevices
-            .filter(d => d.line_id === line.id)
-            .map(d => ({
-                ...d,
-                dataPoints: pointsByDevice[d.id] || []
-            }));
-        return { ...line, devices };
-    });
+        const pointsByDevice = {};
+        allPoints.forEach(p => {
+            if (!pointsByDevice[p.device_id]) pointsByDevice[p.device_id] = [];
+            pointsByDevice[p.device_id].push(p);
+        });
 
-    // 按车间 ID 分组产线
-    const workshopsWithLines = workshops.map(ws => {
-        const wsLines = linesWithDevices.filter(l => l.workshop_id === ws.id);
-        return { ...ws, lines: wsLines };
-    });
+        const linesWithDevices = lines.map(line => {
+            const devices = allDevices
+                .filter(d => d.line_id === line.id && !isAuxiliaryDevice(d))
+                .map(d => ({
+                    ...d,
+                    dataPoints: pointsByDevice[d.id] || []
+                }));
+            return { ...line, devices };
+        });
 
-    // 3. 模型库
-    const models = db.prepare('SELECT * FROM models').all();
-    const activeProject = db.prepare('SELECT * FROM projects WHERE is_active = 1 LIMIT 1').get()
-        || db.prepare('SELECT * FROM projects ORDER BY created_at ASC LIMIT 1').get();
-    const activeScene = activeProject
-        ? (db.prepare('SELECT * FROM scenes WHERE project_id = ? AND is_active = 1 LIMIT 1').get(activeProject.id)
-            || db.prepare('SELECT * FROM scenes WHERE project_id = ? ORDER BY sort_order ASC LIMIT 1').get(activeProject.id))
-        : null;
-    const widgets = activeScene
-        ? db.prepare('SELECT * FROM widgets WHERE scene_id = ? ORDER BY sort_order ASC').all(activeScene.id)
-        : [];
+        const workshopsWithLines = workshops.map(ws => {
+            const wsLines = linesWithDevices.filter(l => l.workshop_id === ws.id);
+            const wsLineIds = new Set(wsLines.map(line => line.id));
+            const devices = allDevices
+                .filter(d => {
+                    if (!isAuxiliaryDevice(d)) return false;
+                    const config = safeJsonParse(d.instance_config, {});
+                    return config.workshop_id === ws.id
+                        || config.workshopId === ws.id
+                        || (d.line_id && wsLineIds.has(d.line_id));
+                })
+                .map(d => ({
+                    ...d,
+                    dataPoints: pointsByDevice[d.id] || []
+                }));
+            return { ...ws, lines: wsLines, devices };
+        });
 
-    res.json({
-        settings,
-        workshops: workshopsWithLines,
-        models,
-        platform: {
-            activeProject,
-            activeScene: activeScene ? {
-                ...activeScene,
-                layout: safeJsonParse(activeScene.layout_json, {}),
-                camera: safeJsonParse(activeScene.camera_json, {}),
-                theme: safeJsonParse(activeScene.theme_json, {})
-            } : null,
-            widgets: widgets.map(widget => ({
-                ...widget,
-                config: safeJsonParse(widget.config_json, {}),
-                binding: safeJsonParse(widget.binding_json, {})
-            }))
-        }
-    });
+        const models = mergeBuiltinModels(await db.all('SELECT * FROM models'));
+        const activeProject = await db.get('SELECT * FROM projects WHERE is_active = 1 LIMIT 1')
+            || await db.get('SELECT * FROM projects ORDER BY created_at ASC LIMIT 1');
+        const activeScene = activeProject
+            ? (await db.get('SELECT * FROM scenes WHERE project_id = ? AND is_active = 1 LIMIT 1', [activeProject.id])
+                || await db.get('SELECT * FROM scenes WHERE project_id = ? ORDER BY sort_order ASC LIMIT 1', [activeProject.id]))
+            : null;
+        const widgets = activeScene
+            ? await db.all('SELECT * FROM widgets WHERE scene_id = ? ORDER BY sort_order ASC', [activeScene.id])
+            : [];
+
+        res.json({
+            settings,
+            workshops: workshopsWithLines,
+            models,
+            platform: {
+                activeProject,
+                activeScene: activeScene ? {
+                    ...activeScene,
+                    layout: safeJsonParse(activeScene.layout_json, {}),
+                    camera: safeJsonParse(activeScene.camera_json, {}),
+                    theme: safeJsonParse(activeScene.theme_json, {})
+                } : null,
+                widgets: widgets.map(widget => ({
+                    ...widget,
+                    config: safeJsonParse(widget.config_json, {}),
+                    binding: safeJsonParse(widget.binding_json, {})
+                }))
+            }
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 module.exports = router;

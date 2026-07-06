@@ -3,32 +3,36 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+const multer = require('multer');
+const {
+    getDb,
+    getDbStatus,
+    reconnectDb,
+    loadDatabaseConfig,
+    publicDatabaseConfig,
+    saveDatabaseConfig,
+    testDatabaseConfig
+} = require('./db/database');
+const { mergeBuiltinModels } = require('./services/builtinModels');
 
 const app = express();
-const PORT = 3001;
+const PORT = Number(process.env.PORT || 3001);
 
-// 确保数据目录存在
-const dataDir = path.join(__dirname, 'data');
-if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-}
 const uploadsDir = path.join(__dirname, 'uploads', 'models');
-if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
-}
 const assetsDir = path.join(__dirname, 'assets');
 const assetModelsDir = path.join(assetsDir, 'models');
-if (!fs.existsSync(assetModelsDir)) {
-    fs.mkdirSync(assetModelsDir, { recursive: true });
+
+for (const dir of [uploadsDir, assetModelsDir]) {
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
 }
 
-// 中间件
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/assets', express.static(assetsDir));
 
-// API 路由
 app.use('/api/config', require('./routes/config'));
 app.use('/api/workshops', require('./routes/workshops'));
 app.use('/api/lines', require('./routes/lines'));
@@ -37,8 +41,6 @@ app.use('/api/datapoints', require('./routes/datapoints'));
 app.use('/api/settings', require('./routes/settings'));
 app.use('/api/platform', require('./routes/platform'));
 
-// 模型文件上传 (使用 multer)
-const multer = require('multer');
 const storage = multer.diskStorage({
     destination: uploadsDir,
     filename: (req, file, cb) => {
@@ -46,84 +48,103 @@ const storage = multer.diskStorage({
         cb(null, uniqueName);
     }
 });
-const upload = multer({ 
-    storage, 
+
+const upload = multer({
+    storage,
     fileFilter: (req, file, cb) => {
         const ext = path.extname(file.originalname).toLowerCase();
         if (['.glb', '.gltf'].includes(ext)) {
             cb(null, true);
         } else {
-            cb(new Error('仅支持 .glb 和 .gltf 格式的3D模型文件'));
+            cb(new Error('仅支持 .glb 和 .gltf 格式的 3D 模型文件'));
         }
     },
-    limits: { fileSize: 100 * 1024 * 1024 } // 100MB
+    limits: { fileSize: 100 * 1024 * 1024 }
 });
 
-// POST /api/models/upload - 上传模型文件
-app.post('/api/models/upload', upload.single('modelFile'), (req, res) => {
+app.post('/api/models/upload', upload.single('modelFile'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: '未收到文件' });
     }
-    const { getDb } = require('./db/database');
-    const db = getDb();
+
     const { id, name, asset_type, tags, metadata, default_scale } = req.body;
     const filePath = `/uploads/models/${req.file.filename}`;
 
     try {
-        db.prepare(`INSERT OR REPLACE INTO models (
-            id, name, file_path, asset_type, tags, default_scale, metadata
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
-            id || req.file.filename.replace(/\.[^.]+$/, ''),
-            name || req.file.originalname,
-            filePath,
-            asset_type || 'model',
-            tags || '[]',
-            Number.isFinite(Number(default_scale)) ? Number(default_scale) : 1.0,
-            metadata || '{}'
-        );
+        const db = await getDb();
+        await db.upsert('models', {
+            id: id || req.file.filename.replace(/\.[^.]+$/, ''),
+            name: name || req.file.originalname,
+            file_path: filePath,
+            asset_type: asset_type || 'model',
+            tags: tags || '[]',
+            thumbnail: null,
+            default_scale: Number.isFinite(Number(default_scale)) ? Number(default_scale) : 1.0,
+            metadata: metadata || '{}'
+        }, 'id');
         res.json({ success: true, filePath });
     } catch (e) {
         res.status(400).json({ error: e.message });
     }
 });
 
-// GET /api/models - 获取模型列表
-app.get('/api/models', (req, res) => {
-    const { getDb } = require('./db/database');
-    const db = getDb();
-    const models = db.prepare('SELECT * FROM models').all();
-    // 始终包含内置模型
-    const builtinModel = {
-        id: 'builtin_furnace',
-        name: '内置多用炉模型（程序化几何体）',
-        file_path: null,
-        default_scale: 1.0,
-        is_builtin: true
-    };
-    res.json([builtinModel, ...models]);
-});
-
-// DELETE /api/models/:id
-app.delete('/api/models/:id', (req, res) => {
-    const { getDb } = require('./db/database');
-    const db = getDb();
-    const model = db.prepare('SELECT * FROM models WHERE id = ?').get(req.params.id);
-    if (model && model.file_path) {
-        const relativePath = model.file_path.replace(/^[/\\]+/, '');
-        const fullPath = path.resolve(__dirname, relativePath);
-        const allowedRoot = path.resolve(uploadsDir);
-        if (fullPath !== allowedRoot && !fullPath.startsWith(allowedRoot + path.sep)) {
-            return res.status(400).json({ error: '模型文件路径不合法' });
-        }
-        if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+app.get('/api/models', async (req, res) => {
+    try {
+        const db = await getDb();
+        const models = await db.all('SELECT * FROM models');
+        res.json(mergeBuiltinModels(models));
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
-    db.prepare('DELETE FROM models WHERE id = ?').run(req.params.id);
-    res.json({ success: true });
 });
 
-// ============ 数据引擎 API ============
+app.put('/api/models/:id', async (req, res) => {
+    try {
+        const db = await getDb();
+        const existing = await db.get('SELECT * FROM models WHERE id = ?', [req.params.id]);
+        if (!existing) {
+            return res.status(404).json({ error: '模型不存在或为不可编辑的内置模型' });
+        }
 
-// GET /api/engine/status - 获取数据引擎当前状态
+        const nextName = req.body.name ?? existing.name;
+        const nextTags = req.body.tags ?? existing.tags ?? '[]';
+        const nextMetadata = req.body.metadata ?? existing.metadata ?? '{}';
+        const nextScale = Number.isFinite(Number(req.body.default_scale))
+            ? Number(req.body.default_scale)
+            : Number(existing.default_scale || 1);
+
+        await db.run(
+            'UPDATE models SET name = ?, tags = ?, default_scale = ?, metadata = ? WHERE id = ?',
+            [nextName, nextTags, nextScale, nextMetadata, req.params.id]
+        );
+
+        const updated = await db.get('SELECT * FROM models WHERE id = ?', [req.params.id]);
+        res.json({ success: true, model: updated });
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.delete('/api/models/:id', async (req, res) => {
+    try {
+        const db = await getDb();
+        const model = await db.get('SELECT * FROM models WHERE id = ?', [req.params.id]);
+        if (model && model.file_path) {
+            const relativePath = model.file_path.replace(/^[/\\]+/, '');
+            const fullPath = path.resolve(__dirname, relativePath);
+            const allowedRoot = path.resolve(uploadsDir);
+            if (fullPath !== allowedRoot && !fullPath.startsWith(allowedRoot + path.sep)) {
+                return res.status(400).json({ error: '模型文件路径不合法' });
+            }
+            if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+        }
+        await db.run('DELETE FROM models WHERE id = ?', [req.params.id]);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
 app.get('/api/engine/status', (req, res) => {
     if (global.dataEngine) {
         res.json(global.dataEngine.getStatus());
@@ -132,50 +153,90 @@ app.get('/api/engine/status', (req, res) => {
     }
 });
 
-// POST /api/engine/restart - 重启数据引擎（用户修改连接设置后调用）
-app.post('/api/engine/restart', (req, res) => {
-    if (global.dataEngine) {
-        global.dataEngine.restart();
-        res.json({ success: true, message: '数据引擎正在重启...' });
-    } else {
-        res.status(500).json({ error: '数据引擎未初始化' });
+app.post('/api/engine/restart', async (req, res) => {
+    if (!global.dataEngine) {
+        return res.status(500).json({ error: '数据引擎未初始化' });
     }
+    await global.dataEngine.restart();
+    res.json({ success: true, message: '数据引擎正在重启...' });
 });
 
-// 健康检查
 app.get('/api/health', (req, res) => {
     const engineStatus = global.dataEngine ? global.dataEngine.getStatus() : null;
-    res.json({ 
-        status: 'ok', 
+    res.json({
+        status: 'ok',
         timestamp: new Date().toISOString(),
+        db: getDbStatus(),
         engine: engineStatus
     });
 });
 
-// ============ 启动服务器 + WebSocket + 数据引擎 ============
+app.get('/api/database/config', (req, res) => {
+    res.json(publicDatabaseConfig(loadDatabaseConfig()));
+});
 
-const httpServer = http.createServer(app);
+app.post('/api/database/test', async (req, res) => {
+    try {
+        await testDatabaseConfig(req.body || {});
+        res.json({ success: true });
+    } catch (e) {
+        res.status(400).json({ success: false, error: e.message });
+    }
+});
 
-// 初始化 WebSocket
-const WsServer = require('./services/wsServer');
-const wsServer = new WsServer();
-wsServer.attach(httpServer);
+app.put('/api/database/config', async (req, res) => {
+    try {
+        const config = saveDatabaseConfig(req.body || {});
+        await reconnectDb();
+        if (global.dataEngine) {
+            await global.dataEngine.restart();
+        }
+        res.json({ success: true, config });
+    } catch (e) {
+        res.status(400).json({ success: false, error: e.message });
+    }
+});
 
-// 初始化数据引擎
-const DataEngine = require('./services/dataEngine');
-const dataEngine = new DataEngine(wsServer);
-global.dataEngine = dataEngine;
+async function startServer() {
+    const httpServer = http.createServer(app);
+    httpServer.on('error', (error) => {
+        if (error.code === 'EADDRINUSE') {
+            console.error(`\n后端端口 ${PORT} 已被占用。`);
+            console.error(`请先关闭旧的后端进程，或用 PowerShell 临时换端口启动：$env:PORT=3002; npm start`);
+            process.exit(1);
+        }
+        throw error;
+    });
 
-httpServer.listen(PORT, () => {
-    console.log(`\n✅ 数字孪生后端服务已启动: http://localhost:${PORT}`);
-    console.log(`   配置 API:    http://localhost:${PORT}/api/config`);
-    console.log(`   管理 API:    http://localhost:${PORT}/api/lines | devices | datapoints | settings`);
-    console.log(`   引擎状态:    http://localhost:${PORT}/api/engine/status`);
-    console.log(`   WebSocket:   ws://localhost:${PORT}/ws`);
-    console.log('');
+    const WsServer = require('./services/wsServer');
+    const wsServer = new WsServer();
+    wsServer.attach(httpServer);
 
-    // 延迟启动数据引擎（确保数据库初始化完成）
-    setTimeout(() => {
-        dataEngine.start();
-    }, 1000);
+    const DataEngine = require('./services/dataEngine');
+    const dataEngine = new DataEngine(wsServer);
+    global.dataEngine = dataEngine;
+
+    httpServer.listen(PORT, () => {
+        console.log(`\n数字孪生后端服务已启动: http://localhost:${PORT}`);
+        const dbConfig = publicDatabaseConfig(loadDatabaseConfig());
+        console.log(`   Database:    ${dbConfig.type} ${dbConfig.host || dbConfig.filename}:${dbConfig.port || ''}/${dbConfig.database || ''}`);
+        console.log(`   配置 API:    http://localhost:${PORT}/api/config`);
+        console.log(`   管理 API:    http://localhost:${PORT}/api/lines | devices | datapoints | settings`);
+        console.log(`   引擎状态:    http://localhost:${PORT}/api/engine/status`);
+        console.log(`   WebSocket:   ws://localhost:${PORT}/ws\n`);
+
+        setTimeout(() => {
+            getDb()
+                .then(() => dataEngine.start())
+                .catch((error) => {
+                    console.error('[DataEngine] 启动失败:', error.message);
+                    console.error('[DataEngine] 可在后台“数据库连接”中修改并测试数据库配置。');
+                });
+        }, 1000);
+    });
+}
+
+startServer().catch((error) => {
+    console.error('\n后端启动失败:', error.message);
+    process.exit(1);
 });

@@ -2,17 +2,54 @@ import { SceneManager } from '../three/SceneManager.js';
 import { applyRealtimeToDeviceModel, createConfiguredDeviceModel } from './DeviceRenderer.js';
 import { createBatchedDeviceRenderer, getBatchableModelInfo } from './BatchDeviceRenderer.js';
 
+function parseInstanceConfig(raw) {
+    if (!raw) return {};
+    if (typeof raw === 'object') return raw;
+    try {
+        return JSON.parse(raw);
+    } catch (e) {
+        return {};
+    }
+}
+
+function isAuxiliaryDevice(deviceCfg) {
+    const instanceConfig = parseInstanceConfig(deviceCfg?.instance_config);
+    return deviceCfg?.model_type === 'transfer_cart'
+        || instanceConfig.role === 'transfer_cart'
+        || instanceConfig.role === 'auxiliary'
+        || instanceConfig.sceneObject === true;
+}
+
 function flattenDeviceDefinitions(workshops) {
     const definitions = [];
     let gLineIdx = 0;
 
     workshops.forEach((ws, wsIdx) => {
+        const firstWorkshopLineIdx = gLineIdx;
         (ws.lines || []).forEach((line) => {
             const lineDevices = line.devices || [];
             lineDevices.forEach((deviceCfg, devIdx) => {
-                definitions.push({ deviceCfg, devIdx, wsIdx, gLineIdx });
+                definitions.push({
+                    deviceCfg,
+                    devIdx,
+                    wsIdx,
+                    gLineIdx,
+                    lineId: line.id,
+                    isLineMember: !isAuxiliaryDevice(deviceCfg)
+                });
             });
             gLineIdx++;
+        });
+        const workshopAuxLineIdx = Math.max(firstWorkshopLineIdx, gLineIdx - 1);
+        (ws.devices || []).forEach((deviceCfg, devIdx) => {
+            definitions.push({
+                deviceCfg,
+                devIdx,
+                wsIdx,
+                gLineIdx: workshopAuxLineIdx,
+                lineId: deviceCfg.line_id || '',
+                isLineMember: false
+            });
         });
     });
 
@@ -34,10 +71,11 @@ export class SceneRuntime {
             cameraMode,
             onLevelChange,
             onDeviceSelect,
-            onDeviceRegistered
+            onDeviceRegistered,
+            interactionOptions
         } = this.options;
 
-        this.sceneManager = new SceneManager(this.containerElement, onLevelChange, onDeviceSelect);
+        this.sceneManager = new SceneManager(this.containerElement, onLevelChange, onDeviceSelect, interactionOptions);
 
         const definitions = flattenDeviceDefinitions(workshops || []);
         const results = new Array(definitions.length);
@@ -78,7 +116,13 @@ export class SceneRuntime {
             };
         }));
 
-        results.forEach(({ deviceCfg, deviceModel }) => {
+        results.forEach(({ deviceCfg, deviceModel, wsIdx, gLineIdx, lineId, isLineMember }) => {
+            Object.assign(deviceModel.userData, {
+                workshopIdx: wsIdx,
+                globalLineIndex: gLineIdx,
+                lineId,
+                isLineMember
+            });
             this.sceneManager.addFurnace(deviceModel);
             this.furnaces.set(deviceCfg.id, deviceModel);
             if (onDeviceRegistered) onDeviceRegistered(deviceCfg);

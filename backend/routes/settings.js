@@ -2,27 +2,24 @@ const express = require('express');
 const router = express.Router();
 const { getDb } = require('../db/database');
 
-// GET /api/settings - 获取所有设置
-router.get('/', (req, res) => {
-    const db = getDb();
-    const rows = db.prepare('SELECT * FROM settings').all();
-    const settings = {};
-    rows.forEach(r => { settings[r.key] = r.value; });
-    res.json(settings);
+router.get('/', async (req, res) => {
+    try {
+        const db = await getDb();
+        const rows = await db.all('SELECT * FROM settings');
+        const settings = {};
+        rows.forEach(r => { settings[r.key] = r.value; });
+        res.json(settings);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
-// PUT /api/settings - 批量更新设置
-router.put('/', (req, res) => {
-    const db = getDb();
-    const upsert = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
-    const batchUpdate = db.transaction((entries) => {
-        for (const [key, value] of entries) {
-            upsert.run(key, String(value));
-        }
-    });
-
+router.put('/', async (req, res) => {
     try {
-        batchUpdate(Object.entries(req.body));
+        const db = await getDb();
+        for (const [key, value] of Object.entries(req.body)) {
+            await db.upsert('settings', { key, value: String(value) }, 'key');
+        }
         res.json({ success: true });
     } catch (e) {
         res.status(400).json({ error: e.message });

@@ -1,252 +1,283 @@
 /**
- * plcReader.js - S7 PLC 连接与数据读取模块
- * 
- * 统一的 PLC 读取层，方案A 和 方案B 都使用此模块连接和读取 PLC。
- * 使用 nodes7 库通过 S7comm (ISO-on-TCP) 协议通信。
- * 
- * 工作流程：
- * 1. 从数据库读取 PLC 连接参数（IP/端口/机架/槽号）
- * 2. 从数据库读取所有设备的点位映射（data_points 表）
- * 3. 建立 S7 连接
- * 4. 按轮询间隔定时读取所有点位
- * 5. 将读到的原始值按设备分组，组装成前端需要的数据结构
- * 6. 通过回调通知上层（dataEngine）
+ * 内置 S7 PLC 采集器
+ *
+ * 运行模型：
+ * - 每台设备保存自己的 PLC 连接配置。
+ * - 每个点位保存自己的采集周期 sample_interval_ms。
+ * - 运行时按 “PLC 端点 + 采集周期” 合并任务，nodes7 会继续对同一 DB 内点位做批量优化读取。
  */
 
 const nodes7 = require('nodes7');
 const { getDb } = require('../db/database');
 
+const DATA_GROUPS = ['analog', 'status', 'motors', 'doors', 'mechanisms', 'gas'];
+const MIN_SAMPLE_INTERVAL_MS = 100;
+const MAX_SAMPLE_INTERVAL_MS = 60000;
+const STATUS_BROADCAST_MIN_MS = 2000;
+
 class PlcReader {
-    constructor() {
-        this.conn = new nodes7();
-        this.connected = false;
-        this.pollTimer = null;
-        this.onData = null;           // 数据回调: (deviceDataArray) => {}
-        this.onStatusChange = null;   // 连接状态回调: (status) => {}
-        this.devicePointMap = {};     // { deviceId: [{ name, plc_tag, data_type, ... }] }
-        this.allTags = {};            // nodes7 需要的 tag 注册表 { tagName: s7Address }
-        this.settings = {};
-        this.retryTimer = null;
+    constructor(options = {}) {
+        this.options = options;
+        this.onData = null;
+        this.onStatusChange = null;
+        this.tasks = new Map();
+        this.deviceStatus = new Map();
+        this.deviceTaskIds = new Map();
+        this.latestSnapshots = new Map();
+        this.currentStatus = { status: 'idle', message: '采集器未启动', devices: [], timestamp: Date.now() };
+        this.lastStatusSignature = '';
+        this.lastStatusBroadcastAt = 0;
+        this.stopped = true;
     }
 
-    /**
-     * 启动 PLC 读取
-     */
-    start(onData, onStatusChange) {
+    async start(onData, onStatusChange) {
         this.onData = onData;
         this.onStatusChange = onStatusChange;
+        this.stopped = false;
 
-        // 从数据库读取设置
-        this._loadSettings();
+        await this._loadDataPoints();
 
-        if (!this.settings.plc_ip) {
-            console.warn('[PlcReader] PLC IP 地址未配置，跳过连接');
-            this._notifyStatus('unconfigured', 'PLC IP 地址未配置');
+        if (this.tasks.size === 0) {
+            this._notifyAggregateStatus(true);
             return;
         }
 
-        // 从数据库读取所有设备点位
-        this._loadDataPoints();
-
-        if (Object.keys(this.allTags).length === 0) {
-            console.warn('[PlcReader] 没有配置任何点位映射，跳过连接');
-            this._notifyStatus('no_points', '没有配置点位映射');
-            return;
+        console.log(`[PlcReader] 已创建 ${this.tasks.size} 个 PLC 采集任务`);
+        for (const task of this.tasks.values()) {
+            this._connectTask(task);
         }
-
-        // 发起连接
-        this._connect();
     }
 
-    /**
-     * 停止 PLC 读取并断开连接
-     */
     stop() {
-        if (this.pollTimer) {
-            clearInterval(this.pollTimer);
-            this.pollTimer = null;
+        this.stopped = true;
+        for (const task of this.tasks.values()) {
+            this._clearTaskTimers(task);
+            this._dropTaskConnection(task);
+            task.status = 'stopped';
+            task.message = '采集任务已停止';
         }
-        if (this.retryTimer) {
-            clearTimeout(this.retryTimer);
-            this.retryTimer = null;
-        }
-        if (this.connected) {
-            try {
-                this.conn.dropConnection();
-            } catch (e) { /* 忽略断开异常 */ }
-            this.connected = false;
-        }
-        this._notifyStatus('stopped', '已停止');
+        this._notifyStatus('stopped', '内置 PLC 采集器已停止');
         console.log('[PlcReader] 已停止');
     }
 
-    /**
-     * 重新加载配置并重连
-     */
-    restart(onData, onStatusChange) {
+    async restart(onData, onStatusChange) {
         this.stop();
-        // 创建新的 nodes7 实例（旧实例状态不可靠）
-        this.conn = new nodes7();
-        this.allTags = {};
-        this.devicePointMap = {};
-        this.start(onData || this.onData, onStatusChange || this.onStatusChange);
+        this.tasks.clear();
+        this.deviceStatus.clear();
+        this.deviceTaskIds.clear();
+        this.latestSnapshots.clear();
+        await this.start(onData || this.onData, onStatusChange || this.onStatusChange);
     }
 
-    // ==================== 内部方法 ====================
-
-    _loadSettings() {
-        const db = getDb();
-        const rows = db.prepare('SELECT * FROM settings').all();
-        this.settings = {};
-        rows.forEach(r => { this.settings[r.key] = r.value; });
+    getStatus() {
+        return this.currentStatus;
     }
 
-    _loadDataPoints() {
-        const db = getDb();
-        // 获取所有设备及其点位
-        const devices = db.prepare('SELECT * FROM devices').all();
-        const allPoints = db.prepare('SELECT * FROM data_points').all();
+    async _loadDataPoints() {
+        const db = await getDb();
+        const devices = await db.all('SELECT * FROM devices ORDER BY line_id, sort_order ASC');
+        const allPoints = await db.all('SELECT * FROM data_points ORDER BY device_id, id ASC');
+        const pointsByDevice = new Map();
+        allPoints.forEach(point => {
+            if (!pointsByDevice.has(point.device_id)) pointsByDevice.set(point.device_id, []);
+            pointsByDevice.get(point.device_id).push(point);
+        });
 
-        this.devicePointMap = {};
-        this.allTags = {};
+        this.tasks.clear();
+        this.deviceStatus.clear();
+        this.deviceTaskIds.clear();
 
         devices.forEach(device => {
-            const points = allPoints.filter(p => p.device_id === device.id);
-            if (points.length > 0) {
-                this.devicePointMap[device.id] = {
-                    deviceName: device.name,
-                    points: points
-                };
+            const points = pointsByDevice.get(device.id) || [];
+            const plc = this._normalizePlcConfig(device);
+            this.deviceStatus.set(device.id, this._createBaseDeviceStatus(device, plc));
 
-                // 注册 nodes7 tags
-                // tag 名使用 "设备ID.点位名" 格式确保唯一
-                points.forEach(point => {
-                    if (point.plc_tag && point.plc_tag.trim() !== '') {
-                        const tagName = `${device.id}.${point.name}`;
-                        this.allTags[tagName] = point.plc_tag;
-                    }
+            if (!plc.enabled) return;
+            if (plc.protocol !== 'S7') {
+                this._updateBaseDeviceStatus(device.id, {
+                    status: 'unsupported',
+                    quality: 'bad',
+                    message: `暂不支持 ${plc.protocol} 协议`
+                });
+                return;
+            }
+            if (!plc.ip) {
+                this._updateBaseDeviceStatus(device.id, {
+                    status: 'unconfigured',
+                    quality: 'bad',
+                    message: 'PLC IP 未配置'
+                });
+                return;
+            }
+            if (points.length === 0) {
+                this._updateBaseDeviceStatus(device.id, {
+                    status: 'no_points',
+                    quality: 'stale',
+                    message: '未配置点位'
+                });
+                return;
+            }
+
+            let readableCount = 0;
+            points.forEach(point => {
+                if (String(point.access_type || 'READ').toUpperCase() === 'WRITE') return;
+                const address = this._normalizePointAddress(point);
+                if (!address) return;
+
+                readableCount += 1;
+                const interval = this._resolveSampleInterval(point);
+                const endpointKey = this._endpointKey(plc);
+                const taskKey = `${endpointKey}|${interval}`;
+                const task = this._getOrCreateTask(taskKey, plc, interval);
+                const tagName = `${device.id}.${point.name}.${point.id || readableCount}`;
+                task.tags[tagName] = address;
+
+                if (!task.devices[device.id]) {
+                    task.devices[device.id] = { deviceName: device.name, points: [] };
+                }
+                task.devices[device.id].points.push({ ...point, tagName, plc_address: address });
+
+                if (!this.deviceTaskIds.has(device.id)) this.deviceTaskIds.set(device.id, new Set());
+                this.deviceTaskIds.get(device.id).add(taskKey);
+            });
+
+            if (readableCount === 0) {
+                this._updateBaseDeviceStatus(device.id, {
+                    status: 'no_points',
+                    quality: 'stale',
+                    message: '未配置可读取点位或点位地址无效'
                 });
             }
         });
 
-        console.log(`[PlcReader] 已加载 ${Object.keys(this.allTags).length} 个点位映射，覆盖 ${Object.keys(this.devicePointMap).length} 台设备`);
+        const pointCount = Array.from(this.tasks.values())
+            .reduce((sum, task) => sum + Object.keys(task.tags).length, 0);
+        console.log(`[PlcReader] 已加载 ${pointCount} 个可读取点位，覆盖 ${this.deviceTaskIds.size} 台启用 PLC 的设备`);
+        this._refreshDeviceStatuses();
     }
 
-    _connect() {
-        const ip = this.settings.plc_ip;
-        const port = parseInt(this.settings.plc_port || '102');
-        const rack = parseInt(this.settings.plc_rack || '0');
-        const slot = parseInt(this.settings.plc_slot || '1');
-        const timeout = parseInt(this.settings.plc_timeout || '5000');
+    _getOrCreateTask(taskKey, plc, interval) {
+        if (this.tasks.has(taskKey)) return this.tasks.get(taskKey);
+        const task = {
+            id: taskKey,
+            endpointKey: this._endpointKey(plc),
+            endpoint: plc,
+            interval,
+            tags: {},
+            devices: {},
+            conn: null,
+            timer: null,
+            retryTimer: null,
+            reading: false,
+            status: 'idle',
+            message: '等待连接',
+            retryCount: 0,
+            lastReadAt: null,
+            lastError: '',
+            nextRetryAt: null
+        };
+        this.tasks.set(taskKey, task);
+        return task;
+    }
 
-        console.log(`[PlcReader] 正在连接 PLC: ${ip}:${port} (Rack=${rack}, Slot=${slot})`);
-        this._notifyStatus('connecting', `正在连接 ${ip}:${port}...`);
+    _connectTask(task) {
+        if (this.stopped) return;
+        this._clearTaskTimers(task);
+        this._dropTaskConnection(task);
+        task.conn = new nodes7();
+        this._setTaskStatus(task, 'connecting', `正在连接 ${this._formatEndpoint(task.endpoint)}...`);
 
-        this.conn.initiateConnection({
-            host: ip,
-            port: port,
-            rack: rack,
-            slot: slot,
-            timeout: timeout
-        }, (err) => {
+        const { ip, port, rack, slot, timeout } = task.endpoint;
+        task.conn.initiateConnection({ host: ip, port, rack, slot, timeout }, (err) => {
+            if (this.stopped) return;
             if (err) {
-                console.error(`[PlcReader] PLC 连接失败: ${err}`);
-                this.connected = false;
-                this._notifyStatus('error', `连接失败: ${err}`);
-                this._scheduleRetry();
+                this._handleTaskFailure(task, err, '连接失败');
                 return;
             }
 
-            console.log('[PlcReader] PLC 连接成功！');
-            this.connected = true;
-            this._notifyStatus('connected', `已连接 ${ip}:${port}`);
-
-            // 注册所有 tags
-            this.conn.setTranslationCB((tag) => tag);
-            this.conn.addItems(Object.keys(this.allTags).map(name => this.allTags[name]));
-
-            // 开始轮询
-            this._startPolling();
+            try {
+                const tagNames = Object.keys(task.tags);
+                task.conn.setTranslationCB(tag => task.tags[tag]);
+                task.conn.addItems(tagNames);
+                task.retryCount = 0;
+                task.lastError = '';
+                task.nextRetryAt = null;
+                this._setTaskStatus(task, 'connected', `${this._formatEndpoint(task.endpoint)} 已连接，${tagNames.length} 点，${task.interval}ms`);
+                this._startTaskPolling(task);
+            } catch (e) {
+                this._handleTaskFailure(task, e, '点位注册失败');
+            }
         });
     }
 
-    _startPolling() {
-        const interval = parseInt(this.settings.plc_poll_interval || '2000');
-        console.log(`[PlcReader] 开始轮询，间隔 ${interval}ms`);
-
-        // 立即读一次
-        this._readAll();
-
-        this.pollTimer = setInterval(() => {
-            if (this.connected) {
-                this._readAll();
-            }
-        }, interval);
+    _startTaskPolling(task) {
+        this._readTask(task);
+        task.timer = setInterval(() => this._readTask(task), task.interval);
     }
 
-    _readAll() {
-        const addresses = Object.values(this.allTags);
-        if (addresses.length === 0) return;
-
-        this.conn.readAllItems((err, values) => {
+    _readTask(task) {
+        if (this.stopped || task.reading || task.status !== 'connected' || !task.conn) return;
+        task.reading = true;
+        task.conn.readAllItems((err, values) => {
+            task.reading = false;
+            if (this.stopped) return;
             if (err) {
-                console.error('[PlcReader] 读取失败:', err);
-                this.connected = false;
-                this._notifyStatus('error', `读取失败: ${err}`);
-                if (this.pollTimer) {
-                    clearInterval(this.pollTimer);
-                    this.pollTimer = null;
-                }
-                this._scheduleRetry();
+                this._handleTaskFailure(task, err, '读取失败');
                 return;
             }
 
-            // values 的 key 是 S7 地址，需要反向映射回 tagName
-            const addressToTag = {};
-            Object.entries(this.allTags).forEach(([tagName, addr]) => {
-                addressToTag[addr] = tagName;
-            });
+            task.lastReadAt = Date.now();
+            task.lastError = '';
+            task.nextRetryAt = null;
+            if (task.status !== 'connected') {
+                this._setTaskStatus(task, 'connected', `${this._formatEndpoint(task.endpoint)} 数据正常`);
+            } else {
+                this._refreshDeviceStatuses();
+                this._notifyAggregateStatus(false);
+            }
 
-            // 按设备分组组装数据
             const deviceDataArray = [];
-            Object.entries(this.devicePointMap).forEach(([deviceId, info]) => {
-                const deviceData = this._assembleDeviceData(deviceId, info, values, addressToTag);
-                deviceDataArray.push(deviceData);
+            Object.entries(task.devices).forEach(([deviceId, info]) => {
+                const patch = this._assembleDeviceData(deviceId, info, values || {});
+                const merged = this._mergeDevicePatch(deviceId, patch);
+                deviceDataArray.push(merged);
             });
 
-            // 回调通知上层
-            if (this.onData) {
+            if (this.onData && deviceDataArray.length > 0) {
                 this.onData(deviceDataArray);
             }
         });
     }
 
-    /**
-     * 将原始 PLC 值组装成前端需要的设备数据结构
-     */
-    _assembleDeviceData(deviceId, info, rawValues, addressToTag) {
-        const data = {
-            furnace_id: deviceId,
-            furnace_name: info.deviceName,
-            timestamp: Date.now(),
-            analog: {},
-            status: {},
-            motors: {},
-            doors: {},
-            mechanisms: {},
-            quality: {
-                analog: {},
-                status: {},
-                motors: {},
-                doors: {},
-                mechanisms: {}
-            },
-            pointMeta: {}
-        };
+    _handleTaskFailure(task, err, prefix) {
+        const message = `${prefix}: ${err?.message || err}`;
+        console.error(`[PlcReader] ${task.id} ${message}`);
+        this._clearTaskTimers(task);
+        this._dropTaskConnection(task);
+        this._emitBadSnapshotsForTask(task);
+
+        task.retryCount += 1;
+        const maxRetries = Number(task.endpoint.maxRetries || 0);
+        if (maxRetries > 0 && task.retryCount > maxRetries) {
+            this._setTaskStatus(task, 'error', `${message}，重连次数已达上限`);
+            return;
+        }
+
+        const retryInterval = this._clampInteger(task.endpoint.retryInterval, 1000, 120000, 10000);
+        task.lastError = message;
+        task.nextRetryAt = Date.now() + retryInterval;
+        this._setTaskStatus(task, 'retrying', `${message}，${Math.round(retryInterval / 1000)} 秒后重连`);
+        task.retryTimer = setTimeout(() => {
+            task.retryTimer = null;
+            this._connectTask(task);
+        }, retryInterval);
+    }
+
+    _assembleDeviceData(deviceId, info, rawValues) {
+        const data = this._createEmptyDeviceData(deviceId, info.deviceName);
 
         info.points.forEach(point => {
-            const addr = point.plc_tag;
-            const rawValue = rawValues[addr];
+            const rawValue = rawValues[point.tagName];
             const convertedValue = this._convertValue(rawValue, point.data_type);
             const scaledValue = this._applyScaleOffset(convertedValue, point);
             const value = this._applyExpression(scaledValue, point);
@@ -259,11 +290,323 @@ class PlcReader {
             data.pointMeta[`${category}.${fieldName}`] = {
                 label: point.label,
                 unit: point.unit || '',
-                display_format: point.display_format || ''
+                display_format: point.display_format || '',
+                sample_interval_ms: this._resolveSampleInterval(point),
+                plc_address: point.plc_address || point.plc_tag || ''
             };
         });
 
         return data;
+    }
+
+    _emitBadSnapshotsForTask(task) {
+        if (!this.onData) return;
+        const deviceDataArray = [];
+        Object.entries(task.devices || {}).forEach(([deviceId, info]) => {
+            const previous = this.latestSnapshots.get(deviceId) || this._createEmptyDeviceData(deviceId, info.deviceName);
+            const patch = this._createEmptyDeviceData(deviceId, info.deviceName);
+            info.points.forEach(point => {
+                const category = this._resolveCategory(point);
+                const fieldName = point.value_role || point.name;
+                patch[category][fieldName] = previous[category]?.[fieldName] ?? null;
+                patch.quality[category][fieldName] = 'bad';
+                patch.pointMeta[`${category}.${fieldName}`] = {
+                    label: point.label,
+                    unit: point.unit || '',
+                    display_format: point.display_format || '',
+                    sample_interval_ms: this._resolveSampleInterval(point),
+                    plc_address: point.plc_address || point.plc_tag || ''
+                };
+            });
+            deviceDataArray.push(this._mergeDevicePatch(deviceId, patch));
+        });
+        if (deviceDataArray.length > 0) this.onData(deviceDataArray);
+    }
+
+    _mergeDevicePatch(deviceId, patch) {
+        const previous = this.latestSnapshots.get(deviceId) || this._createEmptyDeviceData(deviceId, patch.furnace_name);
+        const merged = this._createEmptyDeviceData(deviceId, patch.furnace_name || previous.furnace_name);
+        merged.timestamp = patch.timestamp;
+
+        DATA_GROUPS.forEach(groupName => {
+            merged[groupName] = {
+                ...(previous[groupName] || {}),
+                ...(patch[groupName] || {})
+            };
+            merged.quality[groupName] = {
+                ...(previous.quality?.[groupName] || {}),
+                ...(patch.quality?.[groupName] || {})
+            };
+        });
+
+        merged.pointMeta = {
+            ...(previous.pointMeta || {}),
+            ...(patch.pointMeta || {})
+        };
+
+        this.latestSnapshots.set(deviceId, merged);
+        return merged;
+    }
+
+    _createEmptyDeviceData(deviceId, deviceName) {
+        return {
+            furnace_id: deviceId,
+            furnace_name: deviceName,
+            timestamp: Date.now(),
+            analog: {},
+            status: {},
+            motors: {},
+            doors: {},
+            mechanisms: {},
+            gas: {},
+            quality: {
+                analog: {},
+                status: {},
+                motors: {},
+                doors: {},
+                mechanisms: {},
+                gas: {}
+            },
+            pointMeta: {}
+        };
+    }
+
+    _setTaskStatus(task, status, message) {
+        const changed = task.status !== status || task.message !== message;
+        task.status = status;
+        task.message = message;
+        this._refreshDeviceStatuses();
+        this._notifyAggregateStatus(changed);
+    }
+
+    _refreshDeviceStatuses() {
+        for (const [deviceId, status] of this.deviceStatus.entries()) {
+            const taskIds = Array.from(this.deviceTaskIds.get(deviceId) || []);
+            if (taskIds.length === 0) continue;
+
+            const tasks = taskIds.map(id => this.tasks.get(id)).filter(Boolean);
+            const connected = tasks.filter(task => task.status === 'connected');
+            const connecting = tasks.filter(task => task.status === 'connecting');
+            const retrying = tasks.filter(task => task.status === 'retrying');
+            const errors = tasks.filter(task => task.status === 'error');
+            const lastReadAt = this._maxNumber(tasks.map(task => task.lastReadAt));
+            const nextRetryAt = this._minNumber(tasks.map(task => task.nextRetryAt));
+            const lastError = tasks.find(task => task.lastError)?.lastError || '';
+            const retryCount = Math.max(...tasks.map(task => Number(task.retryCount || 0)), 0);
+            const intervals = [...new Set(tasks.map(task => task.interval))].sort((a, b) => a - b);
+
+            let next = {
+                status: 'idle',
+                quality: 'stale',
+                message: '等待采集',
+                lastReadAt,
+                lastError,
+                retryCount,
+                nextRetryAt,
+                intervals
+            };
+
+            if (connected.length === tasks.length) {
+                next = { ...next, status: 'connected', quality: 'good', message: '数据采集正常' };
+            } else if (connected.length > 0) {
+                next = { ...next, status: 'retrying', quality: 'stale', message: '部分采集任务异常，正在重连' };
+            } else if (connecting.length > 0) {
+                next = { ...next, status: 'connecting', quality: 'stale', message: '正在连接 PLC' };
+            } else if (retrying.length > 0) {
+                next = { ...next, status: 'retrying', quality: 'stale', message: retrying[0].message || '正在重连 PLC' };
+            } else if (errors.length > 0) {
+                next = { ...next, status: 'error', quality: 'bad', message: errors[0].message || 'PLC 连接失败' };
+            }
+
+            this.deviceStatus.set(deviceId, { ...status, ...next });
+        }
+    }
+
+    _notifyAggregateStatus(force = false) {
+        const devices = Array.from(this.deviceStatus.values())
+            .sort((a, b) => String(a.deviceId).localeCompare(String(b.deviceId)));
+        const active = devices.filter(device => device.status !== 'disabled');
+        const connectedCount = active.filter(device => device.status === 'connected').length;
+
+        let status = 'unconfigured';
+        let message = '未启用任何 PLC 设备';
+
+        if (devices.length === 0) {
+            status = 'no_devices';
+            message = '未配置设备';
+        } else if (active.length === 0) {
+            status = 'unconfigured';
+            message = '未启用任何 PLC 设备';
+        } else if (connectedCount === active.length) {
+            status = 'connected';
+            message = `PLC 数据正常：${connectedCount}/${active.length} 台设备在线`;
+        } else if (connectedCount > 0) {
+            status = 'retrying';
+            message = `PLC 部分异常：${connectedCount}/${active.length} 台设备在线`;
+        } else if (active.some(device => device.status === 'connecting')) {
+            status = 'connecting';
+            message = '正在连接 PLC...';
+        } else if (active.some(device => device.status === 'retrying')) {
+            status = 'retrying';
+            message = 'PLC 连接异常，正在重连';
+        } else if (active.every(device => ['no_points', 'unconfigured', 'unsupported'].includes(device.status))) {
+            status = 'unconfigured';
+            message = 'PLC 设备或点位未配置完整';
+        } else {
+            status = 'error';
+            message = 'PLC 采集异常';
+        }
+
+        const payload = { status, message, devices, timestamp: Date.now() };
+        const signature = JSON.stringify({
+            status,
+            message,
+            devices: devices.map(device => ({
+                id: device.deviceId,
+                status: device.status,
+                lastError: device.lastError,
+                retryCount: device.retryCount,
+                nextRetryAt: device.nextRetryAt
+            }))
+        });
+
+        const now = Date.now();
+        if (!force && signature === this.lastStatusSignature && now - this.lastStatusBroadcastAt < STATUS_BROADCAST_MIN_MS) {
+            this.currentStatus = payload;
+            return;
+        }
+
+        this.currentStatus = payload;
+        this.lastStatusSignature = signature;
+        this.lastStatusBroadcastAt = now;
+        if (this.onStatusChange) this.onStatusChange(payload);
+    }
+
+    _notifyStatus(status, message) {
+        const payload = { status, message, devices: Array.from(this.deviceStatus.values()), timestamp: Date.now() };
+        this.currentStatus = payload;
+        if (this.onStatusChange) this.onStatusChange(payload);
+    }
+
+    _createBaseDeviceStatus(device, plc) {
+        const status = plc.enabled ? 'idle' : 'disabled';
+        return {
+            deviceId: device.id,
+            deviceName: device.name,
+            status,
+            quality: plc.enabled ? 'stale' : 'bad',
+            message: plc.enabled ? '等待采集' : '未启用 PLC 采集',
+            protocol: plc.protocol,
+            endpoint: plc.ip ? this._formatEndpoint(plc) : '',
+            plc_ip: plc.ip || '',
+            plc_port: plc.port || 102,
+            plc_rack: plc.rack || 0,
+            plc_slot: plc.slot || 1,
+            lastReadAt: null,
+            lastError: '',
+            retryCount: 0,
+            nextRetryAt: null,
+            intervals: []
+        };
+    }
+
+    _updateBaseDeviceStatus(deviceId, patch) {
+        const previous = this.deviceStatus.get(deviceId);
+        if (!previous) return;
+        this.deviceStatus.set(deviceId, { ...previous, ...patch });
+    }
+
+    _normalizePlcConfig(device) {
+        const enabled = this._isTruthy(device.plc_enabled);
+        return {
+            enabled,
+            protocol: String(device.plc_protocol || 'S7').trim().toUpperCase(),
+            ip: String(device.plc_ip || '').trim(),
+            port: this._clampInteger(device.plc_port, 1, 65535, 102),
+            rack: this._clampInteger(device.plc_rack, 0, 10, 0),
+            slot: this._clampInteger(device.plc_slot, 0, 31, 1),
+            timeout: this._clampInteger(device.plc_timeout, 1000, 30000, 5000),
+            retryInterval: this._clampInteger(device.plc_retry_interval, 1000, 120000, 10000),
+            maxRetries: this._clampInteger(device.plc_max_retries, 0, 999, 0)
+        };
+    }
+
+    _endpointKey(plc) {
+        return `${plc.protocol}:${plc.ip}:${plc.port}:${plc.rack}:${plc.slot}`;
+    }
+
+    _formatEndpoint(plc) {
+        return `${plc.protocol || 'S7'} ${plc.ip}:${plc.port} (Rack=${plc.rack}, Slot=${plc.slot})`;
+    }
+
+    _resolveSampleInterval(point) {
+        return this._clampInteger(point.sample_interval_ms, MIN_SAMPLE_INTERVAL_MS, MAX_SAMPLE_INTERVAL_MS, 1000);
+    }
+
+    _normalizePointAddress(point) {
+        const raw = String(point.plc_tag || '').trim();
+        if (raw) return this._normalizeS7Address(raw, point.data_type);
+
+        const dbNumber = Number(point.db_number);
+        const byteOffset = Number(point.db_byte_offset);
+        if (!Number.isInteger(dbNumber) || !Number.isInteger(byteOffset)) return null;
+
+        const bitOffset = this._clampInteger(point.bit_offset, 0, 7, 0);
+        return this._composeDbAddress(dbNumber, byteOffset, bitOffset, point.data_type);
+    }
+
+    _normalizeS7Address(address, dataType) {
+        const compact = String(address || '').replace(/\s+/g, '').toUpperCase();
+        if (!compact) return null;
+        if (compact.includes(',')) return compact;
+
+        const dbMatch = compact.match(/^DB(\d+)\.DB([A-Z]+)(\d+)(?:\.(\d+))?$/);
+        if (dbMatch) {
+            const [, db, token, byteOffset, bitOffset] = dbMatch;
+            return this._composeDbAddress(
+                Number(db),
+                Number(byteOffset),
+                bitOffset === undefined ? 0 : Number(bitOffset),
+                this._typeFromDbToken(token, dataType)
+            );
+        }
+
+        return compact;
+    }
+
+    _composeDbAddress(dbNumber, byteOffset, bitOffset, dataType) {
+        if (!Number.isInteger(dbNumber) || dbNumber < 0 || !Number.isInteger(byteOffset) || byteOffset < 0) return null;
+        const type = this._canonicalDataType(dataType);
+        if (type === 'BOOL') {
+            const bit = this._clampInteger(bitOffset, 0, 7, 0);
+            return `DB${dbNumber},X${byteOffset}.${bit}`;
+        }
+        return `DB${dbNumber},${type}${byteOffset}`;
+    }
+
+    _typeFromDbToken(token, dataType) {
+        const normalized = String(token || '').toUpperCase();
+        const pointType = this._canonicalDataType(dataType);
+        if (normalized === 'X') return 'BOOL';
+        if (normalized === 'B' || normalized === 'BYTE') return 'BYTE';
+        if (normalized === 'W' || normalized === 'WORD') return pointType === 'INT' ? 'INT' : 'WORD';
+        if (normalized === 'I' || normalized === 'INT') return 'INT';
+        if (normalized === 'DI' || normalized === 'DINT') return 'DINT';
+        if (normalized === 'DW' || normalized === 'DWORD') return pointType === 'REAL' ? 'REAL' : 'DWORD';
+        if (normalized === 'D') return ['REAL', 'DINT', 'DWORD'].includes(pointType) ? pointType : 'DWORD';
+        if (normalized === 'R' || normalized === 'REAL') return 'REAL';
+        return pointType;
+    }
+
+    _canonicalDataType(dataType) {
+        const type = String(dataType || 'WORD').trim().toUpperCase();
+        if (type === 'BOOL' || type === 'BIT' || type === 'X') return 'BOOL';
+        if (type === 'FLOAT' || type === 'REAL' || type === 'R') return 'REAL';
+        if (type === 'DINT' || type === 'DI') return 'DINT';
+        if (type === 'DWORD' || type === 'DW') return 'DWORD';
+        if (type === 'INT' || type === 'I') return 'INT';
+        if (type === 'BYTE' || type === 'B') return 'BYTE';
+        return 'WORD';
     }
 
     _resolveQuality(rawValue, point) {
@@ -275,12 +618,15 @@ class PlcReader {
 
     _resolveCategory(point) {
         const configured = String(point.category || '').trim().toLowerCase();
-        if (['analog', 'status', 'motors', 'doors', 'mechanisms'].includes(configured)) {
-            return configured;
-        }
+        if (DATA_GROUPS.includes(configured)) return configured;
 
-        // 兼容旧点位：没有配置分类时，仍按名称做兜底推断。
         const name = String(point.name || '').toLowerCase();
+        if (name.includes('gas') || name.includes('valve') || name.includes('n2') ||
+            name.includes('nitrogen') || name.includes('methanol') || name.includes('propane') ||
+            name.includes('ammonia') || name.includes('rx') || name.includes('purge') ||
+            name.includes('enrich')) {
+            return 'gas';
+        }
         if (name.includes('temp') || name.includes('carbon') || name.includes('setpoint') ||
             name.includes('current') || name.includes('pressure') || name.includes('flow')) {
             return 'analog';
@@ -314,8 +660,6 @@ class PlcReader {
     _applyExpression(value, point) {
         const expression = String(point.expression || '').trim();
         if (!expression || typeof value !== 'number' || Number.isNaN(value)) return value;
-
-        // 只允许围绕 x 的基础四则运算，避免把点位表达式变成任意脚本入口。
         if (!/^[xX0-9+\-*/().\s]+$/.test(expression)) return value;
 
         try {
@@ -329,38 +673,66 @@ class PlcReader {
 
     _convertValue(rawValue, dataType) {
         if (rawValue === undefined || rawValue === null) return null;
-        const type = (dataType || '').toUpperCase();
+        const type = this._canonicalDataType(dataType);
         switch (type) {
             case 'BOOL':
                 return !!rawValue;
             case 'REAL':
-            case 'FLOAT':
                 return parseFloat(Number(rawValue).toFixed(2));
             case 'INT':
             case 'WORD':
             case 'DINT':
             case 'DWORD':
-                return parseInt(rawValue);
+            case 'BYTE':
+                return parseInt(rawValue, 10);
             default:
                 return rawValue;
         }
     }
 
-    _scheduleRetry() {
-        const retryInterval = parseInt(this.settings.plc_retry_interval || '10000');
-        console.log(`[PlcReader] 将在 ${retryInterval}ms 后重试连接...`);
-        this._notifyStatus('retrying', `${retryInterval / 1000}秒后重连...`);
-
-        this.retryTimer = setTimeout(() => {
-            this.conn = new nodes7();
-            this._connect();
-        }, retryInterval);
+    _clearTaskTimers(task) {
+        if (task.timer) {
+            clearInterval(task.timer);
+            task.timer = null;
+        }
+        if (task.retryTimer) {
+            clearTimeout(task.retryTimer);
+            task.retryTimer = null;
+        }
+        task.reading = false;
     }
 
-    _notifyStatus(status, message) {
-        if (this.onStatusChange) {
-            this.onStatusChange({ status, message, timestamp: Date.now() });
+    _dropTaskConnection(task) {
+        if (!task.conn) return;
+        try {
+            task.conn.dropConnection();
+        } catch (e) {
+            // nodes7 断开异常无需阻断重连。
         }
+        task.conn = null;
+    }
+
+    _isTruthy(value) {
+        if (typeof value === 'boolean') return value;
+        if (typeof value === 'number') return value !== 0;
+        const text = String(value || '').trim().toLowerCase();
+        return ['1', 'true', 'yes', 'on', 'enabled'].includes(text);
+    }
+
+    _clampInteger(value, min, max, fallback) {
+        const next = Number(value);
+        if (!Number.isFinite(next)) return fallback;
+        return Math.max(min, Math.min(max, Math.round(next)));
+    }
+
+    _maxNumber(values) {
+        const valid = values.filter(value => Number.isFinite(Number(value))).map(Number);
+        return valid.length ? Math.max(...valid) : null;
+    }
+
+    _minNumber(values) {
+        const valid = values.filter(value => Number.isFinite(Number(value))).map(Number);
+        return valid.length ? Math.min(...valid) : null;
     }
 }
 

@@ -11,7 +11,6 @@
   "dependencies": {
     "echarts": "^6.0.0",
     "gsap": "^3.15.0",
-    "mqtt": "^5.15.1",
     "three": "^0.184.0",
     "vue": "^3.5.32",
     "vue-router": "^4.6.4"

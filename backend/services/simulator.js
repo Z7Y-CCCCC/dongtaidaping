@@ -7,6 +7,19 @@
 
 const { getDb } = require('../db/database');
 
+const GAS_VALVE_KEYS = [
+    'valve_1',
+    'valve_2',
+    'valve_3',
+    'valve_4',
+    'valve_5',
+    'valve_6',
+    'valve_7',
+    'valve_8',
+    'valve_9',
+    'valve_10'
+];
+
 class Simulator {
     constructor() {
         this.pollTimer = null;
@@ -17,13 +30,13 @@ class Simulator {
         this.deviceStates = {};
     }
 
-    start(onData, onStatusChange) {
+    async start(onData, onStatusChange) {
         this.onData = onData;
         this.onStatusChange = onStatusChange;
 
         // 从数据库加载设备列表
-        const db = getDb();
-        this.devices = db.prepare('SELECT * FROM devices').all();
+        const db = await getDb();
+        this.devices = await db.all('SELECT * FROM devices');
 
         // 为每台设备初始化模拟状态
         this.devices.forEach(device => {
@@ -33,8 +46,21 @@ class Simulator {
                 actual_carbon: 0.75 + Math.random() * 0.2,   // 0.75-0.95%
                 setpoint_carbon: 0.85,
                 fan_motor: true,
+                rear_fan: true,
+                front_fan: true,
+                rear_fan_speed: 960 + Math.random() * 120,
+                front_fan_speed: 720 + Math.random() * 100,
                 stir_motor: true,
+                oil_stir_1: true,
+                oil_stir_2: true,
+                oil_stir_3: true,
+                oil_stir_4: true,
+                oil_stir_1_speed: 520 + Math.random() * 80,
+                oil_stir_2_speed: 520 + Math.random() * 80,
+                oil_stir_3_speed: 520 + Math.random() * 80,
+                oil_stir_4_speed: 520 + Math.random() * 80,
                 oil_pump: Math.random() > 0.5,
+                gas: this._createGasState(),
                 front_door_open: false,
                 middle_door_open: false,
                 push_chain_forward: false,
@@ -52,10 +78,10 @@ class Simulator {
         }
 
         // 读取轮询间隔
-        const settingsRows = db.prepare('SELECT * FROM settings').all();
+        const settingsRows = await db.all('SELECT * FROM settings');
         const settings = {};
         settingsRows.forEach(r => { settings[r.key] = r.value; });
-        const interval = parseInt(settings.plc_poll_interval || '2000');
+        const interval = parseInt(settings.simulation_interval_ms || '2000');
 
         // 开始模拟
         this._tick();
@@ -73,9 +99,9 @@ class Simulator {
         }
     }
 
-    restart(onData, onStatusChange) {
+    async restart(onData, onStatusChange) {
         this.stop();
-        this.start(onData || this.onData, onStatusChange || this.onStatusChange);
+        await this.start(onData || this.onData, onStatusChange || this.onStatusChange);
     }
 
     _tick() {
@@ -93,6 +119,12 @@ class Simulator {
             state.actual_carbon += (Math.random() - 0.5) * 0.01;
             state.actual_carbon = Math.max(state.setpoint_carbon - 0.1, Math.min(state.setpoint_carbon + 0.1, state.actual_carbon));
 
+            state.rear_fan_speed = this._wander(state.rear_fan_speed, 900, 1120, 10);
+            state.front_fan_speed = this._wander(state.front_fan_speed, 650, 860, 8);
+            for (let i = 1; i <= 4; i++) {
+                state[`oil_stir_${i}_speed`] = this._wander(state[`oil_stir_${i}_speed`], 460, 640, 8);
+            }
+
             // 门和链的周期性动作（模拟生产节拍）
             state.doorCycle++;
             state.chainCycle++;
@@ -105,6 +137,8 @@ class Simulator {
             if (state.chainCycle % 60 === 0) {
                 state.push_chain_forward = !state.push_chain_forward;
             }
+
+            this._updateGasState(state);
 
             // 偶尔随机报警（每次 tick 有 0.5% 概率触发报警，持续约 10 秒）
             if (Math.random() < 0.005) {
@@ -128,7 +162,19 @@ class Simulator {
                 },
                 motors: {
                     fan_motor: state.fan_motor,
+                    rear_fan: state.rear_fan,
+                    front_fan: state.front_fan,
+                    rear_fan_speed: Math.round(state.rear_fan_speed),
+                    front_fan_speed: Math.round(state.front_fan_speed),
                     stir_motor: state.stir_motor,
+                    oil_stir_1: state.oil_stir_1,
+                    oil_stir_2: state.oil_stir_2,
+                    oil_stir_3: state.oil_stir_3,
+                    oil_stir_4: state.oil_stir_4,
+                    oil_stir_1_speed: Math.round(state.oil_stir_1_speed),
+                    oil_stir_2_speed: Math.round(state.oil_stir_2_speed),
+                    oil_stir_3_speed: Math.round(state.oil_stir_3_speed),
+                    oil_stir_4_speed: Math.round(state.oil_stir_4_speed),
                     oil_pump: state.oil_pump
                 },
                 doors: {
@@ -138,6 +184,7 @@ class Simulator {
                 mechanisms: {
                     push_chain_forward: state.push_chain_forward
                 },
+                gas: this._gasPayload(state.gas),
                 quality: {
                     analog: {
                         actual_temp: 'good',
@@ -151,7 +198,19 @@ class Simulator {
                     },
                     motors: {
                         fan_motor: 'good',
+                        rear_fan: 'good',
+                        front_fan: 'good',
+                        rear_fan_speed: 'good',
+                        front_fan_speed: 'good',
                         stir_motor: 'good',
+                        oil_stir_1: 'good',
+                        oil_stir_2: 'good',
+                        oil_stir_3: 'good',
+                        oil_stir_4: 'good',
+                        oil_stir_1_speed: 'good',
+                        oil_stir_2_speed: 'good',
+                        oil_stir_3_speed: 'good',
+                        oil_stir_4_speed: 'good',
                         oil_pump: 'good'
                     },
                     doors: {
@@ -160,7 +219,8 @@ class Simulator {
                     },
                     mechanisms: {
                         push_chain_forward: 'good'
-                    }
+                    },
+                    gas: this._gasQualityPayload()
                 },
                 pointMeta: {
                     'analog.actual_temp': { label: '实际温度', unit: '°C', display_format: '0.0' },
@@ -168,7 +228,13 @@ class Simulator {
                     'analog.actual_carbon': { label: '实际碳势', unit: '%', display_format: '0.000' },
                     'analog.setpoint_carbon': { label: '设定碳势', unit: '%', display_format: '0.000' },
                     'status.running': { label: '运行状态', unit: '', display_format: '' },
-                    'status.alarm': { label: '报警状态', unit: '', display_format: '' }
+                    'status.alarm': { label: '报警状态', unit: '', display_format: '' },
+                    'motors.rear_fan_speed': { label: '后室风扇转速', unit: 'rpm', display_format: '0' },
+                    'motors.front_fan_speed': { label: '前室风扇转速', unit: 'rpm', display_format: '0' },
+                    'motors.oil_stir_1_speed': { label: '油搅拌1转速', unit: 'rpm', display_format: '0' },
+                    'motors.oil_stir_2_speed': { label: '油搅拌2转速', unit: 'rpm', display_format: '0' },
+                    'motors.oil_stir_3_speed': { label: '油搅拌3转速', unit: 'rpm', display_format: '0' },
+                    'motors.oil_stir_4_speed': { label: '油搅拌4转速', unit: 'rpm', display_format: '0' }
                 }
             });
         });
@@ -176,6 +242,55 @@ class Simulator {
         if (this.onData && deviceDataArray.length > 0) {
             this.onData(deviceDataArray);
         }
+    }
+
+    _createGasState() {
+        const gas = {};
+        GAS_VALVE_KEYS.forEach((key, index) => {
+            const on = index < 3 || Math.random() > 0.72;
+            gas[`${key}_on`] = on;
+            gas[`${key}_flow`] = on ? 8 + Math.random() * 38 : 0;
+        });
+        return gas;
+    }
+
+    _updateGasState(state) {
+        GAS_VALVE_KEYS.forEach((key, index) => {
+            if (state.doorCycle % (26 + index * 3) === 0 && index > 1) {
+                state.gas[`${key}_on`] = !state.gas[`${key}_on`];
+            }
+            const target = state.gas[`${key}_on`] ? 8 + (index % 5) * 5 + Math.random() * 4 : 0;
+            state.gas[`${key}_flow`] = this._approach(state.gas[`${key}_flow`], target, 1.5);
+        });
+    }
+
+    _gasPayload(gas) {
+        const payload = {};
+        GAS_VALVE_KEYS.forEach((key) => {
+            payload[`${key}_on`] = !!gas[`${key}_on`];
+            payload[`${key}_flow`] = parseFloat(Number(gas[`${key}_flow`] || 0).toFixed(1));
+        });
+        return payload;
+    }
+
+    _gasQualityPayload() {
+        const quality = {};
+        GAS_VALVE_KEYS.forEach((key) => {
+            quality[`${key}_on`] = 'good';
+            quality[`${key}_flow`] = 'good';
+        });
+        return quality;
+    }
+
+    _wander(value, min, max, step) {
+        const next = Number(value || min) + (Math.random() - 0.5) * step;
+        return Math.max(min, Math.min(max, next));
+    }
+
+    _approach(value, target, step) {
+        const current = Number(value || 0);
+        if (Math.abs(current - target) <= step) return target;
+        return current + Math.sign(target - current) * step;
     }
 }
 

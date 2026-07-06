@@ -24,6 +24,7 @@ export function createDashboardDataStore(options = {}) {
     const staleMs = ref(options.staleMs || 6000);
     const metricsRefreshIntervalMs = options.metricsRefreshIntervalMs || 5000;
     const eventsRefreshIntervalMs = options.eventsRefreshIntervalMs || 5000;
+    const trendUpdateIntervalMs = options.trendUpdateIntervalMs || 5000;
     const wsConnected = ref(false);
     const plcStatusText = ref('等待连接...');
     const selectedDeviceId = ref(null);
@@ -58,6 +59,7 @@ export function createDashboardDataStore(options = {}) {
     let onDeviceData = null;
     let lastMetricsRefreshAt = 0;
     let lastEventsRefreshAt = 0;
+    let lastTrendUpdateAt = 0;
     let metricsInFlight = false;
     let eventsInFlight = false;
 
@@ -141,8 +143,11 @@ export function createDashboardDataStore(options = {}) {
     }
 
     function updateRollingTrend(devices) {
+        const timestamp = Date.now();
+        if (timestamp - lastTrendUpdateAt < trendUpdateIntervalMs) return;
         const temps = devices.map(d => Number(d.analog?.actual_temp)).filter(Number.isFinite);
         if (!temps.length) return;
+        lastTrendUpdateAt = timestamp;
         const avgTemp = temps.reduce((sum, value) => sum + value, 0) / temps.length;
         const now = new Date().toLocaleTimeString().slice(0, 5);
         const points = [...trendPoints.value, { time: now, value: Number(avgTemp.toFixed(1)) }];
