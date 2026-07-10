@@ -3,6 +3,8 @@ import { CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { loadGltf, resolveBackendAssetUrl } from '../three/ModelFactory.js';
 import { resolveDeviceQuality } from './DeviceRenderer.js';
+import { ensureConnectionBadge3D, setConnectionBadge3D } from './ConnectionBadge3D.js';
+import { buildDeviceLabelMarkup, updateDeviceLabelElements, applyDeviceLabelStyle } from './uiConfig.js';
 
 const STATUS_COLORS = {
     bad: new THREE.Color(0xd96060),
@@ -10,6 +12,10 @@ const STATUS_COLORS = {
     alarm: new THREE.Color(0xff3333),
     running: new THREE.Color(0x00ff88),
     idle: new THREE.Color(0x666666)
+};
+const BODY_COLORS = {
+    bad: new THREE.Color(0xa8b0b0),
+    stale: new THREE.Color(0xd8b453)
 };
 
 const BUILTIN_BATCH_MODELS = {
@@ -45,29 +51,40 @@ function numberOrDefault(value, fallback) {
     return Number.isFinite(next) ? next : fallback;
 }
 
+function shouldMirrorX(instanceConfig) {
+    return instanceConfig?.mirrorX === true
+        || instanceConfig?.mirror_x === true
+        || instanceConfig?.mirrorAxis === 'x'
+        || instanceConfig?.mirror_axis === 'x';
+}
+
 function modelMetadata(modelInfo) {
     return parseJson(modelInfo?.metadata, {});
 }
 
 function createBatchMaterial(sourceMaterial) {
     const material = new THREE.MeshLambertMaterial({
-        color: sourceMaterial?.color?.clone?.() || new THREE.Color(0xd8ddd8),
-        map: sourceMaterial?.map || null,
+        color: 0xffffff,
+        map: null,
+        vertexColors: true,
         transparent: false,
         opacity: 1,
         depthWrite: true
     });
     material.name = sourceMaterial?.name || sourceMaterial?.uuid || 'batch_material';
+    material.userData.baseColor = sourceMaterial?.color?.clone?.() || new THREE.Color(0xd8ddd8);
     return material;
 }
 
 function createCompactMaterial(name, color) {
     const material = new THREE.MeshLambertMaterial({
-        color,
+        color: 0xffffff,
+        vertexColors: true,
         transparent: false,
         depthWrite: true
     });
     material.name = name;
+    material.userData.baseColor = color.clone ? color.clone() : new THREE.Color(color);
     return material;
 }
 
@@ -179,6 +196,7 @@ function getDefinitionTransform(definition, modelInfo) {
         ),
         rotationY: numberOrDefault(deviceCfg.rotation_y, 0),
         scale: defaultScale * configuredScale * instanceScale,
+        mirrorX: shouldMirrorX(instanceConfig),
         instanceConfig
     };
 }
@@ -200,23 +218,27 @@ class BatchedDeviceProxy extends THREE.Group {
         this.userData.renderedByBatch = true;
         this.userData.defaultScale = numberOrDefault(modelInfo.default_scale, 1);
         this.userData.instanceConfig = transform.instanceConfig;
+        this.userData.mirrorX = transform.mirrorX;
 
         this.position.copy(transform.position);
         this.rotation.y = transform.rotationY;
-        this.scale.setScalar(transform.scale);
+        this.scale.set(transform.mirrorX ? -transform.scale : transform.scale, transform.scale, transform.scale);
         this.localBox = rootBox.clone();
         this.worldBox = new THREE.Box3();
         this.raycastPoint = new THREE.Vector3();
         this.xRayEnabled = false;
         this.isTransferCart = modelInfo.id === 'transfer_cart';
-        this.lastTempText = null;
-        this.lastCarbonText = null;
-        this.pendingTempText = '--';
-        this.pendingCarbonText = '--';
+        this.labelConfig = {
+            ...(options.labelConfig || {}),
+            ...(transform.instanceConfig.labelConfig || {})
+        };
+        this.labelElements = new Map();
+        this.lastLabelValues = new Map();
         this.lastRealtimeData = null;
 
         this.installVisibleTracker();
         this.createLabel();
+        this.createConnectionBadge(rootBox);
     }
 
     installVisibleTracker() {
@@ -241,20 +263,14 @@ class BatchedDeviceProxy extends THREE.Group {
         div.className = 'furnace-label';
         div.style.opacity = '0';
         div.style.transition = 'opacity 0.5s';
-        div.innerHTML = this.isTransferCart
-            ? `
-                <div class="header">${this.furnaceName}</div>
-                <div class="data-row">速度: <span data-field="temp">--</span></div>
-                <div class="data-row">状态: <span data-field="carbon">待机</span></div>
-            `
-            : `
-                <div class="header">${this.furnaceName}</div>
-                <div class="data-row">温度: <span data-field="temp">--</span> °C</div>
-                <div class="data-row">碳势: <span data-field="carbon">--</span> %</div>
-            `;
+        applyDeviceLabelStyle(div, this.labelConfig);
+        div.innerHTML = buildDeviceLabelMarkup(this.furnaceName, this.labelConfig, { isTransferCart: this.isTransferCart, deviceId: this.furnaceId });
+        div.querySelectorAll('[data-label-row]').forEach((valueEl) => {
+            const key = valueEl.getAttribute('data-label-row');
+            const unitEl = div.querySelector(`[data-label-unit="${key}"]`) || null;
+            this.labelElements.set(key, { valueEl, unitEl });
+        });
 
-        this.tempEl = div.querySelector('[data-field="temp"]');
-        this.carbonEl = div.querySelector('[data-field="carbon"]');
         this.labelDiv = div;
         this.labelObj = new CSS2DObject(div);
         this.labelObj.visible = false;
@@ -268,22 +284,30 @@ class BatchedDeviceProxy extends THREE.Group {
         this.labelAnchor.add(this.labelObj);
     }
 
+    createConnectionBadge(rootBox) {
+        this.connectionBadge3D = ensureConnectionBadge3D(this, { box: rootBox });
+    }
+
+    setConnectionBadge(quality) {
+        this.userData.quality = quality;
+        setConnectionBadge3D(this, quality);
+    }
+
     setLabelVisible(visible) {
-        const nextVisible = !!visible;
+        const nextVisible = !!visible && this.labelConfig?.enabled !== false;
         if (this.labelObj) this.labelObj.visible = nextVisible;
         if (this.labelDiv) this.labelDiv.style.opacity = nextVisible ? '1' : '0';
         if (nextVisible) this.renderLabelText();
     }
 
     renderLabelText() {
-        if (this.tempEl && this.lastTempText !== this.pendingTempText) {
-            this.tempEl.innerText = this.pendingTempText;
-            this.lastTempText = this.pendingTempText;
-        }
-        if (this.carbonEl && this.lastCarbonText !== this.pendingCarbonText) {
-            this.carbonEl.innerText = this.pendingCarbonText;
-            this.lastCarbonText = this.pendingCarbonText;
-        }
+        updateDeviceLabelElements(
+            this.labelElements,
+            this.lastRealtimeData || {},
+            this.labelConfig,
+            { isTransferCart: this.isTransferCart },
+            this.lastLabelValues
+        );
     }
 
     setXRayMode(enable) {
@@ -295,14 +319,8 @@ class BatchedDeviceProxy extends THREE.Group {
 
     updateData(data) {
         this.lastRealtimeData = data;
-        if (this.isTransferCart) {
-            this.pendingTempText = data.analog?.cart_speed ?? data.analog?.speed ?? data.motors?.cart_speed ?? data.motors?.speed ?? '--';
-            this.pendingCarbonText = data.status?.running ? '运行' : data.status?.alarm ? '报警' : '待机';
-        } else {
-            this.pendingTempText = data.analog?.actual_temp ?? '--';
-            this.pendingCarbonText = data.analog?.actual_carbon ?? '--';
-        }
         if (this.labelObj?.visible) this.renderLabelText();
+        this.setConnectionBadge(resolveDeviceQuality(data));
         this.batchRenderer.updateInstanceState(this.instanceIndex, data);
     }
 
@@ -334,6 +352,7 @@ class DeviceBatchRenderer extends THREE.Group {
         this.proxies = [];
         this.instancedMeshes = [];
         this.statusColorHexes = new Array(definitions.length).fill(null);
+        this.bodyQuality = new Array(definitions.length).fill('');
         this.statusLightOffsets = definitions.map(definition => {
             const cfg = parseJson(definition.deviceCfg.instance_config, {});
             return numberOrDefault(cfg.statusLightY, numberOrDefault(modelInfo.default_status_light_y, 2.8));
@@ -355,18 +374,32 @@ class DeviceBatchRenderer extends THREE.Group {
         this.xRayDirty = true;
         this.options = options;
         const metadata = modelMetadata(modelInfo);
+        this.hasMirroredInstances = definitions.some(definition => shouldMirrorX(parseJson(definition.deviceCfg.instance_config, {})));
         this.showStatusLight = options.showStatusLight === true || metadata.runtime?.showStatusLight === true;
         this.supportsXRay = options.supportsXRay === true || metadata.runtime?.allowXRay === true;
 
         parts.forEach(({ geometry, material, key }) => {
+            if (this.hasMirroredInstances) {
+                material.side = THREE.DoubleSide;
+                material.needsUpdate = true;
+            }
             const mesh = new THREE.InstancedMesh(geometry, material, definitions.length);
             mesh.name = `batch_${modelInfo.id}_${key}`;
             mesh.frustumCulled = false;
             mesh.castShadow = false;
             mesh.receiveShadow = false;
             mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+            mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(definitions.length * 3), 3);
             this.instancedMeshes.push(mesh);
             this.add(mesh);
+        });
+
+        this.instancedMeshes.forEach((mesh) => {
+            const baseColor = mesh.material.userData.baseColor || new THREE.Color(0xffffff);
+            for (let index = 0; index < definitions.length; index++) {
+                mesh.setColorAt(index, baseColor);
+            }
+            mesh.instanceColor.needsUpdate = true;
         });
 
         if (this.showStatusLight) {
@@ -391,6 +424,8 @@ class DeviceBatchRenderer extends THREE.Group {
         this.proxies[index] = proxy;
         this.markInstanceDirty(index);
         if (this.showStatusLight) this.updateInstanceColor(index, STATUS_COLORS.idle);
+        this.updateInstanceBodyState(index, 'bad');
+        proxy.setConnectionBadge('bad');
         return proxy;
     }
 
@@ -440,8 +475,9 @@ class DeviceBatchRenderer extends THREE.Group {
     }
 
     updateInstanceState(index, data) {
-        if (!this.showStatusLight) return;
         const quality = resolveDeviceQuality(data);
+        this.updateInstanceBodyState(index, quality);
+        if (!this.showStatusLight) return;
         const color = quality === 'bad'
             ? STATUS_COLORS.bad
             : quality === 'stale'
@@ -452,6 +488,22 @@ class DeviceBatchRenderer extends THREE.Group {
                         ? STATUS_COLORS.running
                         : STATUS_COLORS.idle;
         this.updateInstanceColor(index, color);
+    }
+
+    updateInstanceBodyState(index, quality) {
+        if (this.bodyQuality[index] === quality) return;
+        this.bodyQuality[index] = quality;
+        this.instancedMeshes.forEach((mesh) => {
+            const baseColor = mesh.material.userData.baseColor || new THREE.Color(0xffffff);
+            const color = baseColor.clone();
+            if (quality === 'bad') {
+                color.copy(BODY_COLORS.bad);
+            } else if (quality === 'stale') {
+                color.lerp(BODY_COLORS.stale, 0.35);
+            }
+            mesh.setColorAt(index, color);
+            mesh.instanceColor.needsUpdate = true;
+        });
     }
 
     updateInstanceColor(index, color) {
@@ -541,17 +593,17 @@ class DeviceBatchRenderer extends THREE.Group {
     }
 }
 
-export async function createBatchedDeviceRenderer(modelInfo, definitions) {
+export async function createBatchedDeviceRenderer(modelInfo, definitions, options = {}) {
     if (modelInfo.id === 'transfer_cart') {
         const { parts, rootBox } = createCompactTransferCartParts();
-        const batchRenderer = new DeviceBatchRenderer(modelInfo, parts, rootBox, definitions, { showStatusLight: true });
+        const batchRenderer = new DeviceBatchRenderer(modelInfo, parts, rootBox, definitions, { ...options, showStatusLight: true });
         const deviceModels = definitions.map((definition, index) => batchRenderer.createProxy(definition, index));
         return { batchRenderer, deviceModels };
     }
 
     const root = await loadGltf(resolveBackendAssetUrl(modelInfo.file_path));
     const { parts, rootBox } = collectMergedParts(root);
-    const batchRenderer = new DeviceBatchRenderer(modelInfo, parts, rootBox, definitions);
+    const batchRenderer = new DeviceBatchRenderer(modelInfo, parts, rootBox, definitions, options);
     const deviceModels = definitions.map((definition, index) => batchRenderer.createProxy(definition, index));
     return { batchRenderer, deviceModels };
 }

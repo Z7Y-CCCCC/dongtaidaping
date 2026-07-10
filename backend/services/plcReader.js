@@ -73,6 +73,33 @@ class PlcReader {
         return this.currentStatus;
     }
 
+    getPointRuntimeValues(deviceId, points = []) {
+        const snapshot = this.latestSnapshots.get(deviceId);
+        const deviceStatus = this.deviceStatus.get(deviceId) || null;
+        const fallbackQuality = deviceStatus?.quality || 'bad';
+
+        return {
+            deviceStatus,
+            snapshotTimestamp: snapshot?.timestamp || null,
+            points: points.map(point => {
+                const category = this._resolveCategory(point);
+                const fieldName = point.value_role || point.name;
+                const value = snapshot?.[category]?.[fieldName] ?? null;
+                const quality = snapshot?.quality?.[category]?.[fieldName] || fallbackQuality;
+                return {
+                    ...point,
+                    category_resolved: category,
+                    field_name: fieldName,
+                    plc_address: this._normalizePointAddress(point) || point.plc_tag || '',
+                    sample_interval_ms: this._resolveSampleInterval(point),
+                    value,
+                    quality,
+                    lastReadAt: deviceStatus?.lastReadAt || null
+                };
+            })
+        };
+    }
+
     async _loadDataPoints() {
         const db = await getDb();
         const devices = await db.all('SELECT * FROM devices ORDER BY line_id, sort_order ASC');
@@ -172,6 +199,7 @@ class PlcReader {
             status: 'idle',
             message: '等待连接',
             retryCount: 0,
+            lastConnectedAt: null,
             lastReadAt: null,
             lastError: '',
             nextRetryAt: null
@@ -199,6 +227,7 @@ class PlcReader {
                 const tagNames = Object.keys(task.tags);
                 task.conn.setTranslationCB(tag => task.tags[tag]);
                 task.conn.addItems(tagNames);
+                task.lastConnectedAt = Date.now();
                 task.retryCount = 0;
                 task.lastError = '';
                 task.nextRetryAt = null;
@@ -250,6 +279,7 @@ class PlcReader {
     }
 
     _handleTaskFailure(task, err, prefix) {
+        if (this.stopped) return;
         const message = `${prefix}: ${err?.message || err}`;
         console.error(`[PlcReader] ${task.id} ${message}`);
         this._clearTaskTimers(task);
@@ -269,6 +299,7 @@ class PlcReader {
         this._setTaskStatus(task, 'retrying', `${message}，${Math.round(retryInterval / 1000)} 秒后重连`);
         task.retryTimer = setTimeout(() => {
             task.retryTimer = null;
+            if (this.stopped) return;
             this._connectTask(task);
         }, retryInterval);
     }
@@ -389,6 +420,7 @@ class PlcReader {
             const connecting = tasks.filter(task => task.status === 'connecting');
             const retrying = tasks.filter(task => task.status === 'retrying');
             const errors = tasks.filter(task => task.status === 'error');
+            const lastConnectedAt = this._maxNumber(tasks.map(task => task.lastConnectedAt));
             const lastReadAt = this._maxNumber(tasks.map(task => task.lastReadAt));
             const nextRetryAt = this._minNumber(tasks.map(task => task.nextRetryAt));
             const lastError = tasks.find(task => task.lastError)?.lastError || '';
@@ -399,6 +431,7 @@ class PlcReader {
                 status: 'idle',
                 quality: 'stale',
                 message: '等待采集',
+                lastConnectedAt,
                 lastReadAt,
                 lastError,
                 retryCount,
@@ -464,6 +497,8 @@ class PlcReader {
             devices: devices.map(device => ({
                 id: device.deviceId,
                 status: device.status,
+                lastConnectedAt: device.lastConnectedAt,
+                lastReadAt: device.lastReadAt,
                 lastError: device.lastError,
                 retryCount: device.retryCount,
                 nextRetryAt: device.nextRetryAt
@@ -502,6 +537,7 @@ class PlcReader {
             plc_port: plc.port || 102,
             plc_rack: plc.rack || 0,
             plc_slot: plc.slot || 1,
+            lastConnectedAt: null,
             lastReadAt: null,
             lastError: '',
             retryCount: 0,
@@ -577,6 +613,7 @@ class PlcReader {
     _composeDbAddress(dbNumber, byteOffset, bitOffset, dataType) {
         if (!Number.isInteger(dbNumber) || dbNumber < 0 || !Number.isInteger(byteOffset) || byteOffset < 0) return null;
         const type = this._canonicalDataType(dataType);
+        if (type === 'STRING' || type === 'CHAR') return null;
         if (type === 'BOOL') {
             const bit = this._clampInteger(bitOffset, 0, 7, 0);
             return `DB${dbNumber},X${byteOffset}.${bit}`;
@@ -595,6 +632,10 @@ class PlcReader {
         if (normalized === 'DW' || normalized === 'DWORD') return pointType === 'REAL' ? 'REAL' : 'DWORD';
         if (normalized === 'D') return ['REAL', 'DINT', 'DWORD'].includes(pointType) ? pointType : 'DWORD';
         if (normalized === 'R' || normalized === 'REAL') return 'REAL';
+        if (normalized === 'LR' || normalized === 'LREAL') return 'LREAL';
+        if (normalized === 'S' || normalized === 'STRING') return 'STRING';
+        if (normalized === 'C' || normalized === 'CHAR') return 'CHAR';
+        if (['DT', 'DTZ', 'DTL', 'DTLZ'].includes(normalized)) return normalized;
         return pointType;
     }
 
@@ -602,10 +643,14 @@ class PlcReader {
         const type = String(dataType || 'WORD').trim().toUpperCase();
         if (type === 'BOOL' || type === 'BIT' || type === 'X') return 'BOOL';
         if (type === 'FLOAT' || type === 'REAL' || type === 'R') return 'REAL';
+        if (type === 'LREAL' || type === 'LR') return 'LREAL';
         if (type === 'DINT' || type === 'DI') return 'DINT';
         if (type === 'DWORD' || type === 'DW') return 'DWORD';
         if (type === 'INT' || type === 'I') return 'INT';
         if (type === 'BYTE' || type === 'B') return 'BYTE';
+        if (type === 'STRING' || type === 'S') return 'STRING';
+        if (type === 'CHAR' || type === 'C') return 'CHAR';
+        if (['DT', 'DTZ', 'DTL', 'DTLZ'].includes(type)) return type;
         return 'WORD';
     }
 
@@ -678,6 +723,7 @@ class PlcReader {
             case 'BOOL':
                 return !!rawValue;
             case 'REAL':
+            case 'LREAL':
                 return parseFloat(Number(rawValue).toFixed(2));
             case 'INT':
             case 'WORD':
@@ -685,6 +731,13 @@ class PlcReader {
             case 'DWORD':
             case 'BYTE':
                 return parseInt(rawValue, 10);
+            case 'STRING':
+            case 'CHAR':
+            case 'DT':
+            case 'DTZ':
+            case 'DTL':
+            case 'DTLZ':
+                return rawValue instanceof Date ? rawValue.toISOString() : String(rawValue);
             default:
                 return rawValue;
         }

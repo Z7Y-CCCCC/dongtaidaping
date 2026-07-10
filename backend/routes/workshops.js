@@ -30,6 +30,9 @@ router.put('/:id', async (req, res) => {
     const { name, sort_order } = req.body;
     try {
         const db = await getDb();
+        const existing = await db.get('SELECT id FROM workshops WHERE id = ?', [req.params.id]);
+        if (!existing) return res.status(404).json({ error: '车间不存在，可能已经被删除或 ID 未正确编码' });
+
         await db.run('UPDATE workshops SET name = ?, sort_order = ? WHERE id = ?', [name, sort_order || 0, req.params.id]);
         res.json({ success: true });
     } catch (e) {
@@ -40,6 +43,9 @@ router.put('/:id', async (req, res) => {
 router.delete('/:id', async (req, res) => {
     try {
         const db = await getDb();
+        const existing = await db.get('SELECT id FROM workshops WHERE id = ?', [req.params.id]);
+        if (!existing) return res.status(404).json({ error: '车间不存在，可能已经被删除或 ID 未正确编码' });
+
         await db.transaction(async (tx) => {
             const lines = await tx.all('SELECT id FROM `lines` WHERE workshop_id = ?', [req.params.id]);
             const lineIds = lines.map(line => line.id);

@@ -5,6 +5,13 @@ import { SceneRuntime } from './runtime/SceneRuntime.js'
 import { createDashboardDataStore } from './runtime/DataStore.js'
 import { getSceneCamera } from './runtime/LayoutConfig.js'
 import WidgetRenderer from './runtime/WidgetRenderer.vue'
+import {
+  DEFAULT_DEVICE_LABEL_CONFIG,
+  DEFAULT_DIAGNOSTIC_CONFIG,
+  DEFAULT_LINE_OVERVIEW_CONFIG,
+  buildDiagnosticGroups,
+  normalizeDeviceLabelConfig
+} from './runtime/uiConfig.js'
 
 const threeContainer = ref(null)
 const currentLevel = ref(0)
@@ -30,6 +37,7 @@ const {
 
 const allWorkshops = computed(() => getWorkshops())
 const platform = computed(() => getPlatform() || {})
+const CONFIG_ONLY_WIDGET_TYPES = new Set(['device_label', 'diagnostics', 'line_overview_cards'])
 const defaultDashboardWidgets = [
   { id: 'widget_navigation', widget_type: 'navigation', title: '层级导航', x: 0, y: 0, w: 5, h: 5, sort_order: 0, visible: true, config: {}, binding: {} },
   { id: 'widget_metrics', widget_type: 'metrics', title: '生产指标', x: 0, y: 5, w: 5, h: 5, sort_order: 1, visible: true, config: { compact: true }, binding: {} },
@@ -42,8 +50,38 @@ const dashboardWidgets = computed(() => {
   const widgets = platform.value.widgets?.length ? platform.value.widgets : defaultDashboardWidgets
   return widgets
     .filter(widget => widget.visible !== 0 && widget.visible !== false)
+    .filter(widget => !CONFIG_ONLY_WIDGET_TYPES.has(widget.widget_type))
     .sort((a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0))
 })
+
+function getPlatformWidget(widgetType) {
+  return (platform.value.widgets || []).find(item => item.widget_type === widgetType || item.id === `widget_${widgetType}`) || null
+}
+
+function getPlatformWidgetConfig(widgetType, fallback = {}) {
+  return getPlatformWidget(widgetType)?.config || fallback
+}
+
+function isPlatformWidgetVisible(widgetType, defaultVisible = true) {
+  const widget = getPlatformWidget(widgetType)
+  if (!widget) return defaultVisible
+  return widget.visible !== 0 && widget.visible !== false
+}
+
+const deviceLabelConfig = computed(() => {
+  const config = getPlatformWidgetConfig('device_label', DEFAULT_DEVICE_LABEL_CONFIG)
+  return normalizeDeviceLabelConfig({
+    ...config,
+    enabled: isPlatformWidgetVisible('device_label', true) && config.enabled !== false
+  })
+})
+const diagnosticPanelConfig = computed(() => getPlatformWidgetConfig('diagnostics', DEFAULT_DIAGNOSTIC_CONFIG))
+const isDiagnosticPanelVisible = computed(() => isPlatformWidgetVisible('diagnostics', true))
+const lineOverviewConfig = computed(() => ({
+  ...DEFAULT_LINE_OVERVIEW_CONFIG,
+  ...getPlatformWidgetConfig('line_overview_cards', {})
+}))
+const isLineOverviewVisible = computed(() => isPlatformWidgetVisible('line_overview_cards', true))
 
 const currentLineDevices = computed(() => {
   if (currentLine.value < 0) return []
@@ -55,6 +93,12 @@ const currentLineDevices = computed(() => {
     }
   }
   return []
+})
+
+const lineOverviewDevices = computed(() => {
+  const maxCards = Number(lineOverviewConfig.value.maxCards || 0)
+  if (Number.isFinite(maxCards) && maxCards > 0) return currentLineDevices.value.slice(0, maxCards)
+  return currentLineDevices.value
 })
 
 const headerKpis = computed(() => {
@@ -94,40 +138,10 @@ function gasValveRows(data) {
   return rows
 }
 
-const diagnosticGroups = computed(() => {
-  const data = dataStore.selectedDeviceData
-  return [
-    { title: '温度监控', rows: [
-      { label: '实际', value: data.analog?.actual_temp ?? '--', unit: '°C', quality: data.quality?.analog?.actual_temp },
-      { label: '设定', value: data.analog?.setpoint_temp ?? '--', unit: '°C', quality: data.quality?.analog?.setpoint_temp }
-    ] },
-    { title: '碳势监控', rows: [
-      { label: '实际', value: data.analog?.actual_carbon ?? '--', unit: '%', quality: data.quality?.analog?.actual_carbon },
-      { label: '设定', value: data.analog?.setpoint_carbon ?? '--', unit: '%', quality: data.quality?.analog?.setpoint_carbon }
-    ] },
-    { title: '循环风扇', rows: [
-      { label: '后室', value: runningText(data.motors?.rear_fan ?? data.motors?.fan_motor), unit: `${valueOrDash(data.motors?.rear_fan_speed)} rpm`, quality: data.quality?.motors?.rear_fan },
-      { label: '前室', value: runningText(data.motors?.front_fan ?? data.motors?.fan_motor), unit: `${valueOrDash(data.motors?.front_fan_speed)} rpm`, quality: data.quality?.motors?.front_fan }
-    ] },
-    { title: '油槽搅拌', rows: [1, 2, 3, 4].map(index => ({
-      label: `搅拌${index}`,
-      value: runningText(data.motors?.[`oil_stir_${index}`] ?? data.motors?.stir_motor),
-      unit: `${valueOrDash(data.motors?.[`oil_stir_${index}_speed`])} rpm`,
-      quality: data.quality?.motors?.[`oil_stir_${index}`]
-    })) },
-    { title: '气体阀组', rows: gasValveRows(data).slice(0, 5) },
-    { title: '气体阀组 2', rows: gasValveRows(data).slice(5, 10) },
-    { title: '门与机构', rows: [
-      { label: '前门', value: data.doors?.front_door_open ? '已开启' : '关闭中', quality: data.quality?.doors?.front_door_open },
-      { label: '中门', value: data.doors?.middle_door_open ? '已开启' : '关闭中', quality: data.quality?.doors?.middle_door_open },
-      { label: '推链', value: data.mechanisms?.push_chain_forward ? '向前推入' : '默认位置', quality: data.quality?.mechanisms?.push_chain_forward }
-    ] },
-    { title: '设备状态', rows: [
-      { label: '运行', value: data.status?.running ? '运行' : '停止', quality: data.quality?.status?.running },
-      { label: '报警', value: data.status?.alarm ? '报警' : '正常', quality: data.quality?.status?.alarm }
-    ] }
-  ]
-})
+const diagnosticGroups = computed(() => buildDiagnosticGroups(
+  dataStore.selectedDeviceData,
+  diagnosticPanelConfig.value
+))
 
 function updateTime() {
   const now = new Date()
@@ -192,6 +206,18 @@ function controlCamera(action) {
   sceneRuntime?.controlCamera(action)
 }
 
+function exposeDevRuntime() {
+  if (!import.meta.env.DEV || typeof window === 'undefined') return
+  window.__DASHBOARD_RUNTIME__ = sceneRuntime
+  window.__DASHBOARD_DATA_STORE__ = dataStore
+}
+
+function clearDevRuntime() {
+  if (!import.meta.env.DEV || typeof window === 'undefined') return
+  delete window.__DASHBOARD_RUNTIME__
+  delete window.__DASHBOARD_DATA_STORE__
+}
+
 function getWidgetGridStyle(widget) {
   const columns = platform.value.activeScene?.layout?.grid?.columns || 24
   const rows = platform.value.activeScene?.layout?.grid?.rows || 12
@@ -219,12 +245,14 @@ onMounted(async () => {
     workshops: getWorkshops(),
     models: factoryConfig.models || [],
     cameraMode: getSetting('camera_mode', sceneCamera.mode || 'auto'),
+    deviceLabelConfig: deviceLabelConfig.value,
     onLevelChange: level => { currentLevel.value = level },
     onDeviceSelect: deviceId => dataStore.selectDevice(deviceId),
     onDeviceRegistered: deviceCfg => dataStore.registerDevice(deviceCfg)
   })
 
   await sceneRuntime.start()
+  exposeDevRuntime()
   topLevel.value = sceneRuntime.sceneManager?.topLevel ?? 0
   if (topLevel.value === 1) {
     selectWorkshop(0)
@@ -246,6 +274,7 @@ onUnmounted(() => {
   dataStore.dispose()
   sceneRuntime?.dispose()
   sceneRuntime = null
+  clearDevRuntime()
   window.removeEventListener('workshop-selected', handleWorkshopSelected)
   window.removeEventListener('line-selected', handleLineSelected)
   window.removeEventListener('factory-selected', handleFactorySelected)
@@ -321,7 +350,7 @@ onUnmounted(() => {
       </div>
 
       <transition name="slide-up">
-        <div class="bottom-drawer-panel industrial-panel" v-if="currentLevel === 3" :class="{ 'drawer-closed': !isDrawerOpen }">
+        <div class="bottom-drawer-panel industrial-panel" v-if="currentLevel === 3 && isDiagnosticPanelVisible" :class="{ 'drawer-closed': !isDrawerOpen }">
           <div class="drawer-handle" @click="isDrawerOpen = !isDrawerOpen">
             {{ isDrawerOpen ? '收起诊断面板' : '展开诊断面板' }}
           </div>
@@ -352,9 +381,9 @@ onUnmounted(() => {
       </button>
 
       <transition name="fade-up">
-        <div class="device-overview-bar" v-if="currentLevel === 2 && currentLineDevices.length > 0">
+        <div class="device-overview-bar" v-if="currentLevel === 2 && isLineOverviewVisible && lineOverviewDevices.length > 0">
           <div
-            v-for="deviceCfg in currentLineDevices"
+            v-for="deviceCfg in lineOverviewDevices"
             :key="deviceCfg.id"
             class="device-mini-card industrial-panel"
             :class="[
@@ -367,8 +396,8 @@ onUnmounted(() => {
               {{ dataStore.deviceStatusMap[deviceCfg.id]?.name || deviceCfg.name }}
             </div>
             <div class="card-body">
-              <span>{{ dataStore.deviceStatusMap[deviceCfg.id]?.temp || '--' }} °C</span>
-              <span>{{ dataStore.deviceStatusMap[deviceCfg.id]?.carbon || '--' }} %</span>
+              <span v-if="lineOverviewConfig.showTemperature !== false">{{ dataStore.deviceStatusMap[deviceCfg.id]?.temp || '--' }} {{ lineOverviewConfig.temperatureUnit }}</span>
+              <span v-if="lineOverviewConfig.showCarbon !== false">{{ dataStore.deviceStatusMap[deviceCfg.id]?.carbon || '--' }} {{ lineOverviewConfig.carbonUnit }}</span>
             </div>
           </div>
         </div>
@@ -624,15 +653,41 @@ html, body, #app { width: 100%; height: 100%; overscroll-behavior: none; }
   height: auto;
   padding: 0 0 5px;
   background: transparent;
-  color: #f2b85b;
+  color: var(--device-label-title-color, #f2b85b);
   font-weight: 700;
   font-size: 13px;
   letter-spacing: 0;
 }
 
-.furnace-label .data-row { display: flex; justify-content: space-between; gap: 8px; line-height: 1.5; color: #d7dedb; }
-.furnace-label span { color: #ffffff; font-weight: 700; }
+.furnace-label .data-row { display: flex; justify-content: space-between; gap: 8px; line-height: 1.5; color: var(--device-label-text-color, #d7dedb); }
+.furnace-label span { color: var(--device-label-value-color, #ffffff); font-weight: 700; }
 .furnace-part-label { padding: 5px 8px; color: #ffd180; font-size: 11px; white-space: nowrap; }
+.device-connection-badge {
+  min-width: 48px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  position: relative;
+  z-index: 5;
+  background: rgba(28, 31, 33, .9);
+  border: 1px solid rgba(255,255,255,.18);
+  color: #f4f7f6;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  pointer-events: none;
+  text-align: center;
+  white-space: nowrap;
+  box-shadow: 0 8px 24px rgba(0,0,0,.26);
+}
+.device-connection-badge.bad {
+  background: rgba(74, 78, 80, .92);
+  border-color: rgba(210, 216, 216, .38);
+}
+.device-connection-badge.stale {
+  color: #1d1d1f;
+  background: rgba(240, 179, 90, .94);
+  border-color: rgba(255, 230, 180, .72);
+}
 
 .factory-guide-label {
   min-width: 108px;

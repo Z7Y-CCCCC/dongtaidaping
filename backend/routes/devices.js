@@ -37,6 +37,15 @@ function isAuxiliaryDevice(modelType, instanceConfig) {
         || config.sceneObject === true;
 }
 
+function restartDataEngineSoon(reason) {
+    if (!global.dataEngine?.restart) return;
+    setTimeout(() => {
+        global.dataEngine.restart().catch(e => {
+            console.warn(`[Devices] 数据引擎重启失败(${reason}):`, e.message);
+        });
+    }, 80);
+}
+
 router.get('/', async (req, res) => {
     try {
         const db = await getDb();
@@ -108,6 +117,7 @@ router.post('/', async (req, res) => {
             numberWithDefault(plc_retry_interval, 10000),
             numberWithDefault(plc_max_retries, 0)
         ]);
+        restartDataEngineSoon('create device');
         res.json({ success: true, id });
     } catch (e) {
         res.status(400).json({ error: e.message });
@@ -127,6 +137,9 @@ router.put('/:id', async (req, res) => {
     }
     try {
         const db = await getDb();
+        const existing = await db.get('SELECT id FROM devices WHERE id = ?', [req.params.id]);
+        if (!existing) return res.status(404).json({ error: '设备不存在，可能已经被删除或 ID 未正确编码' });
+
         await db.run(`UPDATE devices SET name=?, line_id=?, model_type=?, model_file=?,
             template_id=?, instance_config=?, pos_x=?, pos_y=?, pos_z=?,
             rotation_y=?, scale=?, sort_order=?, plc_enabled=?, plc_protocol=?, plc_ip=?,
@@ -155,6 +168,7 @@ router.put('/:id', async (req, res) => {
             numberWithDefault(plc_max_retries, 0),
             req.params.id
         ]);
+        restartDataEngineSoon('update device');
         res.json({ success: true });
     } catch (e) {
         res.status(400).json({ error: e.message });
@@ -164,10 +178,15 @@ router.put('/:id', async (req, res) => {
 router.delete('/:id', async (req, res) => {
     try {
         const db = await getDb();
+        const existing = await db.get('SELECT id FROM devices WHERE id = ?', [req.params.id]);
+        if (!existing) return res.status(404).json({ error: '设备不存在，可能已经被删除或 ID 未正确编码' });
+
         await db.transaction(async (tx) => {
             await tx.run('DELETE FROM data_points WHERE device_id = ?', [req.params.id]);
-            await tx.run('DELETE FROM devices WHERE id = ?', [req.params.id]);
+            const result = await tx.run('DELETE FROM devices WHERE id = ?', [req.params.id]);
+            if (!result?.affectedRows && !result?.changes) throw new Error('设备删除失败：没有删除到任何记录');
         });
+        restartDataEngineSoon('delete device');
         res.json({ success: true });
     } catch (e) {
         res.status(400).json({ error: e.message });

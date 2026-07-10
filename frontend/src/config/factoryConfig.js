@@ -15,6 +15,16 @@ const factoryConfig = reactive({
 const loading = ref(false)
 const error = ref(null)
 
+async function readApiJson(resp, fallbackMessage = '请求失败') {
+    const data = await resp.json().catch(() => ({}))
+    if (!resp.ok) return { error: data.error || `${fallbackMessage}: ${resp.status}` }
+    return data
+}
+
+function pathId(id) {
+    return encodeURIComponent(String(id))
+}
+
 /**
  * 从后端拉取完整工厂配置
  */
@@ -132,52 +142,63 @@ export function useFactoryConfig() {
 export const adminApi = {
     // 车间
     async getWorkshops() { return (await fetch(`${API_BASE}/workshops`)).json() },
-    async createWorkshop(data) { return (await fetch(`${API_BASE}/workshops`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
-    async updateWorkshop(id, data) { return (await fetch(`${API_BASE}/workshops/${id}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
-    async deleteWorkshop(id) { return (await fetch(`${API_BASE}/workshops/${id}`, { method: 'DELETE' })).json() },
+    async createWorkshop(data) { return readApiJson(await fetch(`${API_BASE}/workshops`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '创建车间失败') },
+    async updateWorkshop(id, data) { return readApiJson(await fetch(`${API_BASE}/workshops/${pathId(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存车间失败') },
+    async deleteWorkshop(id) { return readApiJson(await fetch(`${API_BASE}/workshops/${pathId(id)}`, { method: 'DELETE' }), '删除车间失败') },
 
     // 产线
     async getLines() { return (await fetch(`${API_BASE}/lines`)).json() },
-    async createLine(data) { return (await fetch(`${API_BASE}/lines`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
-    async updateLine(id, data) { return (await fetch(`${API_BASE}/lines/${id}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
-    async deleteLine(id) { return (await fetch(`${API_BASE}/lines/${id}`, { method: 'DELETE' })).json() },
+    async createLine(data) { return readApiJson(await fetch(`${API_BASE}/lines`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '创建产线失败') },
+    async updateLine(id, data) { return readApiJson(await fetch(`${API_BASE}/lines/${pathId(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存产线失败') },
+    async deleteLine(id) { return readApiJson(await fetch(`${API_BASE}/lines/${pathId(id)}`, { method: 'DELETE' }), '删除产线失败') },
 
     // 设备
     async getDevices(lineId) { 
-        const url = lineId ? `${API_BASE}/devices?line_id=${lineId}` : `${API_BASE}/devices`
+        const url = lineId ? `${API_BASE}/devices?line_id=${encodeURIComponent(lineId)}` : `${API_BASE}/devices`
         return (await fetch(url)).json() 
     },
-    async getDevice(id) { return (await fetch(`${API_BASE}/devices/${id}`)).json() },
-    async createDevice(data) { return (await fetch(`${API_BASE}/devices`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
-    async updateDevice(id, data) { return (await fetch(`${API_BASE}/devices/${id}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
-    async deleteDevice(id) { return (await fetch(`${API_BASE}/devices/${id}`, { method: 'DELETE' })).json() },
+    async getDevice(id) { return readApiJson(await fetch(`${API_BASE}/devices/${pathId(id)}`), '读取设备失败') },
+    async createDevice(data) { return readApiJson(await fetch(`${API_BASE}/devices`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '创建设备失败') },
+    async updateDevice(id, data) { return readApiJson(await fetch(`${API_BASE}/devices/${pathId(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存设备失败') },
+    async deleteDevice(id) { return readApiJson(await fetch(`${API_BASE}/devices/${pathId(id)}`, { method: 'DELETE' }), '删除设备失败') },
 
     // 点位
-    async getDataPoints(deviceId) { return (await fetch(`${API_BASE}/datapoints?device_id=${deviceId}`)).json() },
-    async saveDataPointsBatch(deviceId, points) { 
-        return (await fetch(`${API_BASE}/datapoints/batch`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ device_id: deviceId, points }) })).json() 
+    async getDataPoints(deviceId) {
+        const suffix = deviceId && deviceId !== 'all' ? `?device_id=${encodeURIComponent(deviceId)}` : ''
+        return (await fetch(`${API_BASE}/datapoints${suffix}`)).json()
     },
-    async deleteDataPoint(id) { return (await fetch(`${API_BASE}/datapoints/${id}`, { method: 'DELETE' })).json() },
+    async saveDataPointsBatch(deviceId, points) { 
+        return readApiJson(await fetch(`${API_BASE}/datapoints/batch`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ device_id: deviceId, points }) }), '保存点位失败')
+    },
+    async getRealtimePointValues(deviceId) {
+        const suffix = deviceId && deviceId !== 'all' ? `?device_id=${encodeURIComponent(deviceId)}` : ''
+        return readApiJson(await fetch(`${API_BASE}/plc/points/realtime${suffix}`), '读取实时点位失败')
+    },
+    async deleteDataPoint(id) { return readApiJson(await fetch(`${API_BASE}/datapoints/${pathId(id)}`, { method: 'DELETE' }), '删除点位失败') },
 
     // 设置
     async getSettings() { return (await fetch(`${API_BASE}/settings`)).json() },
-    async saveSettings(data) { return (await fetch(`${API_BASE}/settings`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
+    async saveSettings(data) { return readApiJson(await fetch(`${API_BASE}/settings`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存设置失败') },
     async getDatabaseConfig() { return (await fetch(`${API_BASE}/database/config`)).json() },
-    async testDatabaseConfig(data) { return (await fetch(`${API_BASE}/database/test`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
-    async saveDatabaseConfig(data) { return (await fetch(`${API_BASE}/database/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
+    async testDatabaseConfig(data) { return readApiJson(await fetch(`${API_BASE}/database/test`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '测试数据库连接失败') },
+    async saveDatabaseConfig(data) { return readApiJson(await fetch(`${API_BASE}/database/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存数据库配置失败') },
 
     // 模型
     async getModels() { return (await fetch(`${API_BASE}/models`)).json() },
-    async uploadModel(formData) { return (await fetch(`${API_BASE}/models/upload`, { method: 'POST', body: formData })).json() },
-    async updateModel(id, data) { return (await fetch(`${API_BASE}/models/${id}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
-    async deleteModel(id) { return (await fetch(`${API_BASE}/models/${id}`, { method: 'DELETE' })).json() },
+    async uploadModel(formData) { return readApiJson(await fetch(`${API_BASE}/models/upload`, { method: 'POST', body: formData }), '上传模型失败') },
+    async updateModel(id, data) { return readApiJson(await fetch(`${API_BASE}/models/${pathId(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存模型失败') },
+    async deleteModel(id) {
+        const resp = await fetch(`${API_BASE}/models/${pathId(id)}`, { method: 'DELETE' })
+        const data = await resp.json().catch(() => ({}))
+        return resp.ok ? data : { error: data.error || `删除失败: ${resp.status}` }
+    },
 
     // 平台编排
     async getPlatform() { return (await fetch(`${API_BASE}/platform`)).json() },
-    async updateScene(id, data) { return (await fetch(`${API_BASE}/platform/scenes/${id}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
-    async createWidget(data) { return (await fetch(`${API_BASE}/platform/widgets`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
-    async updateWidget(id, data) { return (await fetch(`${API_BASE}/platform/widgets/${id}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
-    async deleteWidget(id) { return (await fetch(`${API_BASE}/platform/widgets/${id}`, { method: 'DELETE' })).json() },
+    async updateScene(id, data) { return readApiJson(await fetch(`${API_BASE}/platform/scenes/${pathId(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存场景失败') },
+    async createWidget(data) { return readApiJson(await fetch(`${API_BASE}/platform/widgets`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '创建组件失败') },
+    async updateWidget(id, data) { return readApiJson(await fetch(`${API_BASE}/platform/widgets/${pathId(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存组件失败') },
+    async deleteWidget(id) { return readApiJson(await fetch(`${API_BASE}/platform/widgets/${pathId(id)}`, { method: 'DELETE' }), '删除组件失败') },
     async getEvents(limit = 50) { return (await fetch(`${API_BASE}/platform/events?limit=${limit}`)).json() },
     async createEvent(data) { return (await fetch(`${API_BASE}/platform/events`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })).json() },
 }

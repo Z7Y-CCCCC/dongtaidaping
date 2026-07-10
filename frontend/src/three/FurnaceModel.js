@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import gsap from 'gsap';
+import { buildDeviceLabelMarkup, updateDeviceLabelElements, applyDeviceLabelStyle } from '../runtime/uiConfig.js';
 
 const GAS_DEFS = [
     { key: 'valve_1', label: 'N2', aliases: ['n2', 'nitrogen'] },
@@ -103,7 +104,7 @@ function makeBladeGroup(material, count = 4, radius = 0.72) {
 }
 
 export class FurnaceModel extends THREE.Group {
-    constructor(id, name) {
+    constructor(id, name, options = {}) {
         super();
         this.furnaceId = id;
         this.furnaceName = name;
@@ -119,8 +120,12 @@ export class FurnaceModel extends THREE.Group {
         this.detailObjects = [];
         this.detailVisible = true;
         this.xRayEnabled = false;
-        this.lastTempText = null;
-        this.lastCarbonText = null;
+        this.labelConfig = {
+            ...(options.labelConfig || {}),
+            ...(options.instanceConfig?.labelConfig || {})
+        };
+        this.labelElements = new Map();
+        this.lastLabelValues = new Map();
         this.lastDeviceQuality = null;
         this.lastAlarm = null;
 
@@ -382,17 +387,15 @@ export class FurnaceModel extends THREE.Group {
         div.className = 'furnace-label';
         div.style.opacity = '0';
         div.style.transition = 'opacity 0.25s ease';
-        div.innerHTML = `
-            <div class="header">${this.furnaceName}</div>
-            <div class="data-row">温度: <span data-field="temp">--</span> °C</div>
-            <div class="data-row">碳势: <span data-field="carbon">--</span> %</div>
-            <div class="data-row">气体: <span data-field="gas">--</span></div>
-        `;
+        applyDeviceLabelStyle(div, this.labelConfig);
+        div.innerHTML = buildDeviceLabelMarkup(this.furnaceName, this.labelConfig, { isTransferCart: false, deviceId: this.furnaceId });
+        div.querySelectorAll('[data-label-row]').forEach((valueEl) => {
+            const key = valueEl.getAttribute('data-label-row');
+            const unitEl = div.querySelector(`[data-label-unit="${key}"]`) || null;
+            this.labelElements.set(key, { valueEl, unitEl });
+        });
 
         this.labelDiv = div;
-        this.tempEl = div.querySelector('[data-field="temp"]');
-        this.carbonEl = div.querySelector('[data-field="carbon"]');
-        this.gasEl = div.querySelector('[data-field="gas"]');
         this.labelObj = new CSS2DObject(div);
         this.labelObj.visible = false;
         this.labelAnchor.add(this.labelObj);
@@ -413,7 +416,7 @@ export class FurnaceModel extends THREE.Group {
     }
 
     setLabelVisible(visible) {
-        const nextVisible = !!visible;
+        const nextVisible = !!visible && this.labelConfig?.enabled !== false;
         if (this.labelObj) this.labelObj.visible = nextVisible;
         if (this.labelDiv) this.labelDiv.style.opacity = nextVisible ? '1' : '0';
     }
@@ -466,16 +469,13 @@ export class FurnaceModel extends THREE.Group {
     }
 
     updateMainLabel(data) {
-        const tempText = firstDefined(data.analog?.actual_temp, data.analog?.rear_temp, '--');
-        const carbonText = firstDefined(data.analog?.actual_carbon, data.analog?.carbon, '--');
-        if (this.tempEl && this.lastTempText !== tempText) {
-            this.tempEl.innerText = tempText;
-            this.lastTempText = tempText;
-        }
-        if (this.carbonEl && this.lastCarbonText !== carbonText) {
-            this.carbonEl.innerText = carbonText;
-            this.lastCarbonText = carbonText;
-        }
+        updateDeviceLabelElements(
+            this.labelElements,
+            data || {},
+            this.labelConfig,
+            { isTransferCart: false },
+            this.lastLabelValues
+        );
     }
 
     updateMotors(data) {

@@ -689,6 +689,8 @@ async function ensureColumn(table, column, definitionSql) {
 async function ensureSchemaColumns() {
     const t = schemaTypes();
 
+    await ensureColumn('lines', 'layout_json', `${t.json}`);
+
     await ensureColumn('devices', 'plc_enabled', `${t.bool} DEFAULT 0`);
     await ensureColumn('devices', 'plc_protocol', `${t.string(32)} DEFAULT 'S7'`);
     await ensureColumn('devices', 'plc_ip', `${t.string(128)} DEFAULT ''`);
@@ -704,6 +706,11 @@ async function ensureSchemaColumns() {
     await ensureColumn('data_points', 'db_number', `${t.int} NULL`);
     await ensureColumn('data_points', 'db_byte_offset', `${t.int} NULL`);
     await ensureColumn('data_points', 'bit_offset', `${t.int} NULL`);
+    await ensureColumn('data_points', 'point_kind', `${t.string(32)} DEFAULT 'normal'`);
+    await ensureColumn('data_points', 'alarm_record_role', `${t.string(64)} DEFAULT ''`);
+    await ensureColumn('data_points', 'alarm_text', `${t.text}`);
+    await ensureColumn('data_points', 'alarm_level', `${t.string(32)} DEFAULT 'WARNING'`);
+    await ensureColumn('data_points', 'alarm_condition', `${t.string(64)} DEFAULT '=1'`);
 }
 
 async function rawQuery(sql) {
@@ -726,6 +733,7 @@ async function initTables() {
         id ${t.string(64)} PRIMARY KEY,
         name ${t.string(255)} NOT NULL,
         workshop_id ${t.string(64)},
+        layout_json ${t.json},
         sort_order ${t.int} DEFAULT 0,
         created_at ${t.datetime} DEFAULT CURRENT_TIMESTAMP
     `);
@@ -774,6 +782,11 @@ async function initTables() {
         db_number ${t.int} NULL,
         db_byte_offset ${t.int} NULL,
         bit_offset ${t.int} NULL,
+        point_kind ${t.string(32)} DEFAULT 'normal',
+        alarm_record_role ${t.string(64)} DEFAULT '',
+        alarm_text ${t.text},
+        alarm_level ${t.string(32)} DEFAULT 'WARNING',
+        alarm_condition ${t.string(64)} DEFAULT '=1',
         alarm_high ${t.double} NULL,
         alarm_low ${t.double} NULL
     `);
@@ -954,7 +967,17 @@ async function seedFactoryDefaults(db) {
     const lineNames = ['A 产线', 'B 产线', 'C 产线', 'D 产线'];
     for (let li = 0; li < lineNames.length; li++) {
         const lineId = `line_${String.fromCharCode(97 + li)}`;
-        await db.insertIgnore('lines', { id: lineId, name: lineNames[li], workshop_id: 'ws_1', sort_order: li }, 'id');
+        await db.insertIgnore('lines', {
+            id: lineId,
+            name: lineNames[li],
+            workshop_id: 'ws_1',
+            layout_json: JSON.stringify({
+                version: 1,
+                lanes: [{ id: 'lane_1', name: '设备线 1', type: 'device_lane', offsetZ: 0, length: 60, sort_order: 0 }],
+                rails: []
+            }),
+            sort_order: li
+        }, 'id');
 
         for (let di = 0; di < 5; di++) {
             const globalIdx = li * 5 + di;
@@ -978,6 +1001,9 @@ async function seedFactoryDefaults(db) {
 }
 
 async function seedModelAssets(db) {
+    const deletedSeed = await db.get('SELECT value FROM settings WHERE `key` = ?', ['deleted_seed_model_box_atmosphere_furnace']);
+    if (String(deletedSeed?.value || '') === '1') return;
+
     await db.insertIgnore('models', {
         id: 'box_atmosphere_furnace',
         name: '箱式气氛多用炉低模',
@@ -1056,6 +1082,28 @@ async function seedPlatformDefaults(db) {
                 visible: 1
             }, 'id');
         }
+    }
+
+    const configWidgets = [
+        ['widget_device_label_config', 'device_label', '设备浮标配置', JSON.stringify({ enabled: true, showTitle: true, titleTemplate: '{name}', rows: [{ key: 'temperature', label: '温度', path: 'analog.actual_temp', fallbackPaths: ['analog.rear_temp'], unit: '°C' }, { key: 'carbon', label: '碳势', path: 'analog.actual_carbon', fallbackPaths: ['analog.carbon'], unit: '%' }], style: { minWidth: '132px', padding: '8px 10px', fontSize: '12px', background: 'rgba(18, 22, 24, .84)', borderColor: 'rgba(242, 184, 91, .35)', titleColor: '#f2b85b', textColor: '#d7dedb', valueColor: '#ffffff' } }), '{}', 0, 0, 1, 1, 98, 1],
+        ['widget_diagnostics_config', 'diagnostics', '诊断面板配置', '{}', '{}', 0, 0, 1, 1, 99, 0],
+        ['widget_line_overview_cards_config', 'line_overview_cards', '产线设备卡片配置', '{}', '{}', 0, 0, 1, 1, 100, 1]
+    ];
+    for (const [id, widget_type, title, config_json, binding_json, x, y, w, h, sort_order, visible] of configWidgets) {
+        await db.insertIgnore('widgets', {
+            id,
+            scene_id: 'scene_factory_overview',
+            widget_type,
+            title,
+            config_json,
+            binding_json,
+            x,
+            y,
+            w,
+            h,
+            sort_order,
+            visible
+        }, 'id');
     }
 
     const releaseCount = await db.get('SELECT COUNT(*) AS cnt FROM releases');

@@ -41,14 +41,7 @@ export function createDashboardDataStore(options = {}) {
         total_devices: 0
     });
     const events = ref([{ id: 'boot', time: new Date().toLocaleTimeString(), msg: '等待实时事件接入', level: 'info' }]);
-    const trendPoints = ref([
-        { time: '08:00', value: 840 },
-        { time: '10:00', value: 852 },
-        { time: '12:00', value: 850 },
-        { time: '14:00', value: 855 },
-        { time: '16:00', value: 848 },
-        { time: '18:00', value: 850 }
-    ]);
+    const trendPoints = ref([]);
 
     const latestDeviceDataMap = new Map();
     const lastSeenMap = new Map();
@@ -60,6 +53,7 @@ export function createDashboardDataStore(options = {}) {
     let lastMetricsRefreshAt = 0;
     let lastEventsRefreshAt = 0;
     let lastTrendUpdateAt = 0;
+    let lastRealtimeFrameAt = 0;
     let metricsInFlight = false;
     let eventsInFlight = false;
 
@@ -70,6 +64,15 @@ export function createDashboardDataStore(options = {}) {
 
     function setDeviceDataHandler(handler) {
         onDeviceData = handler;
+        Object.keys(deviceStatusMap).forEach((deviceId) => {
+            const cachedData = latestDeviceDataMap.get(deviceId);
+            if (cachedData) {
+                onDeviceData?.(cachedData);
+            } else {
+                onDeviceData?.(createDeviceConnectionData(deviceId, deviceStatusMap[deviceId]?.quality || 'bad'));
+            }
+        });
+        recomputeMetricsFromRuntime();
     }
 
     function registerDevice(deviceCfg) {
@@ -84,6 +87,8 @@ export function createDashboardDataStore(options = {}) {
             quality: 'bad',
             lastSeen: null
         };
+        if (onDeviceData) onDeviceData(createDeviceConnectionData(deviceCfg.id, 'bad'));
+        recomputeMetricsFromRuntime();
     }
 
     function selectDevice(deviceId) {
@@ -96,6 +101,7 @@ export function createDashboardDataStore(options = {}) {
     function applyDeviceRealtimeData(data) {
         if (!data?.furnace_id) return;
 
+        lastRealtimeFrameAt = Date.now();
         latestDeviceDataMap.set(data.furnace_id, data);
         lastSeenMap.set(data.furnace_id, Date.now());
 
@@ -116,6 +122,89 @@ export function createDashboardDataStore(options = {}) {
         }
 
         if (onDeviceData) onDeviceData(data);
+        recomputeMetricsFromRuntime();
+    }
+
+    function qualityFromPlcStatus(status) {
+        const value = String(status || '').toLowerCase();
+        if (value === 'connected') return 'good';
+        if (['connecting', 'retrying', 'idle', 'no_points'].includes(value)) return 'stale';
+        return 'bad';
+    }
+
+    function createDeviceConnectionData(deviceId, quality, patch = {}) {
+        const status = deviceStatusMap[deviceId] || {};
+        return {
+            furnace_id: deviceId,
+            furnace_name: status.name || patch.deviceName || deviceId,
+            analog: {},
+            status: {
+                running: false,
+                alarm: false,
+                connection_status: patch.status || quality
+            },
+            motors: {},
+            doors: {},
+            mechanisms: {},
+            gas: {},
+            quality: {
+                status: {
+                    _connection: quality,
+                    running: quality,
+                    alarm: quality
+                }
+            },
+            plc: {
+                status: patch.status || quality,
+                message: patch.message || '',
+                lastConnectedAt: patch.lastConnectedAt || null,
+                lastReadAt: patch.lastReadAt || null,
+                lastError: patch.lastError || ''
+            }
+        };
+    }
+
+    function applyPlcStatus(payload) {
+        plcStatusText.value = payload?.message || payload?.status || '状态未知';
+        (payload?.devices || []).forEach((deviceStatus) => {
+            const deviceId = deviceStatus.deviceId;
+            if (!deviceId) return;
+            const quality = deviceStatus.quality || qualityFromPlcStatus(deviceStatus.status);
+            const previous = deviceStatusMap[deviceId] || {};
+            deviceStatusMap[deviceId] = {
+                ...previous,
+                name: previous.name || deviceStatus.deviceName || deviceId,
+                online: quality === 'good',
+                quality,
+                plcStatus: deviceStatus.status,
+                lastConnectedAt: deviceStatus.lastConnectedAt || previous.lastConnectedAt || null,
+                lastReadAt: deviceStatus.lastReadAt || previous.lastReadAt || null,
+                lastError: deviceStatus.lastError || ''
+            };
+
+            if (quality !== 'good' || !latestDeviceDataMap.has(deviceId)) {
+                const cachedData = latestDeviceDataMap.get(deviceId);
+                const connectionData = cachedData
+                    ? {
+                        ...cloneDataWithQuality(cachedData, quality),
+                        plc: {
+                            ...(cachedData.plc || {}),
+                            status: deviceStatus.status || quality,
+                            message: deviceStatus.message || '',
+                            lastConnectedAt: deviceStatus.lastConnectedAt || null,
+                            lastReadAt: deviceStatus.lastReadAt || null,
+                            lastError: deviceStatus.lastError || ''
+                        }
+                    }
+                    : createDeviceConnectionData(deviceId, quality, deviceStatus);
+                latestDeviceDataMap.set(deviceId, connectionData);
+                if (selectedDeviceId.value === deviceId) {
+                    Object.keys(selectedDeviceData).forEach(key => delete selectedDeviceData[key]);
+                    Object.assign(selectedDeviceData, connectionData);
+                }
+                if (onDeviceData) onDeviceData(connectionData);
+            }
+        });
     }
 
     function cloneDataWithQuality(data, quality) {
@@ -138,8 +227,27 @@ export function createDashboardDataStore(options = {}) {
         const devices = payload?.devices || [];
         devices.forEach(applyDeviceRealtimeData);
         updateRollingTrend(devices);
-        refreshMetrics();
+        recomputeMetricsFromRuntime();
         refreshEvents();
+    }
+
+    function hasRecentRealtimeFrame() {
+        return lastRealtimeFrameAt > 0 && Date.now() - lastRealtimeFrameAt <= staleMs.value * 2;
+    }
+
+    function recomputeMetricsFromRuntime() {
+        const statuses = Object.values(deviceStatusMap);
+        metrics.total_devices = statuses.length;
+        metrics.online_devices = statuses.filter(s => s.online).length;
+        metrics.running_devices = statuses.filter(s => s.running).length;
+        metrics.alarm_devices = statuses.filter(s => s.alarm).length;
+
+        if (!hasRecentRealtimeFrame() || metrics.online_devices === 0) {
+            metrics.current_output = 0;
+            metrics.daily_target = 0;
+            metrics.overall_oee = 0;
+            metrics.energy_consumption = 0;
+        }
     }
 
     function updateRollingTrend(devices) {
@@ -178,11 +286,17 @@ export function createDashboardDataStore(options = {}) {
                 }
             }
         });
+        recomputeMetricsFromRuntime();
     }
 
     async function refreshEvents(force = false) {
         const now = Date.now();
         if (!force && (eventsInFlight || now - lastEventsRefreshAt < eventsRefreshIntervalMs)) return;
+        if (Object.keys(deviceStatusMap).length > 0 && !hasRecentRealtimeFrame()) {
+            events.value = [{ id: 'no-live-events', time: new Date().toLocaleTimeString(), msg: '暂无实时报警事件', level: 'info' }];
+            lastEventsRefreshAt = now;
+            return;
+        }
         eventsInFlight = true;
         try {
             const resp = await fetch(`${API_BASE}/platform/events?limit=20`);
@@ -200,19 +314,21 @@ export function createDashboardDataStore(options = {}) {
     async function refreshMetrics(force = false) {
         const now = Date.now();
         if (!force && (metricsInFlight || now - lastMetricsRefreshAt < metricsRefreshIntervalMs)) return;
+        if (Object.keys(deviceStatusMap).length > 0 && !hasRecentRealtimeFrame()) {
+            recomputeMetricsFromRuntime();
+            lastMetricsRefreshAt = now;
+            return;
+        }
         metricsInFlight = true;
         try {
             const resp = await fetch(`${API_BASE}/platform/metrics/latest`);
             if (!resp.ok) return;
             const data = await resp.json();
             Object.assign(metrics, data);
+            recomputeMetricsFromRuntime();
         } catch (e) {
             // 离线时用实时帧聚合兜底。
-            const statuses = Object.values(deviceStatusMap);
-            metrics.total_devices = statuses.length;
-            metrics.online_devices = statuses.filter(s => s.online).length;
-            metrics.running_devices = statuses.filter(s => s.running).length;
-            metrics.alarm_devices = statuses.filter(s => s.alarm).length;
+            recomputeMetricsFromRuntime();
         } finally {
             lastMetricsRefreshAt = Date.now();
             metricsInFlight = false;
@@ -244,7 +360,7 @@ export function createDashboardDataStore(options = {}) {
                 } else if (msg.type === 'device_data') {
                     applyDeviceRealtimeData(msg.payload);
                 } else if (msg.type === 'plc_status') {
-                    plcStatusText.value = msg.payload?.message || msg.payload?.status || '状态未知';
+                    applyPlcStatus(msg.payload);
                 }
             } catch (e) {
                 // 忽略非 JSON 消息。

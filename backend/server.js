@@ -14,6 +14,7 @@ const {
     testDatabaseConfig
 } = require('./db/database');
 const { mergeBuiltinModels } = require('./services/builtinModels');
+const { stringifyModelMetadata } = require('./services/modelAssetMetadata');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
@@ -62,6 +63,24 @@ const upload = multer({
     limits: { fileSize: 100 * 1024 * 1024 }
 });
 
+function resolveModelFileDeletePlan(modelFilePath) {
+    if (!modelFilePath) return null;
+
+    const relativePath = modelFilePath.replace(/^[/\\]+/, '');
+    const fullPath = path.resolve(__dirname, relativePath);
+    const uploadRoot = path.resolve(uploadsDir);
+    const assetRoot = path.resolve(assetModelsDir);
+
+    if (fullPath.startsWith(uploadRoot + path.sep)) {
+        return { fullPath, deleteFile: true };
+    }
+    if (fullPath.startsWith(assetRoot + path.sep)) {
+        return { fullPath, deleteFile: false };
+    }
+
+    throw new Error('模型文件路径不合法');
+}
+
 app.post('/api/models/upload', upload.single('modelFile'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: '未收到文件' });
@@ -69,18 +88,20 @@ app.post('/api/models/upload', upload.single('modelFile'), async (req, res) => {
 
     const { id, name, asset_type, tags, metadata, default_scale } = req.body;
     const filePath = `/uploads/models/${req.file.filename}`;
+    const modelName = name || req.file.originalname;
 
     try {
         const db = await getDb();
+        const normalizedMetadata = stringifyModelMetadata(metadata || '{}', { name: modelName });
         await db.upsert('models', {
             id: id || req.file.filename.replace(/\.[^.]+$/, ''),
-            name: name || req.file.originalname,
+            name: modelName,
             file_path: filePath,
             asset_type: asset_type || 'model',
             tags: tags || '[]',
             thumbnail: null,
             default_scale: Number.isFinite(Number(default_scale)) ? Number(default_scale) : 1.0,
-            metadata: metadata || '{}'
+            metadata: normalizedMetadata
         }, 'id');
         res.json({ success: true, filePath });
     } catch (e) {
@@ -112,10 +133,11 @@ app.put('/api/models/:id', async (req, res) => {
         const nextScale = Number.isFinite(Number(req.body.default_scale))
             ? Number(req.body.default_scale)
             : Number(existing.default_scale || 1);
+        const normalizedMetadata = stringifyModelMetadata(nextMetadata, { name: nextName });
 
         await db.run(
             'UPDATE models SET name = ?, tags = ?, default_scale = ?, metadata = ? WHERE id = ?',
-            [nextName, nextTags, nextScale, nextMetadata, req.params.id]
+            [nextName, nextTags, nextScale, normalizedMetadata, req.params.id]
         );
 
         const updated = await db.get('SELECT * FROM models WHERE id = ?', [req.params.id]);
@@ -129,17 +151,33 @@ app.delete('/api/models/:id', async (req, res) => {
     try {
         const db = await getDb();
         const model = await db.get('SELECT * FROM models WHERE id = ?', [req.params.id]);
-        if (model && model.file_path) {
-            const relativePath = model.file_path.replace(/^[/\\]+/, '');
-            const fullPath = path.resolve(__dirname, relativePath);
-            const allowedRoot = path.resolve(uploadsDir);
-            if (fullPath !== allowedRoot && !fullPath.startsWith(allowedRoot + path.sep)) {
-                return res.status(400).json({ error: '模型文件路径不合法' });
-            }
-            if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+        if (!model) {
+            return res.status(404).json({ error: '模型不存在' });
         }
+
+        const usedByDevices = await db.get('SELECT COUNT(*) AS cnt FROM devices WHERE model_type = ?', [req.params.id]);
+        if (Number(usedByDevices?.cnt || 0) > 0) {
+            return res.status(409).json({ error: `该模型正在被 ${usedByDevices.cnt} 台设备使用，先修改这些设备的模型后再删除` });
+        }
+
+        let fileDeleted = false;
+        if (model.file_path) {
+            const deletePlan = resolveModelFileDeletePlan(model.file_path);
+            if (deletePlan?.deleteFile && fs.existsSync(deletePlan.fullPath)) {
+                const stat = fs.statSync(deletePlan.fullPath);
+                if (!stat.isFile()) {
+                    return res.status(400).json({ error: '模型文件路径不是文件，已拒绝删除' });
+                }
+                fs.unlinkSync(deletePlan.fullPath);
+                fileDeleted = true;
+            }
+        }
+
         await db.run('DELETE FROM models WHERE id = ?', [req.params.id]);
-        res.json({ success: true });
+        if (req.params.id === 'box_atmosphere_furnace') {
+            await db.upsert('settings', { key: 'deleted_seed_model_box_atmosphere_furnace', value: '1' }, 'key');
+        }
+        res.json({ success: true, fileDeleted });
     } catch (e) {
         res.status(400).json({ error: e.message });
     }
@@ -150,6 +188,70 @@ app.get('/api/engine/status', (req, res) => {
         res.json(global.dataEngine.getStatus());
     } else {
         res.json({ mode: null, plcStatus: { status: 'not_started', message: '引擎未启动' } });
+    }
+});
+
+app.get('/api/plc/points/realtime', async (req, res) => {
+    try {
+        const deviceId = String(req.query.device_id || '').trim();
+
+        const db = await getDb();
+        const devices = deviceId
+            ? [await db.get('SELECT * FROM devices WHERE id = ?', [deviceId])]
+            : await db.all('SELECT * FROM devices ORDER BY line_id, sort_order ASC');
+
+        if (deviceId && !devices[0]) {
+            return res.status(404).json({ error: '设备不存在' });
+        }
+
+        const allPoints = deviceId
+            ? await db.all('SELECT * FROM data_points WHERE device_id = ? ORDER BY id ASC', [deviceId])
+            : await db.all('SELECT * FROM data_points ORDER BY device_id, id ASC');
+        const pointsByDevice = new Map();
+        allPoints.forEach(point => {
+            if (!pointsByDevice.has(point.device_id)) pointsByDevice.set(point.device_id, []);
+            pointsByDevice.get(point.device_id).push(point);
+        });
+
+        const runtimeDevices = devices.filter(Boolean).map(device => {
+            const points = pointsByDevice.get(device.id) || [];
+            const runtime = global.dataEngine?.getPointRuntimeValues
+                ? global.dataEngine.getPointRuntimeValues(device.id, points)
+                : {
+                    deviceStatus: null,
+                    snapshotTimestamp: null,
+                    points: points.map(point => ({ ...point, value: null, quality: 'bad' }))
+                };
+            return {
+                device,
+                deviceStatus: runtime.deviceStatus,
+                snapshotTimestamp: runtime.snapshotTimestamp,
+                points: runtime.points.map(point => ({
+                    ...point,
+                    device_id: device.id,
+                    device_name: device.name,
+                    device_status: runtime.deviceStatus?.status || null
+                }))
+            };
+        });
+
+        const latestSnapshot = runtimeDevices
+            .map(item => Number(item.snapshotTimestamp || 0))
+            .filter(Number.isFinite)
+            .reduce((max, value) => Math.max(max, value), 0) || null;
+
+        res.json({
+            success: true,
+            device: deviceId ? runtimeDevices[0]?.device : null,
+            devices: runtimeDevices.map(item => item.device),
+            deviceStatus: deviceId ? runtimeDevices[0]?.deviceStatus : null,
+            deviceStatuses: runtimeDevices.map(item => item.deviceStatus).filter(Boolean),
+            snapshotTimestamp: latestSnapshot,
+            points: runtimeDevices.flatMap(item => item.points),
+            timestamp: Date.now()
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 

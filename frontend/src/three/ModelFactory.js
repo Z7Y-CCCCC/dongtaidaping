@@ -3,6 +3,7 @@ import { CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as cloneObject3D } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { FurnaceModel } from './FurnaceModel.js';
+import { buildDeviceLabelMarkup, updateDeviceLabelElements, applyDeviceLabelStyle } from '../runtime/uiConfig.js';
 
 const loader = new GLTFLoader();
 const modelCache = new Map();
@@ -161,7 +162,7 @@ function applyColorToTarget(target, colorValue) {
 }
 
 class TransferCartModel extends THREE.Group {
-    constructor(deviceConfig) {
+    constructor(deviceConfig, options = {}) {
         super();
         this.deviceConfig = deviceConfig;
         this.furnaceId = deviceConfig.id;
@@ -169,9 +170,15 @@ class TransferCartModel extends THREE.Group {
         this.userData.isDevice = true;
         this.userData.id = deviceConfig.id;
         this.userData.defaultScale = 1;
+        const instanceConfig = parseJson(deviceConfig.instance_config, {});
+        this.labelConfig = {
+            ...(options.labelConfig || {}),
+            ...(instanceConfig.labelConfig || {})
+        };
+        this.labelElements = new Map();
+        this.lastLabelValues = new Map();
+        this.lastRealtimeData = null;
 
-        this.lastSpeedText = null;
-        this.lastStateText = null;
         this.lastVisualState = null;
 
         this.createBody();
@@ -236,14 +243,14 @@ class TransferCartModel extends THREE.Group {
         div.className = 'furnace-label';
         div.style.opacity = '0';
         div.style.transition = 'opacity 0.5s';
-        div.innerHTML = `
-            <div class="header">${this.furnaceName}</div>
-            <div class="data-row">速度: <span data-field="speed">--</span></div>
-            <div class="data-row">状态: <span data-field="state">待机</span></div>
-        `;
+        applyDeviceLabelStyle(div, this.labelConfig);
+        div.innerHTML = buildDeviceLabelMarkup(this.furnaceName, this.labelConfig, { isTransferCart: true, deviceId: this.furnaceId });
+        div.querySelectorAll('[data-label-row]').forEach((valueEl) => {
+            const key = valueEl.getAttribute('data-label-row');
+            const unitEl = div.querySelector(`[data-label-unit="${key}"]`) || null;
+            this.labelElements.set(key, { valueEl, unitEl });
+        });
 
-        this.speedEl = div.querySelector('[data-field="speed"]');
-        this.stateEl = div.querySelector('[data-field="state"]');
         this.labelObj = new CSS2DObject(div);
         this.labelObj.visible = false;
         this.labelDiv = div;
@@ -255,7 +262,7 @@ class TransferCartModel extends THREE.Group {
     }
 
     setLabelVisible(visible) {
-        const nextVisible = !!visible;
+        const nextVisible = !!visible && this.labelConfig?.enabled !== false;
         if (this.labelObj) this.labelObj.visible = nextVisible;
         if (this.labelDiv) this.labelDiv.style.opacity = nextVisible ? '1' : '0';
     }
@@ -271,20 +278,16 @@ class TransferCartModel extends THREE.Group {
     }
 
     updateData(data) {
-        const analog = data?.analog || {};
-        const motors = data?.motors || {};
-        const speedText = analog.cart_speed ?? analog.speed ?? motors.cart_speed ?? motors.speed ?? '--';
-        const stateText = data?.status?.running ? '运行' : data?.status?.alarm ? '报警' : '待机';
+        this.lastRealtimeData = data;
+        updateDeviceLabelElements(
+            this.labelElements,
+            data || {},
+            this.labelConfig,
+            { isTransferCart: true },
+            this.lastLabelValues
+        );
 
-        if (this.speedEl && this.lastSpeedText !== speedText) {
-            this.speedEl.innerText = speedText;
-            this.lastSpeedText = speedText;
-        }
-        if (this.stateEl && this.lastStateText !== stateText) {
-            this.stateEl.innerText = stateText;
-            this.lastStateText = stateText;
-        }
-
+        const stateText = data?.status?.running ? '??' : data?.status?.alarm ? '??' : '??';
         const quality = resolveDeviceQuality(data);
         const visualState = `${quality}:${stateText}`;
         if (this.lastVisualState === visualState) return;
@@ -317,7 +320,7 @@ class TransferCartModel extends THREE.Group {
 }
 
 class ImportedDeviceModel extends THREE.Group {
-    constructor(deviceConfig, modelInfo) {
+    constructor(deviceConfig, modelInfo, options = {}) {
         super();
         this.deviceConfig = deviceConfig;
         this.modelInfo = modelInfo;
@@ -327,10 +330,16 @@ class ImportedDeviceModel extends THREE.Group {
         this.userData.isDevice = true;
         this.userData.id = deviceConfig.id;
         this.userData.defaultScale = Number(modelInfo.default_scale || 1);
+        const instanceConfig = parseJson(deviceConfig.instance_config, {});
+        this.labelConfig = {
+            ...(options.labelConfig || {}),
+            ...(instanceConfig.labelConfig || {})
+        };
+        this.labelElements = new Map();
+        this.lastLabelValues = new Map();
+        this.lastRealtimeData = null;
 
         this.materials = new Set();
-        this.lastTempText = null;
-        this.lastCarbonText = null;
         this.lastVisualState = null;
         this.xRayEnabled = null;
         this.partBindings = Array.isArray(this.metadata.partBindings) ? this.metadata.partBindings : [];
@@ -371,14 +380,14 @@ class ImportedDeviceModel extends THREE.Group {
         div.className = 'furnace-label';
         div.style.opacity = '0';
         div.style.transition = 'opacity 0.5s';
-        div.innerHTML = `
-            <div class="header">${this.furnaceName}</div>
-            <div class="data-row">温度: <span data-field="temp">--</span> °C</div>
-            <div class="data-row">碳势: <span data-field="carbon">--</span> %</div>
-        `;
+        applyDeviceLabelStyle(div, this.labelConfig);
+        div.innerHTML = buildDeviceLabelMarkup(this.furnaceName, this.labelConfig, { isTransferCart: false, deviceId: this.furnaceId });
+        div.querySelectorAll('[data-label-row]').forEach((valueEl) => {
+            const key = valueEl.getAttribute('data-label-row');
+            const unitEl = div.querySelector(`[data-label-unit="${key}"]`) || null;
+            this.labelElements.set(key, { valueEl, unitEl });
+        });
 
-        this.tempEl = div.querySelector('[data-field="temp"]');
-        this.carbonEl = div.querySelector('[data-field="carbon"]');
         this.labelObj = new CSS2DObject(div);
         this.labelObj.visible = false;
         this.labelDiv = div;
@@ -390,7 +399,7 @@ class ImportedDeviceModel extends THREE.Group {
     }
 
     setLabelVisible(visible) {
-        const nextVisible = !!visible;
+        const nextVisible = !!visible && this.labelConfig?.enabled !== false;
         if (this.labelObj) this.labelObj.visible = nextVisible;
         if (this.labelDiv) this.labelDiv.style.opacity = nextVisible ? '1' : '0';
     }
@@ -427,16 +436,14 @@ class ImportedDeviceModel extends THREE.Group {
     }
 
     updateData(data) {
-        const tempText = data.analog?.actual_temp ?? '--';
-        const carbonText = data.analog?.actual_carbon ?? '--';
-        if (this.tempEl && this.lastTempText !== tempText) {
-            this.tempEl.innerText = tempText;
-            this.lastTempText = tempText;
-        }
-        if (this.carbonEl && this.lastCarbonText !== carbonText) {
-            this.carbonEl.innerText = carbonText;
-            this.lastCarbonText = carbonText;
-        }
+        this.lastRealtimeData = data;
+        updateDeviceLabelElements(
+            this.labelElements,
+            data || {},
+            this.labelConfig,
+            { isTransferCart: false },
+            this.lastLabelValues
+        );
 
         if (this.statusLight) {
             const deviceQuality = this.resolveDeviceQuality(data);
@@ -546,20 +553,20 @@ class ImportedDeviceModel extends THREE.Group {
     }
 }
 
-export async function createDeviceModel(deviceConfig, models = []) {
+export async function createDeviceModel(deviceConfig, models = [], options = {}) {
     const modelInfo = models.find((item) => item.id === deviceConfig.model_type);
     if (deviceConfig.model_type === 'transfer_cart' && !modelInfo?.file_path) {
-        return new TransferCartModel(deviceConfig);
+        return new TransferCartModel(deviceConfig, options);
     }
 
     if (!modelInfo || modelInfo.id === 'builtin_furnace' || !modelInfo.file_path) {
-        return new FurnaceModel(deviceConfig.id, deviceConfig.name);
+        return new FurnaceModel(deviceConfig.id, deviceConfig.name, { labelConfig: options.labelConfig, instanceConfig: parseJson(deviceConfig.instance_config, {}) });
     }
 
     try {
-        return await new ImportedDeviceModel(deviceConfig, modelInfo).load();
+        return await new ImportedDeviceModel(deviceConfig, modelInfo, options).load();
     } catch (error) {
         console.warn(`[ModelFactory] 模型 ${modelInfo.id} 加载失败，回退到内置炉子模型:`, error);
-        return new FurnaceModel(deviceConfig.id, deviceConfig.name);
+        return new FurnaceModel(deviceConfig.id, deviceConfig.name, { labelConfig: options.labelConfig, instanceConfig: parseJson(deviceConfig.instance_config, {}) });
     }
 }

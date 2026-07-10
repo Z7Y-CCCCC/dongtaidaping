@@ -1,4 +1,8 @@
+import * as THREE from 'three';
 import { createDeviceModel } from '../three/ModelFactory.js';
+import { setConnectionBadge3D } from './ConnectionBadge3D.js';
+
+const OFFLINE_GRAY = new THREE.Color(0xa8b0b0);
 
 function parseInstanceConfig(raw) {
     if (!raw) return {};
@@ -15,9 +19,33 @@ function numberOrDefault(value, fallback) {
     return Number.isFinite(next) ? next : fallback;
 }
 
-export async function createConfiguredDeviceModel(definition, models = []) {
+function shouldMirrorX(instanceConfig) {
+    return instanceConfig?.mirrorX === true
+        || instanceConfig?.mirror_x === true
+        || instanceConfig?.mirrorAxis === 'x'
+        || instanceConfig?.mirror_axis === 'x';
+}
+
+function makeMaterialsMirrorSafe(deviceModel) {
+    deviceModel.traverse?.((child) => {
+        if (!child.isMesh || !child.material) return;
+        const materialList = Array.isArray(child.material) ? child.material : [child.material];
+        materialList.filter(Boolean).forEach((material) => {
+            if (material.userData?.mirrorSafeApplied) return;
+            material.userData = {
+                ...(material.userData || {}),
+                mirrorSafeApplied: true,
+                originalSide: material.side
+            };
+            material.side = THREE.DoubleSide;
+            material.needsUpdate = true;
+        });
+    });
+}
+
+export async function createConfiguredDeviceModel(definition, models = [], options = {}) {
     const { deviceCfg, devIdx, wsIdx, gLineIdx } = definition;
-    const deviceModel = await createDeviceModel(deviceCfg, models);
+    const deviceModel = await createDeviceModel(deviceCfg, models, options);
     const instanceConfig = parseInstanceConfig(deviceCfg.instance_config);
     deviceModel.userData.instanceConfig = instanceConfig;
 
@@ -34,7 +62,12 @@ export async function createConfiguredDeviceModel(definition, models = []) {
     const configuredScale = numberOrDefault(deviceCfg.scale, 1);
     const instanceScale = Number(instanceConfig.scaleMultiplier || 1);
     const finalScale = defaultScale * configuredScale * (Number.isFinite(instanceScale) ? instanceScale : 1);
-    if (finalScale !== 1) {
+    const mirrorX = shouldMirrorX(instanceConfig);
+    deviceModel.userData.mirrorX = mirrorX;
+    if (mirrorX) {
+        deviceModel.scale.set(-finalScale, finalScale, finalScale);
+        makeMaterialsMirrorSafe(deviceModel);
+    } else if (finalScale !== 1) {
         deviceModel.scale.setScalar(finalScale);
     }
 
@@ -46,6 +79,7 @@ export async function createConfiguredDeviceModel(definition, models = []) {
         deviceModel.statusLight.position.y = Number(instanceConfig.statusLightY);
     }
 
+    applyDeviceConnectionVisual(deviceModel, 'bad');
     return deviceModel;
 }
 
@@ -54,6 +88,8 @@ export function applyRealtimeToDeviceModel(deviceModel, data) {
     deviceModel.updateData(data);
     deviceModel.userData.lastRealtimeAt = Date.now();
     deviceModel.userData.quality = resolveDeviceQuality(data);
+    if (deviceModel.userData.renderedByBatch) return;
+    applyDeviceConnectionVisual(deviceModel, deviceModel.userData.quality);
 }
 
 export function resolveDeviceQuality(data) {
@@ -62,4 +98,77 @@ export function resolveDeviceQuality(data) {
     if (values.includes('bad')) return 'bad';
     if (values.includes('stale')) return 'stale';
     return 'good';
+}
+
+function collectVisualMaterials(deviceModel) {
+    if (deviceModel.userData.connectionVisualMaterials) {
+        return deviceModel.userData.connectionVisualMaterials;
+    }
+
+    const materials = [];
+    const seen = new Set();
+    deviceModel.traverse?.((child) => {
+        if (!child.isMesh || !child.material) return;
+        const materialList = Array.isArray(child.material) ? child.material : [child.material];
+        materialList.filter(Boolean).forEach((material) => {
+            if (seen.has(material.uuid)) return;
+            seen.add(material.uuid);
+            materials.push({
+                material,
+                color: material.color?.clone?.() || null,
+                emissive: material.emissive?.clone?.() || null,
+                map: material.map || null,
+                opacity: material.opacity,
+                transparent: material.transparent,
+                depthWrite: material.depthWrite
+            });
+        });
+    });
+    deviceModel.userData.connectionVisualMaterials = materials;
+    return materials;
+}
+
+function restoreVisualMaterials(deviceModel) {
+    collectVisualMaterials(deviceModel).forEach((entry) => {
+        if (entry.color && entry.material.color) entry.material.color.copy(entry.color);
+        if (entry.emissive && entry.material.emissive) entry.material.emissive.copy(entry.emissive);
+        if ('map' in entry.material) entry.material.map = entry.map;
+        entry.material.opacity = entry.opacity;
+        entry.material.transparent = entry.transparent;
+        entry.material.depthWrite = entry.depthWrite;
+        entry.material.needsUpdate = true;
+    });
+}
+
+function applyOfflineGray(deviceModel) {
+    collectVisualMaterials(deviceModel).forEach((entry) => {
+        if (entry.material.color) {
+            entry.material.color.copy(OFFLINE_GRAY);
+        }
+        if (entry.material.emissive) entry.material.emissive.setHex(0x000000);
+        if ('map' in entry.material) entry.material.map = null;
+        entry.material.opacity = 1;
+        entry.material.transparent = false;
+        entry.material.depthWrite = true;
+        entry.material.needsUpdate = true;
+    });
+}
+
+function setConnectionBadge(deviceModel, quality) {
+    setConnectionBadge3D(deviceModel, quality);
+}
+
+export function applyDeviceConnectionVisual(deviceModel, quality) {
+    if (!deviceModel) return;
+    const nextQuality = quality || 'bad';
+    deviceModel.userData.quality = nextQuality;
+    if (deviceModel.userData.connectionVisualQuality === nextQuality) return;
+    deviceModel.userData.connectionVisualQuality = nextQuality;
+
+    if (nextQuality === 'bad') {
+        applyOfflineGray(deviceModel);
+    } else {
+        restoreVisualMaterials(deviceModel);
+    }
+    setConnectionBadge(deviceModel, nextQuality);
 }

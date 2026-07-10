@@ -202,6 +202,9 @@ router.post('/widgets', async (req, res) => {
 router.delete('/widgets/:id', async (req, res) => {
     try {
         const db = await getDb();
+        const widget = await db.get('SELECT id FROM widgets WHERE id = ?', [req.params.id]);
+        if (!widget) return res.status(404).json({ error: '组件不存在，可能已经被删除或 ID 未正确编码' });
+
         await db.run('DELETE FROM widgets WHERE id = ?', [req.params.id]);
         res.json({ success: true });
     } catch (e) {

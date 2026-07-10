@@ -9,6 +9,9 @@ backend/data/*.db-*
 backend/data/database-config.json
 backend/uploads/
 output/
+.playwright-cli/
+logs/
+backend-restart*.log
 
 .env
 .env.*

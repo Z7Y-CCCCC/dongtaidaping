@@ -19,9 +19,11 @@ class DataEngine {
         this.alarmState = new Map();
         this.lastMetricSnapshotAt = 0;
         this.metricSnapshotIntervalMs = 5000;
+        this.runVersion = 0;
     }
 
     async start() {
+        this.runVersion += 1;
         const db = await getDb();
         const rows = await db.all('SELECT * FROM settings');
         const settings = {};
@@ -43,6 +45,7 @@ class DataEngine {
     }
 
     stop() {
+        this.runVersion += 1;
         if (this.plcReader) { this.plcReader.stop(); this.plcReader = null; }
         if (this.simulator) { this.simulator.stop(); this.simulator = null; }
         this.currentMode = null;
@@ -61,6 +64,27 @@ class DataEngine {
             mode: this.currentMode,
             plcStatus: this.plcStatus,
             collectorStatus: this.collectorStatus
+        };
+    }
+
+    getPointRuntimeValues(deviceId, points = []) {
+        if (this.plcReader?.getPointRuntimeValues) {
+            return this.plcReader.getPointRuntimeValues(deviceId, points);
+        }
+
+        const deviceStatus = (this.plcStatus?.devices || []).find(device => device.deviceId === deviceId) || null;
+        return {
+            deviceStatus,
+            snapshotTimestamp: null,
+            points: points.map(point => ({
+                ...point,
+                category_resolved: point.category || 'analog',
+                field_name: point.value_role || point.name,
+                plc_address: point.plc_tag || '',
+                value: null,
+                quality: deviceStatus?.quality || 'bad',
+                lastReadAt: deviceStatus?.lastReadAt || null
+            }))
         };
     }
 
@@ -160,6 +184,7 @@ class DataEngine {
 
     async _startIntegratedPlcMode() {
         console.log('[DataEngine] 内置低延迟采集模式: PLC -> 后端采集器 -> WebSocket');
+        const runVersion = this.runVersion;
 
         this.collectorStatus = {
             status: 'starting',
@@ -169,12 +194,15 @@ class DataEngine {
             devices: 0
         };
 
-        this.plcReader = new PlcReader({ profile: 'low_latency' });
-        await this.plcReader.start(
+        const plcReader = new PlcReader({ profile: 'low_latency' });
+        this.plcReader = plcReader;
+        await plcReader.start(
             (deviceDataArray) => {
+                if (this.runVersion !== runVersion || this.plcReader !== plcReader) return;
                 this._publishRealtimeData(deviceDataArray);
             },
             (statusInfo) => {
+                if (this.runVersion !== runVersion || this.plcReader !== plcReader) return;
                 this.plcStatus = statusInfo;
                 this.collectorStatus = {
                     ...this.collectorStatus,
@@ -189,13 +217,17 @@ class DataEngine {
 
     async _startSimulationMode() {
         console.log('[DataEngine] 模拟模式: 生成模拟数据 -> WebSocket');
+        const runVersion = this.runVersion;
 
-        this.simulator = new Simulator();
-        await this.simulator.start(
+        const simulator = new Simulator();
+        this.simulator = simulator;
+        await simulator.start(
             (deviceDataArray) => {
+                if (this.runVersion !== runVersion || this.simulator !== simulator) return;
                 this._publishRealtimeData(deviceDataArray);
             },
             (statusInfo) => {
+                if (this.runVersion !== runVersion || this.simulator !== simulator) return;
                 this.plcStatus = statusInfo;
                 this.collectorStatus = {
                     status: statusInfo.status,
