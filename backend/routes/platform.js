@@ -22,6 +22,29 @@ function numberOrDefault(value, fallback) {
     return Number.isFinite(next) ? next : fallback;
 }
 
+function clampNumber(value, min, max, fallback) {
+    const next = Number(value);
+    if (!Number.isFinite(next)) return fallback;
+    return Math.max(min, Math.min(max, next));
+}
+
+function clampInteger(value, min, max, fallback) {
+    return Math.round(clampNumber(value, min, max, fallback));
+}
+
+function formatSqlDateTime(date) {
+    const pad = value => String(value).padStart(2, '0');
+    return [
+        date.getFullYear(),
+        pad(date.getMonth() + 1),
+        pad(date.getDate())
+    ].join('-') + ' ' + [
+        pad(date.getHours()),
+        pad(date.getMinutes()),
+        pad(date.getSeconds())
+    ].join(':');
+}
+
 async function loadPlatformSnapshot() {
     const db = await getDb();
     const projects = await db.all('SELECT * FROM projects ORDER BY is_active DESC, created_at ASC');
@@ -238,8 +261,28 @@ router.post('/events', async (req, res) => {
 router.get('/events', async (req, res) => {
     try {
         const db = await getDb();
-        const limit = Math.min(parseInt(req.query.limit || '50'), 200);
-        const rows = await db.all(`SELECT * FROM event_logs ORDER BY occurred_at DESC, id DESC LIMIT ${limit}`);
+        const limit = clampInteger(req.query.limit, 1, 200, 50);
+        const windowHours = clampNumber(req.query.window_hours ?? req.query.since_hours, 0, 87600, 0);
+        const eventType = String(req.query.event_type || req.query.eventType || '').trim();
+        const level = String(req.query.level || '').trim();
+
+        const where = [];
+        const params = [];
+        if (windowHours > 0) {
+            where.push('occurred_at >= ?');
+            params.push(formatSqlDateTime(new Date(Date.now() - windowHours * 3600000)));
+        }
+        if (eventType) {
+            where.push('event_type = ?');
+            params.push(eventType);
+        }
+        if (level) {
+            where.push('level = ?');
+            params.push(level);
+        }
+
+        const whereSql = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+        const rows = await db.all(`SELECT * FROM event_logs${whereSql} ORDER BY occurred_at DESC, id DESC LIMIT ${limit}`, params);
         res.json(rows);
     } catch (e) {
         res.status(500).json({ error: e.message });

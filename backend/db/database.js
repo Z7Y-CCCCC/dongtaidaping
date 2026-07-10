@@ -61,6 +61,17 @@ function readStoredConfig() {
     }
 }
 
+function parseJsonObject(value, fallback = {}) {
+    if (!value) return fallback;
+    if (typeof value === 'object' && !Array.isArray(value)) return value;
+    try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : fallback;
+    } catch (e) {
+        return fallback;
+    }
+}
+
 function loadDatabaseConfig() {
     const stored = readStoredConfig();
     const merged = { ...DEFAULT_CONFIG, ...stored };
@@ -1064,7 +1075,7 @@ async function seedPlatformDefaults(db) {
             ['widget_metrics', 'metrics', '生产指标', JSON.stringify({ compact: true }), '{}', 0, 5, 5, 5, 1],
             ['widget_trend', 'trend', '历史趋势', JSON.stringify({ metric: 'avg_temp' }), '{}', 19, 0, 5, 5, 2],
             ['widget_alarms', 'alarm_list', '报警履历', JSON.stringify({ limit: 5 }), '{}', 19, 5, 5, 5, 3],
-            ['widget_marquee', 'marquee', '实时日志', JSON.stringify({ speed: 30 }), '{}', 3, 11, 18, 1, 4]
+            ['widget_marquee', 'marquee', '实时日志', JSON.stringify({ speed: 30, limit: 20, eventWindowHours: 24 }), '{}', 3, 11, 18, 1, 4]
         ];
         for (const [id, widget_type, title, config_json, binding_json, x, y, w, h, sort_order] of widgets) {
             await db.insertIgnore('widgets', {
@@ -1106,6 +1117,8 @@ async function seedPlatformDefaults(db) {
         }, 'id');
     }
 
+    await mergeWidgetDefaultConfig(db, 'widget_marquee', { speed: 30, limit: 20, eventWindowHours: 24 });
+
     const releaseCount = await db.get('SELECT COUNT(*) AS cnt FROM releases');
     if (releaseCount.cnt === 0) {
         await db.insertIgnore('releases', {
@@ -1116,6 +1129,18 @@ async function seedPlatformDefaults(db) {
             is_current: 1
         }, 'id');
     }
+}
+
+async function mergeWidgetDefaultConfig(db, widgetId, defaults) {
+    const widget = await db.get('SELECT config_json FROM widgets WHERE id = ?', [widgetId]);
+    if (!widget) return;
+
+    const current = parseJsonObject(widget.config_json, {});
+    const merged = { ...defaults, ...current };
+    const changed = Object.keys(defaults).some(key => current[key] === undefined);
+    if (!changed) return;
+
+    await db.run('UPDATE widgets SET config_json = ? WHERE id = ?', [JSON.stringify(merged), widgetId]);
 }
 
 module.exports = {

@@ -14,6 +14,7 @@ const DATA_GROUPS = ['analog', 'status', 'motors', 'doors', 'mechanisms', 'gas']
 const MIN_SAMPLE_INTERVAL_MS = 100;
 const MAX_SAMPLE_INTERVAL_MS = 60000;
 const STATUS_BROADCAST_MIN_MS = 2000;
+const DEFAULT_OFFLINE_AFTER_MS = 15000;
 
 class PlcReader {
     constructor(options = {}) {
@@ -27,6 +28,8 @@ class PlcReader {
         this.currentStatus = { status: 'idle', message: '采集器未启动', devices: [], timestamp: Date.now() };
         this.lastStatusSignature = '';
         this.lastStatusBroadcastAt = 0;
+        this.offlineAfterMs = this._resolveOfflineAfterMs(options.offlineAfterMs);
+        this.statusHeartbeatTimer = null;
         this.stopped = true;
     }
 
@@ -42,6 +45,7 @@ class PlcReader {
             return;
         }
 
+        this._startStatusHeartbeat();
         console.log(`[PlcReader] 已创建 ${this.tasks.size} 个 PLC 采集任务`);
         for (const task of this.tasks.values()) {
             this._connectTask(task);
@@ -50,6 +54,10 @@ class PlcReader {
 
     stop() {
         this.stopped = true;
+        if (this.statusHeartbeatTimer) {
+            clearInterval(this.statusHeartbeatTimer);
+            this.statusHeartbeatTimer = null;
+        }
         for (const task of this.tasks.values()) {
             this._clearTaskTimers(task);
             this._dropTaskConnection(task);
@@ -199,8 +207,12 @@ class PlcReader {
             status: 'idle',
             message: '等待连接',
             retryCount: 0,
+            firstConnectAttemptAt: null,
+            lastConnectAttemptAt: null,
             lastConnectedAt: null,
             lastReadAt: null,
+            lastFailureAt: null,
+            outageStartedAt: null,
             lastError: '',
             nextRetryAt: null
         };
@@ -212,6 +224,10 @@ class PlcReader {
         if (this.stopped) return;
         this._clearTaskTimers(task);
         this._dropTaskConnection(task);
+        const now = Date.now();
+        if (!task.firstConnectAttemptAt) task.firstConnectAttemptAt = now;
+        task.lastConnectAttemptAt = now;
+        if (!task.outageStartedAt && !task.lastReadAt) task.outageStartedAt = now;
         task.conn = new nodes7();
         this._setTaskStatus(task, 'connecting', `正在连接 ${this._formatEndpoint(task.endpoint)}...`);
 
@@ -229,6 +245,9 @@ class PlcReader {
                 task.conn.addItems(tagNames);
                 task.lastConnectedAt = Date.now();
                 task.retryCount = 0;
+                task.firstConnectAttemptAt = null;
+                task.outageStartedAt = null;
+                task.lastFailureAt = null;
                 task.lastError = '';
                 task.nextRetryAt = null;
                 this._setTaskStatus(task, 'connected', `${this._formatEndpoint(task.endpoint)} 已连接，${tagNames.length} 点，${task.interval}ms`);
@@ -256,6 +275,9 @@ class PlcReader {
             }
 
             task.lastReadAt = Date.now();
+            task.firstConnectAttemptAt = null;
+            task.outageStartedAt = null;
+            task.lastFailureAt = null;
             task.lastError = '';
             task.nextRetryAt = null;
             if (task.status !== 'connected') {
@@ -287,6 +309,8 @@ class PlcReader {
         this._emitBadSnapshotsForTask(task);
 
         task.retryCount += 1;
+        task.lastFailureAt = Date.now();
+        if (!task.outageStartedAt) task.outageStartedAt = task.lastReadAt || task.lastConnectedAt || task.lastFailureAt;
         const maxRetries = Number(task.endpoint.maxRetries || 0);
         if (maxRetries > 0 && task.retryCount > maxRetries) {
             this._setTaskStatus(task, 'error', `${message}，重连次数已达上限`);
@@ -411,21 +435,27 @@ class PlcReader {
     }
 
     _refreshDeviceStatuses() {
+        const now = Date.now();
         for (const [deviceId, status] of this.deviceStatus.entries()) {
             const taskIds = Array.from(this.deviceTaskIds.get(deviceId) || []);
             if (taskIds.length === 0) continue;
 
             const tasks = taskIds.map(id => this.tasks.get(id)).filter(Boolean);
             const connected = tasks.filter(task => task.status === 'connected');
+            const offline = tasks.filter(task => this._isTaskOffline(task, now));
+            const connectedFresh = connected.filter(task => !offline.includes(task));
             const connecting = tasks.filter(task => task.status === 'connecting');
             const retrying = tasks.filter(task => task.status === 'retrying');
             const errors = tasks.filter(task => task.status === 'error');
             const lastConnectedAt = this._maxNumber(tasks.map(task => task.lastConnectedAt));
             const lastReadAt = this._maxNumber(tasks.map(task => task.lastReadAt));
+            const offlineSince = this._minNumber(tasks.map(task => this._getTaskOutageStart(task)));
             const nextRetryAt = this._minNumber(tasks.map(task => task.nextRetryAt));
             const lastError = tasks.find(task => task.lastError)?.lastError || '';
             const retryCount = Math.max(...tasks.map(task => Number(task.retryCount || 0)), 0);
             const intervals = [...new Set(tasks.map(task => task.interval))].sort((a, b) => a - b);
+            const allOffline = tasks.length > 0 && connectedFresh.length === 0 && (offline.length === tasks.length || errors.length === tasks.length);
+            const offlineSeconds = Math.round(this.offlineAfterMs / 1000);
 
             let next = {
                 status: 'idle',
@@ -433,15 +463,26 @@ class PlcReader {
                 message: '等待采集',
                 lastConnectedAt,
                 lastReadAt,
+                offlineSince,
+                offlineAfterMs: this.offlineAfterMs,
                 lastError,
                 retryCount,
                 nextRetryAt,
                 intervals
             };
 
-            if (connected.length === tasks.length) {
+            if (connectedFresh.length === tasks.length) {
                 next = { ...next, status: 'connected', quality: 'good', message: '数据采集正常' };
-            } else if (connected.length > 0) {
+            } else if (allOffline) {
+                next = {
+                    ...next,
+                    status: 'offline',
+                    quality: 'bad',
+                    message: lastError
+                        ? `设备离线：超过 ${offlineSeconds} 秒未连通 PLC（${lastError}）`
+                        : `设备离线：超过 ${offlineSeconds} 秒未连通 PLC`
+                };
+            } else if (connectedFresh.length > 0) {
                 next = { ...next, status: 'retrying', quality: 'stale', message: '部分采集任务异常，正在重连' };
             } else if (connecting.length > 0) {
                 next = { ...next, status: 'connecting', quality: 'stale', message: '正在连接 PLC' };
@@ -460,6 +501,7 @@ class PlcReader {
             .sort((a, b) => String(a.deviceId).localeCompare(String(b.deviceId)));
         const active = devices.filter(device => device.status !== 'disabled');
         const connectedCount = active.filter(device => device.status === 'connected').length;
+        const offlineCount = active.filter(device => ['offline', 'error'].includes(device.status)).length;
 
         let status = 'unconfigured';
         let message = '未启用任何 PLC 设备';
@@ -476,6 +518,9 @@ class PlcReader {
         } else if (connectedCount > 0) {
             status = 'retrying';
             message = `PLC 部分异常：${connectedCount}/${active.length} 台设备在线`;
+        } else if (offlineCount > 0) {
+            status = 'offline';
+            message = `设备离线：0/${active.length} 台设备在线，${offlineCount} 台已超过离线阈值`;
         } else if (active.some(device => device.status === 'connecting')) {
             status = 'connecting';
             message = '正在连接 PLC...';
@@ -499,6 +544,8 @@ class PlcReader {
                 status: device.status,
                 lastConnectedAt: device.lastConnectedAt,
                 lastReadAt: device.lastReadAt,
+                offlineSince: device.offlineSince,
+                offlineAfterMs: device.offlineAfterMs,
                 lastError: device.lastError,
                 retryCount: device.retryCount,
                 nextRetryAt: device.nextRetryAt
@@ -539,6 +586,8 @@ class PlcReader {
             plc_slot: plc.slot || 1,
             lastConnectedAt: null,
             lastReadAt: null,
+            offlineSince: null,
+            offlineAfterMs: this.offlineAfterMs,
             lastError: '',
             retryCount: 0,
             nextRetryAt: null,
@@ -550,6 +599,32 @@ class PlcReader {
         const previous = this.deviceStatus.get(deviceId);
         if (!previous) return;
         this.deviceStatus.set(deviceId, { ...previous, ...patch });
+    }
+
+    _startStatusHeartbeat() {
+        if (this.statusHeartbeatTimer) return;
+        this.statusHeartbeatTimer = setInterval(() => {
+            if (this.stopped) return;
+            this._refreshDeviceStatuses();
+            this._notifyAggregateStatus(false);
+        }, STATUS_BROADCAST_MIN_MS);
+    }
+
+    _getTaskOutageStart(task) {
+        if (!task) return null;
+        if (task.status === 'connected') {
+            return task.lastReadAt || task.lastConnectedAt || null;
+        }
+        return task.outageStartedAt || task.lastFailureAt || task.firstConnectAttemptAt || task.lastConnectAttemptAt || null;
+    }
+
+    _isTaskOffline(task, now = Date.now()) {
+        if (!task) return false;
+        if (task.status === 'error') return true;
+
+        const outageStart = this._getTaskOutageStart(task);
+        if (!outageStart) return false;
+        return now - Number(outageStart) >= this.offlineAfterMs;
     }
 
     _normalizePlcConfig(device) {
@@ -778,13 +853,22 @@ class PlcReader {
         return Math.max(min, Math.min(max, Math.round(next)));
     }
 
+    _resolveOfflineAfterMs(value) {
+        const configured = value ?? process.env.PLC_OFFLINE_AFTER_MS;
+        return this._clampInteger(configured, 3000, 600000, DEFAULT_OFFLINE_AFTER_MS);
+    }
+
     _maxNumber(values) {
-        const valid = values.filter(value => Number.isFinite(Number(value))).map(Number);
+        const valid = values
+            .filter(value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)))
+            .map(Number);
         return valid.length ? Math.max(...valid) : null;
     }
 
     _minNumber(values) {
-        const valid = values.filter(value => Number.isFinite(Number(value))).map(Number);
+        const valid = values
+            .filter(value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)))
+            .map(Number);
         return valid.length ? Math.min(...valid) : null;
     }
 }

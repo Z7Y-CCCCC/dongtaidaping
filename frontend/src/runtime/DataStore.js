@@ -11,13 +11,30 @@ function getDeviceQuality(data) {
 }
 
 function formatEvent(row) {
-    const date = row?.occurred_at ? new Date(row.occurred_at) : new Date();
+    const parsedDate = row?.occurred_at ? new Date(row.occurred_at) : new Date();
+    const date = Number.isNaN(parsedDate.getTime()) ? new Date() : parsedDate;
     return {
         id: row?.id ?? `${Date.now()}-${Math.random()}`,
-        time: date.toLocaleTimeString(),
+        time: formatEventTime(date),
+        occurred_at: row?.occurred_at || null,
         msg: row?.title || row?.message || '系统事件',
         level: row?.level || 'info'
     };
+}
+
+function formatEventTime(date) {
+    const now = new Date();
+    const sameDay = date.getFullYear() === now.getFullYear()
+        && date.getMonth() === now.getMonth()
+        && date.getDate() === now.getDate();
+    if (sameDay) return date.toLocaleTimeString();
+    return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${date.toLocaleTimeString()}`;
+}
+
+function clampNumber(value, min, max, fallback) {
+    const next = Number(value);
+    if (!Number.isFinite(next)) return fallback;
+    return Math.max(min, Math.min(max, next));
 }
 
 export function createDashboardDataStore(options = {}) {
@@ -42,6 +59,11 @@ export function createDashboardDataStore(options = {}) {
     });
     const events = ref([{ id: 'boot', time: new Date().toLocaleTimeString(), msg: '等待实时事件接入', level: 'info' }]);
     const trendPoints = ref([]);
+    const eventQueryOptions = reactive({
+        limit: options.eventLimit || 20,
+        eventWindowHours: options.eventWindowHours ?? 24,
+        eventType: options.eventType || ''
+    });
 
     const latestDeviceDataMap = new Map();
     const lastSeenMap = new Map();
@@ -60,6 +82,17 @@ export function createDashboardDataStore(options = {}) {
     function setStaleMs(value) {
         const next = Number(value);
         if (Number.isFinite(next) && next > 0) staleMs.value = next;
+    }
+
+    function setEventQueryOptions(options = {}) {
+        eventQueryOptions.limit = Math.round(clampNumber(options.limit, 1, 200, eventQueryOptions.limit || 20));
+        eventQueryOptions.eventWindowHours = clampNumber(
+            options.eventWindowHours ?? options.windowHours ?? options.sinceHours,
+            0,
+            87600,
+            eventQueryOptions.eventWindowHours ?? 24
+        );
+        eventQueryOptions.eventType = String(options.eventType || options.event_type || '').trim();
     }
 
     function setDeviceDataHandler(handler) {
@@ -129,6 +162,7 @@ export function createDashboardDataStore(options = {}) {
         const value = String(status || '').toLowerCase();
         if (value === 'connected') return 'good';
         if (['connecting', 'retrying', 'idle', 'no_points'].includes(value)) return 'stale';
+        if (['offline', 'error', 'disabled', 'unsupported', 'unconfigured'].includes(value)) return 'bad';
         return 'bad';
     }
 
@@ -292,17 +326,20 @@ export function createDashboardDataStore(options = {}) {
     async function refreshEvents(force = false) {
         const now = Date.now();
         if (!force && (eventsInFlight || now - lastEventsRefreshAt < eventsRefreshIntervalMs)) return;
-        if (Object.keys(deviceStatusMap).length > 0 && !hasRecentRealtimeFrame()) {
-            events.value = [{ id: 'no-live-events', time: new Date().toLocaleTimeString(), msg: '暂无实时报警事件', level: 'info' }];
-            lastEventsRefreshAt = now;
-            return;
-        }
         eventsInFlight = true;
         try {
-            const resp = await fetch(`${API_BASE}/platform/events?limit=20`);
+            const params = new URLSearchParams();
+            params.set('limit', String(Math.round(clampNumber(eventQueryOptions.limit, 1, 200, 20))));
+            const windowHours = clampNumber(eventQueryOptions.eventWindowHours, 0, 87600, 24);
+            if (windowHours > 0) params.set('window_hours', String(windowHours));
+            if (eventQueryOptions.eventType) params.set('event_type', eventQueryOptions.eventType);
+            const resp = await fetch(`${API_BASE}/platform/events?${params.toString()}`);
             if (!resp.ok) return;
             const rows = await resp.json();
-            events.value = rows.length ? rows.map(formatEvent) : [{ id: 'empty', time: new Date().toLocaleTimeString(), msg: '暂无报警履历', level: 'info' }];
+            const emptyMsg = windowHours > 0
+                ? `最近 ${windowHours} 小时暂无报警履历`
+                : '暂无报警履历';
+            events.value = rows.length ? rows.map(formatEvent) : [{ id: 'empty', time: new Date().toLocaleTimeString(), msg: emptyMsg, level: 'info' }];
         } catch (e) {
             // 离线时保留当前列表。
         } finally {
@@ -408,6 +445,7 @@ export function createDashboardDataStore(options = {}) {
         trendPoints,
         latestDeviceDataMap,
         setStaleMs,
+        setEventQueryOptions,
         setDeviceDataHandler,
         registerDevice,
         selectDevice,

@@ -107,7 +107,7 @@ function useFallbackConfig() {
             { id: 'widget_metrics', widget_type: 'metrics', title: '生产指标', visible: 1, config: { compact: true } },
             { id: 'widget_trend', widget_type: 'trend', title: '历史趋势', visible: 1, config: { metric: 'avg_temp' } },
             { id: 'widget_alarms', widget_type: 'alarm_list', title: '报警履历', visible: 1, config: { limit: 5 } },
-            { id: 'widget_marquee', widget_type: 'marquee', title: '实时日志', visible: 1, config: { speed: 30 } }
+            { id: 'widget_marquee', widget_type: 'marquee', title: '实时日志', visible: 1, config: { speed: 30, limit: 20, eventWindowHours: 24 } }
         ]
     }
     factoryConfig.loaded = true

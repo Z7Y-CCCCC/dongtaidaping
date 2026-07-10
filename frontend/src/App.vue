@@ -43,7 +43,7 @@ const defaultDashboardWidgets = [
   { id: 'widget_metrics', widget_type: 'metrics', title: '生产指标', x: 0, y: 5, w: 5, h: 5, sort_order: 1, visible: true, config: { compact: true }, binding: {} },
   { id: 'widget_trend', widget_type: 'trend', title: '历史趋势', x: 19, y: 0, w: 5, h: 5, sort_order: 2, visible: true, config: { metric: 'avg_temp' }, binding: {} },
   { id: 'widget_alarms', widget_type: 'alarm_list', title: '报警履历', x: 19, y: 5, w: 5, h: 5, sort_order: 3, visible: true, config: { limit: 5 }, binding: {} },
-  { id: 'widget_marquee', widget_type: 'marquee', title: '实时日志', x: 3, y: 11, w: 18, h: 1, sort_order: 4, visible: true, config: { speed: 30 }, binding: {} }
+  { id: 'widget_marquee', widget_type: 'marquee', title: '实时日志', x: 3, y: 11, w: 18, h: 1, sort_order: 4, visible: true, config: { speed: 30, limit: 20, eventWindowHours: 24 }, binding: {} }
 ]
 const dashboardWidgets = computed(() => {
   if (currentLevel.value >= 3) return []
@@ -60,6 +60,16 @@ function getPlatformWidget(widgetType) {
 
 function getPlatformWidgetConfig(widgetType, fallback = {}) {
   return getPlatformWidget(widgetType)?.config || fallback
+}
+
+function getEventQueryConfig() {
+  const marqueeConfig = getPlatformWidgetConfig('marquee', { limit: 20, eventWindowHours: 24 })
+  const alarmConfig = getPlatformWidgetConfig('alarm_list', { limit: 5 })
+  return {
+    limit: marqueeConfig.limit || alarmConfig.limit || 20,
+    eventWindowHours: marqueeConfig.eventWindowHours ?? marqueeConfig.windowHours ?? 24,
+    eventType: marqueeConfig.eventType || marqueeConfig.event_type || ''
+  }
 }
 
 function isPlatformWidgetVisible(widgetType, defaultVisible = true) {
@@ -240,6 +250,7 @@ onMounted(async () => {
 
   const sceneCamera = getSceneCamera(platform.value)
   dataStore.setStaleMs(getSetting('realtime_stale_ms', sceneCamera.staleMs || 6000))
+  dataStore.setEventQueryOptions(getEventQueryConfig())
 
   sceneRuntime = new SceneRuntime(threeContainer.value, {
     workshops: getWorkshops(),

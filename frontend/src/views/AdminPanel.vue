@@ -3035,7 +3035,7 @@ function getWidgetDefaultConfig(type) {
         },
         trend: { seriesName: '平均温度', timeField: 'time', valueField: 'value', lineColor: '#f0b35a' },
         alarm_list: { limit: 5 },
-        marquee: { speed: 30 },
+        marquee: { speed: 30, limit: 20, eventWindowHours: 24 },
         text: { text: '现场提示 {value}', tone: 'normal' },
         device_label: DEFAULT_DEVICE_LABEL_CONFIG,
         diagnostics: DEFAULT_DIAGNOSTIC_CONFIG,
