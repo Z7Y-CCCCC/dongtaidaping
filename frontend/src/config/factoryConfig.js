@@ -190,6 +190,14 @@ export const adminApi = {
     async createDatabaseBackup() { return readApiJson(await fetch(`${API_BASE}/database/backups`, { method: 'POST' }), '创建数据库备份失败') },
     async restoreDatabaseBackup(filename) { return readApiJson(await fetch(`${API_BASE}/database/backups/${pathId(filename)}/restore`, { method: 'POST' }), '恢复数据库备份失败') },
     databaseBackupDownloadUrl(filename) { return `${API_BASE}/database/backups/${pathId(filename)}/download` },
+    async getSiteBackups() { return readApiJson(await fetch(`${API_BASE}/site-backups`), '读取整站灾备状态失败') },
+    async createSiteBackup() { return readApiJson(await fetch(`${API_BASE}/site-backups/export`, { method: 'POST' }), '导出整站灾备失败') },
+    async restoreSiteBackup(file) {
+        const formData = new FormData()
+        formData.append('backup', file)
+        return readApiJson(await fetch(`${API_BASE}/site-backups/import`, { method: 'POST', body: formData }), '恢复整站灾备失败')
+    },
+    siteBackupDownloadUrl(filename) { return `${API_BASE}/site-backups/${pathId(filename)}/download` },
 
     // 模型
     async getModels() { return (await fetch(`${API_BASE}/models`)).json() },

@@ -15,7 +15,11 @@
 %APPDATA%\heat-treatment-digital-twin-desktop\data\factory.db
 %APPDATA%\heat-treatment-digital-twin-desktop\data\backups\
 %APPDATA%\heat-treatment-digital-twin-desktop\data\recovery\
+%APPDATA%\heat-treatment-digital-twin-desktop\uploads\models\
 %APPDATA%\heat-treatment-digital-twin-desktop\logs\backend.log
+%APPDATA%\heat-treatment-digital-twin-desktop\logs\backend-error.log
+%APPDATA%\heat-treatment-digital-twin-desktop\logs\desktop-error.log
+%APPDATA%\heat-treatment-digital-twin-desktop\logs\*.log.gz
 ```
 
 ## 断电恢复与备份
@@ -23,8 +27,35 @@
 - 数据库使用 WAL 和全同步写入，启动时自动执行完整性检查。
 - 启动、每 6 小时和正常退出时自动备份，默认轮转保留最近 10 份。
 - 数据库损坏时，程序会把损坏文件移到 `recovery`，再从最新校验通过的备份恢复。
-- 后台“数据库连接 → 断电恢复与备份”可立即备份、下载或恢复；恢复前会自动创建回滚备份。
+- `backend.log` 记录后端正常运行输出，`backend-error.log` 单独记录后端错误输出，`desktop-error.log` 记录桌面壳启动和子进程异常；三类日志都按时间戳保留。
+- 单个活动日志默认达到 10 MB 自动切卷并 gzip；压缩日志默认保留 30 天、最多保留 60 个，程序运行期间每 6 小时自动清理一次。
+- 工程师做隔离诊断时可设置 `APP_USER_DATA_DIR` 指定应用数据目录；正常客户部署无需设置。
+- 后台“数据库连接 → 本机自动备份”可立即备份、下载或恢复；恢复前会自动创建回滚备份。
+- 本机自动备份与现场电脑存放在一起，只能防断电或数据库损坏，不能防电脑丢失、硬盘损坏或整机报废。
 - 软件在 Windows 登录后自动启动。无人值守来电恢复还需现场开启 BIOS 的“来电自动开机”，并配置专用 Windows 账号自动登录。
+
+## 整站灾备与新电脑恢复
+
+后台“数据库连接 → 整站灾备（防电脑丢失）”可导出一个 ZIP 灾备包，其中包含：
+
+- 一致性 SQLite 数据库，以及数据库中的车间、产线、设备、PLC 点位、性能设置和平台编排等全部现场配置。
+- 现场自行上传的 GLB/GLTF 模型文件。内置模型随安装包提供，不重复写入灾备包。
+- 文件清单、大小和 SHA-256，用于导入前完整性校验。
+
+现场备份步骤：
+
+1. 点击“导出整站备份”。
+2. 在安装版弹出的“另存为”窗口中选择 U 盘、移动硬盘或 NAS。不要只保存在现场电脑上。
+3. 定期把最新 ZIP 复制到另一处受控存储，并按现场制度保管。
+
+现场电脑丢失或更换后的恢复步骤：
+
+1. 在新电脑安装同版本或更新版本的软件并启动一次。
+2. 进入后台“数据库连接 → 整站灾备”，点击“从整站备份恢复”。
+3. 选择外置介质中的 ZIP，等待校验与恢复完成。
+4. 核对车间、设备、PLC 点位和上传模型，再进行现场 PLC 连通验收。
+
+导入前软件会创建当前数据库回滚备份；导入失败时会恢复原上传文件。旧电脑的绝对数据库路径不会覆盖新电脑的数据目录。
 
 ## 现场配置
 
@@ -44,6 +75,7 @@
 - 强杀 PLC 后 79ms 发布坏质量、4.126 秒判离线；PLC 恢复后 994ms 出现首个好帧、1.105 秒恢复在线。
 - 高频写入中强杀后端，重启后最后一次已确认写入仍存在，数据库 `quick_check=ok`。
 - 人为损坏主数据库后已验证自动恢复、损坏文件隔离、备份下载、手工恢复和恢复前回滚备份。
+- 已验证整站 ZIP 导出、配置与上传模型的异机式恢复、SQLite 完整性、SHA-256 校验、损坏包拒绝和恢复前回滚。
 
 ## 商业交付注意事项
 

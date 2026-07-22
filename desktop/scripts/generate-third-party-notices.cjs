@@ -32,7 +32,7 @@ function readLicenseFile(packageDirectory, declaredLicense) {
     if (!filename) return { filename: '', text: '' };
     return {
         filename,
-        text: fs.readFileSync(path.join(packageDirectory, filename), 'utf8').trim()
+        text: fs.readFileSync(path.join(packageDirectory, filename), 'utf8').trim().replace(/[ \t]+$/gm, '')
     };
 }
 

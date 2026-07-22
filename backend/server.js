@@ -22,6 +22,13 @@ const {
 } = require('./db/database');
 const { mergeBuiltinModels } = require('./services/builtinModels');
 const { stringifyModelMetadata } = require('./services/modelAssetMetadata');
+const {
+    createSiteBackup,
+    restoreSiteBackup,
+    getSiteBackupStatus,
+    resolveSiteBackupPath,
+    SITE_IMPORT_DIR
+} = require('./services/siteBackup');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
@@ -76,6 +83,30 @@ const upload = multer({
     },
     limits: { fileSize: 100 * 1024 * 1024 }
 });
+
+fs.mkdirSync(SITE_IMPORT_DIR, { recursive: true });
+const siteBackupUpload = multer({
+    dest: SITE_IMPORT_DIR,
+    fileFilter: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        cb(ext === '.zip' ? null : new Error('仅支持系统导出的 .zip 整站备份包'), ext === '.zip');
+    },
+    limits: { fileSize: 1024 * 1024 * 1024, files: 1 }
+});
+
+function receiveSiteBackup(req, res, next) {
+    siteBackupUpload.single('backup')(req, res, error => {
+        if (!error) {
+            next();
+            return;
+        }
+        if (req.file?.path) fs.rmSync(req.file.path, { force: true });
+        const message = error.code === 'LIMIT_FILE_SIZE'
+            ? '整站备份包不能超过 1 GB'
+            : error.message;
+        res.status(400).json({ success: false, error: message });
+    });
+}
 
 function resolveModelFileDeletePlan(modelFilePath) {
     if (!modelFilePath) return null;
@@ -366,6 +397,63 @@ app.post('/api/database/backups/:filename/restore', async (req, res) => {
         }
         res.status(400).json({ success: false, error: e.message });
     }
+});
+
+app.get('/api/site-backups', (req, res) => {
+    try {
+        res.json(getSiteBackupStatus());
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/site-backups/export', async (req, res) => {
+    try {
+        const backup = await createSiteBackup(uploadsRootDir);
+        res.json({ success: true, backup, status: getSiteBackupStatus() });
+    } catch (e) {
+        res.status(400).json({ success: false, error: e.message });
+    }
+});
+
+app.get('/api/site-backups/:filename/download', (req, res) => {
+    try {
+        const filename = resolveSiteBackupPath(req.params.filename);
+        res.download(filename, path.basename(filename));
+    } catch (e) {
+        res.status(404).json({ error: e.message });
+    }
+});
+
+app.post('/api/site-backups/import', receiveSiteBackup, async (req, res) => {
+    if (!req.file) return res.status(400).json({ success: false, error: '未收到整站备份文件' });
+
+    const dataEngine = global.dataEngine;
+    let result = null;
+    let restoreError = null;
+    try {
+        dataEngine?.stop();
+        await stopDatabaseMaintenance({ backup: true, reason: 'before-site-import' });
+        result = await restoreSiteBackup(req.file.path, uploadsRootDir);
+    } catch (error) {
+        restoreError = error;
+    }
+
+    try {
+        await startDatabaseMaintenance();
+    } catch (error) {
+        restoreError ||= error;
+    }
+    if (dataEngine) {
+        try { await dataEngine.start(); } catch (error) { restoreError ||= error; }
+    }
+    fs.rmSync(req.file.path, { force: true });
+
+    if (restoreError) {
+        res.status(400).json({ success: false, error: restoreError.message });
+        return;
+    }
+    res.json({ ...result, status: getSiteBackupStatus(), databaseStatus: getDatabaseBackupStatus() });
 });
 
 async function startServer() {

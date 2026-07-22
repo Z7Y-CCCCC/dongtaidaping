@@ -190,7 +190,8 @@ Windows 安装版默认使用 SQLite，并启用以下保护：
 - `WAL` 日志模式与 `synchronous=FULL`，降低突然断电造成已提交数据丢失或主库损坏的风险。
 - 每次启动、每 6 小时、正常退出时自动创建一致性备份，默认保留最近 10 份。
 - 启动时执行 `quick_check`；主库损坏时隔离原数据库及 WAL/SHM 文件，并从最新有效备份恢复。
-- 后台“数据库连接 → 断电恢复与备份”支持立即备份、下载和手工恢复；恢复前会自动生成回滚备份。
+- 后台“数据库连接 → 本机自动备份”支持立即备份、下载和手工恢复；恢复前会自动生成回滚备份。
+- 本机自动备份仍与现场电脑存放在一起，只防断电和数据库损坏，不防电脑丢失或硬盘损坏。
 
 安装版数据默认位于：
 
@@ -199,6 +200,34 @@ Windows 安装版默认使用 SQLite，并启用以下保护：
 %APPDATA%\heat-treatment-digital-twin-desktop\data\backups\
 %APPDATA%\heat-treatment-digital-twin-desktop\data\recovery\
 ```
+
+## 运行日志与错误日志
+
+Windows 安装版会把日志保存在当前用户的应用数据目录：
+
+```text
+%APPDATA%\heat-treatment-digital-twin-desktop\logs\backend.log
+%APPDATA%\heat-treatment-digital-twin-desktop\logs\backend-error.log
+%APPDATA%\heat-treatment-digital-twin-desktop\logs\desktop-error.log
+%APPDATA%\heat-treatment-digital-twin-desktop\logs\*.log.gz
+```
+
+`backend.log` 是后端正常运行日志，`backend-error.log` 是后端标准错误日志，`desktop-error.log` 是桌面壳和后端进程异常日志。单个活动日志默认达到 10 MB 自动切卷并 gzip；压缩日志默认保留 30 天、最多 60 个，软件运行期间每 6 小时自动清理。可通过 `LOG_MAX_BYTES`、`LOG_RETENTION_DAYS`、`LOG_MAX_ARCHIVES` 环境变量调整，单位分别是字节、天和文件数。
+
+工程师做隔离诊断时可设置 `APP_USER_DATA_DIR` 指定应用数据目录；未设置时仍使用 Windows 当前用户的默认应用数据目录。
+
+### 整站灾备（电脑丢失后在新电脑恢复）
+
+后台“数据库连接 → 整站灾备（防电脑丢失）”可导出 ZIP，内容包括一致性 SQLite 数据库、数据库中的全部现场配置、全部现场上传模型，以及逐文件 SHA-256 清单。安装版导出时会弹出“另存为”，应选择 U 盘、移动硬盘或 NAS，不能只保存在现场电脑上。
+
+新电脑恢复流程：
+
+1. 安装同版本或更新版本的软件并启动。
+2. 打开后台“数据库连接 → 整站灾备”。
+3. 点击“从整站备份恢复”并选择 ZIP。
+4. 恢复完成后核对设备、PLC 点位和模型，并重新进行现场连通验收。
+
+导入前会创建数据库回滚备份，失败时会恢复原上传文件；灾备包不会把旧电脑的绝对数据库路径写入新电脑。内置模型随安装包交付，不在 ZIP 内重复保存。
 
 安装版会注册 Windows 登录后自动启动。若要求停电来电后无人值守恢复展示，还必须在现场电脑 BIOS 中开启来电自动开机，并为专用展示账号配置 Windows 自动登录。
 
@@ -327,6 +356,7 @@ PLC 与断电恢复集成测试：
 cd backend
 npm run test:plc
 npm run test:recovery
+npm run test:site-backup
 ```
 
 PLC 测试默认从相邻的 `排产/PLC仿真调试器` 启动 Snap7 服务，所有数据库与日志均写入项目的 `output/` 隔离目录。

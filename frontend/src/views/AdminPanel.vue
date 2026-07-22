@@ -1038,7 +1038,7 @@ async function syncToLine() {
 }
 
 // ============ 连接设置 ============
-const settings = reactive({
+const defaultSettings = {
     factory_name: '',
     data_mode: 'integrated_plc',
     realtime_stale_ms: '6000',
@@ -1050,7 +1050,8 @@ const settings = reactive({
     render_scale: 1,
     render_antialias: false,
     render_label_fps: 12
-})
+}
+const settings = reactive({ ...defaultSettings })
 
 const renderProfileOptions = RENDER_PROFILE_OPTIONS
 const resolvedRenderSettings = computed(() => normalizeRenderSettings(settings))
@@ -1062,7 +1063,8 @@ const selectedRenderProfile = computed(() => (
 async function loadSettings() {
     const s = await adminApi.getSettings()
     if (s.data_mode !== 'simulation') s.data_mode = 'integrated_plc'
-    Object.assign(settings, s)
+    for (const key of Object.keys(settings)) delete settings[key]
+    Object.assign(settings, defaultSettings, s)
     settings.render_target_fps = Number(settings.render_target_fps || 45)
     settings.render_scale = Number(settings.render_scale || 1)
     settings.render_label_fps = Number(settings.render_label_fps || 12)
@@ -1154,6 +1156,15 @@ const databaseBackupStatus = reactive({
     lastRecovery: null,
     backups: []
 })
+const siteBackupFileInput = ref(null)
+const siteBackupBusy = ref(false)
+const siteBackupMessage = ref('')
+const siteBackupStatus = reactive({
+    supported: false,
+    retention: 0,
+    externalCopyRequired: true,
+    backups: []
+})
 const databaseDefaultPorts = {
     mysql: 3307,
     postgres: 5432,
@@ -1164,9 +1175,84 @@ async function loadDatabaseConfig() {
     try {
         const config = await adminApi.getDatabaseConfig()
         Object.assign(databaseConfig, config)
-        await loadDatabaseBackups()
+        await Promise.all([loadDatabaseBackups(), loadSiteBackups()])
     } catch (e) {
         databaseTestStatus.value = '数据库配置读取失败'
+    }
+}
+
+async function loadSiteBackups() {
+    try {
+        const status = await adminApi.getSiteBackups()
+        if (status?.error) throw new Error(status.error)
+        Object.assign(siteBackupStatus, status, { backups: status.backups || [] })
+    } catch (e) {
+        siteBackupMessage.value = `整站灾备状态读取失败：${e.message || e}`
+    }
+}
+
+function downloadSiteBackup(backup) {
+    const link = document.createElement('a')
+    link.href = adminApi.siteBackupDownloadUrl(backup.filename)
+    link.download = backup.filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+}
+
+async function exportSiteBackup() {
+    siteBackupBusy.value = true
+    siteBackupMessage.value = '正在生成整站灾备包并校验文件，请稍候...'
+    try {
+        const result = await adminApi.createSiteBackup()
+        if (result?.error || !result?.success || !result.backup?.filename) {
+            throw new Error(result?.error || '后端没有返回灾备文件')
+        }
+        Object.assign(siteBackupStatus, result.status || {}, { backups: result.status?.backups || [] })
+        siteBackupMessage.value = `灾备包已生成：${result.backup.filename}。请选择 U 盘、移动硬盘或 NAS 保存。`
+        downloadSiteBackup(result.backup)
+    } catch (e) {
+        siteBackupMessage.value = `整站灾备导出失败：${e.message || e}`
+    } finally {
+        siteBackupBusy.value = false
+    }
+}
+
+function chooseSiteBackupFile() {
+    if (!siteBackupFileInput.value) return
+    siteBackupFileInput.value.value = ''
+    siteBackupFileInput.value.click()
+}
+
+async function restoreSiteBackupFromFile(event) {
+    const file = event.target.files?.[0]
+    if (!file) return
+    if (!(await confirm(
+        `确定从“${file.name}”恢复整套现场？\n\n当前数据库和上传模型会先创建回滚副本，恢复后将以灾备包中的配置为准。`,
+        { title: '恢复整站灾备', type: 'warning', confirmText: '校验并恢复' }
+    ))) return
+
+    siteBackupBusy.value = true
+    siteBackupMessage.value = '正在校验灾备包并恢复数据库、现场配置和上传模型...'
+    try {
+        const result = await adminApi.restoreSiteBackup(file)
+        if (result?.error || !result?.success) throw new Error(result?.error || '后端没有返回成功状态')
+        Object.assign(siteBackupStatus, result.status || {}, { backups: result.status?.backups || [] })
+        Object.assign(databaseBackupStatus, result.databaseStatus || {}, { backups: result.databaseStatus?.backups || [] })
+        await loadWorkshops()
+        await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform()])
+        ensureComposerSelection()
+        syncComposerDraftFromSelection()
+        await nextTick()
+        scheduleComposerPreview()
+        siteBackupMessage.value = `整站恢复完成：灾备时间 ${new Date(result.manifestCreatedAt).toLocaleString()}，上传模型 ${result.uploadedFileCount || 0} 个。`
+        await alert('现场配置、数据库和上传模型已恢复完成。', { title: '整站恢复成功', type: 'success' })
+    } catch (e) {
+        siteBackupMessage.value = `整站恢复失败：${e.message || e}`
+        await alert(siteBackupMessage.value, { title: '整站恢复失败', type: 'danger' })
+    } finally {
+        siteBackupBusy.value = false
+        event.target.value = ''
     }
 }
 
@@ -6905,7 +6991,7 @@ const mainTabs = [
                             <div v-if="databaseConfig.type === 'sqlite' && databaseBackupStatus.supported" class="database-backup-panel">
                                 <div class="database-backup-header">
                                     <div>
-                                        <strong>断电恢复与备份</strong>
+                                        <strong>本机自动备份（仅防断电或数据库损坏）</strong>
                                         <p>
                                             WAL 全同步写入；每 {{ formatBackupInterval(databaseBackupStatus.intervalMs) }} 自动备份，
                                             保留最近 {{ databaseBackupStatus.retention }} 份，退出时再备份一次。
@@ -6918,6 +7004,9 @@ const mainTabs = [
                                     来源 {{ databaseBackupStatus.lastRecovery.source }}
                                 </p>
                                 <p v-if="databaseBackupMessage" class="database-backup-message">{{ databaseBackupMessage }}</p>
+                                <p class="database-local-only-notice">
+                                    这些备份仍保存在当前电脑内，电脑丢失或硬盘损坏时无法使用；整机灾难请使用下方“整站灾备”。
+                                </p>
                                 <div class="database-backup-list">
                                     <div v-for="backup in databaseBackupStatus.backups" :key="backup.filename" class="database-backup-row">
                                         <div>
@@ -6931,6 +7020,38 @@ const mainTabs = [
                                         <button @click="restoreDatabaseBackup(backup)" class="btn btn-small" :disabled="databaseBackupBusy || !backup.valid">恢复</button>
                                     </div>
                                     <div v-if="databaseBackupStatus.backups.length === 0" class="empty-hint">暂无备份</div>
+                                </div>
+                            </div>
+
+                            <div v-if="databaseConfig.type === 'sqlite' && siteBackupStatus.supported" class="site-backup-panel">
+                                <div class="site-backup-header">
+                                    <div>
+                                        <strong>整站灾备（防电脑丢失）</strong>
+                                        <p>一个 ZIP 包含一致性数据库、全部现场配置和所有上传模型，可在新电脑安装软件后直接导入复原。</p>
+                                    </div>
+                                    <div class="site-backup-actions">
+                                        <button @click="exportSiteBackup" class="btn btn-primary" :disabled="siteBackupBusy">导出整站备份</button>
+                                        <button @click="chooseSiteBackupFile" class="btn" :disabled="siteBackupBusy">从整站备份恢复</button>
+                                        <input ref="siteBackupFileInput" class="site-backup-file-input" type="file" accept=".zip,application/zip" @change="restoreSiteBackupFromFile" />
+                                    </div>
+                                </div>
+                                <p class="site-backup-external-notice">
+                                    导出时请保存到 U 盘、移动硬盘或 NAS。只保存在现场电脑上，仍然不能防止整机丢失。
+                                </p>
+                                <p v-if="siteBackupMessage" class="database-backup-message">{{ siteBackupMessage }}</p>
+                                <div v-if="siteBackupStatus.backups.length" class="site-backup-history">
+                                    <span>本机最近生成</span>
+                                    <button
+                                        v-for="backup in siteBackupStatus.backups.slice(0, 3)"
+                                        :key="backup.filename"
+                                        type="button"
+                                        class="site-backup-history-item"
+                                        :disabled="siteBackupBusy"
+                                        @click="downloadSiteBackup(backup)"
+                                    >
+                                        <strong>{{ backup.filename }}</strong>
+                                        <small>{{ new Date(backup.createdAt).toLocaleString() }} · {{ formatBackupSize(backup.size) }} · 重新保存</small>
+                                    </button>
                                 </div>
                             </div>
                         </div>
@@ -9840,6 +9961,7 @@ button:enabled:active {
 .database-backup-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .database-backup-header p { margin: 6px 0 0; color: #6e6e73; font-size: 13px; line-height: 1.6; }
 .database-recovery-notice { margin: 14px 0 0; padding: 10px 12px; background: #fff8e6; border-left: 3px solid #c68a00; color: #5c4300; font-size: 13px; }
+.database-local-only-notice { margin: 14px 0 0; padding: 10px 12px; background: #fff8e6; border-left: 3px solid #c68a00; color: #5c4300; font-size: 13px; line-height: 1.55; }
 .database-backup-message { margin: 12px 0 0; color: #515154; font-size: 13px; }
 .database-backup-list { margin-top: 14px; border-top: 1px solid #e5e5e7; }
 .database-backup-row { display: grid; grid-template-columns: minmax(280px, 1fr) auto auto auto; align-items: center; gap: 10px; min-height: 58px; padding: 8px 0; border-bottom: 1px solid #ededee; }
@@ -9850,6 +9972,18 @@ button:enabled:active {
 .backup-validity.is-valid { color: #16713a; }
 .backup-validity.is-invalid { color: #b42318; }
 .btn-small { min-height: 32px; padding: 5px 10px; font-size: 12px; }
+.site-backup-panel { margin-top: 26px; padding-top: 24px; border-top: 1px solid #d7d7da; }
+.site-backup-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.site-backup-header p { max-width: 720px; margin: 6px 0 0; color: #515154; font-size: 13px; line-height: 1.6; }
+.site-backup-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; }
+.site-backup-file-input { display: none; }
+.site-backup-external-notice { margin: 16px 0 0; padding: 12px 14px; color: #173f2b; background: #edf8f1; border-left: 3px solid #24834f; font-size: 13px; line-height: 1.55; }
+.site-backup-history { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 8px 14px; align-items: start; margin-top: 16px; padding-top: 14px; border-top: 1px solid #e5e5e7; }
+.site-backup-history > span { padding-top: 8px; color: #6e6e73; font-size: 12px; }
+.site-backup-history-item { grid-column: 2; display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; min-width: 0; padding: 8px 10px; color: #1d1d1f; background: transparent; border: 1px solid transparent; border-radius: 6px; text-align: left; cursor: pointer; transition: background-color 160ms ease, border-color 160ms ease; }
+.site-backup-history-item:hover:not(:disabled) { background: #f5f5f7; border-color: #e2e2e5; }
+.site-backup-history-item strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.site-backup-history-item small { flex: 0 0 auto; color: #6e6e73; font-size: 11px; }
 .mode-hint { margin-top: 16px; padding: 16px 20px; background: rgba(0, 102, 204, 0.03); border: 1px solid rgba(0, 102, 204, 0.1); border-radius: 8px; }
 .mode-hint p { margin: 6px 0; font-size: 13px; color: #434345; line-height: 1.6; }
 .mode-hint code { background: rgba(0, 0, 0, 0.04); padding: 2px 6px; border-radius: 4px; font-size: 12px; color: #1d1d1f; }
@@ -9891,6 +10025,8 @@ button:enabled:active {
     .database-backup-row {
         grid-template-columns: minmax(220px, 1fr) auto auto;
     }
+    .site-backup-header { flex-direction: column; }
+    .site-backup-actions { justify-content: flex-start; }
     .backup-validity {
         grid-column: 1 / -1;
         grid-row: 2;

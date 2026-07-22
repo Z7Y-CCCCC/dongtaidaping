@@ -5,11 +5,21 @@ const fs = require('fs');
 const http = require('http');
 const net = require('net');
 const path = require('path');
+const {
+    cleanupLogArchives,
+    createRotatingLogWriter
+} = require('./logManager.cjs');
 
 const APP_NAME = '热处理数字孪生大屏';
+if (process.env.APP_USER_DATA_DIR) {
+    app.setPath('userData', path.resolve(process.env.APP_USER_DATA_DIR));
+}
 let mainWindow = null;
 let backendProcess = null;
 let backendLogStream = null;
+let backendErrorLogStream = null;
+let desktopErrorLogStream = null;
+let logCleanupTimer = null;
 let backendPort = null;
 let backendShutdownToken = null;
 let isQuitting = false;
@@ -107,14 +117,47 @@ function waitForHealth(url, timeoutMs = 30000) {
     });
 }
 
-function startBackend(port, writable) {
+function logDesktopError(context, error) {
+    const message = error?.stack || error?.message || String(error || '未知错误');
+    desktopErrorLogStream?.write(`[${new Date().toISOString()}] [${context}] ${message}\n`);
+}
+
+function startLogMaintenance(logsDir) {
+    cleanupLogArchives(logsDir);
+    if (logCleanupTimer) clearInterval(logCleanupTimer);
+    logCleanupTimer = setInterval(() => cleanupLogArchives(logsDir), 6 * 60 * 60 * 1000);
+    logCleanupTimer.unref?.();
+}
+
+function closeBackendLogStreams() {
+    backendLogStream?.end();
+    backendErrorLogStream?.end();
+    backendLogStream = null;
+    backendErrorLogStream = null;
+}
+
+function guardLogStream(stream, label) {
+    stream.on('error', error => {
+        try {
+            dialog.showErrorBox(APP_NAME, `${label}写入失败：${error.message}`);
+        } catch (dialogError) { /* application may already be shutting down */ }
+    });
+    return stream;
+}
+
+async function startBackend(port, writable) {
     const backendDir = path.join(process.resourcesPath, 'backend');
     const nodeBinary = path.join(process.resourcesPath, 'runtime', 'node.exe');
     const frontendDir = path.join(process.resourcesPath, 'frontend');
-    const logPath = path.join(writable.logsDir, 'backend.log');
+    const errorLogPath = path.join(writable.logsDir, 'backend-error.log');
     backendPort = port;
     backendShutdownToken = crypto.randomBytes(32).toString('hex');
-    backendLogStream = fs.createWriteStream(logPath, { flags: 'a' });
+    const logStreams = await Promise.all([
+        createRotatingLogWriter(writable.logsDir, 'backend.log'),
+        createRotatingLogWriter(writable.logsDir, 'backend-error.log')
+    ]);
+    backendLogStream = guardLogStream(logStreams[0], '运行日志');
+    backendErrorLogStream = guardLogStream(logStreams[1], '后端错误日志');
 
     backendProcess = spawn(nodeBinary, [path.join(backendDir, 'server.js')], {
         cwd: backendDir,
@@ -136,13 +179,19 @@ function startBackend(port, writable) {
     });
 
     backendProcess.stdout.pipe(backendLogStream, { end: false });
-    backendProcess.stderr.pipe(backendLogStream, { end: false });
+    backendProcess.stderr.pipe(backendErrorLogStream, { end: false });
     backendProcess.once('exit', (code) => {
         backendProcess = null;
         if (!isQuitting && code !== 0) {
-            dialog.showErrorBox(APP_NAME, `本地数据服务异常退出（代码 ${code}）。\n日志：${logPath}`);
+            const error = new Error(`本地数据服务异常退出（代码 ${code}）`);
+            logDesktopError('backend-exit', error);
+            dialog.showErrorBox(APP_NAME, `${error.message}。\n错误日志：${errorLogPath}`);
             app.quit();
         }
+    });
+    await new Promise((resolve, reject) => {
+        backendProcess.once('spawn', resolve);
+        backendProcess.once('error', reject);
     });
 }
 
@@ -179,8 +228,7 @@ function stopBackend() {
     backendPort = null;
     backendShutdownToken = null;
     if (!processToStop || processToStop.killed) {
-        if (backendLogStream) backendLogStream.end();
-        backendLogStream = null;
+        closeBackendLogStreams();
         return Promise.resolve();
     }
 
@@ -190,8 +238,7 @@ function stopBackend() {
             if (settled) return;
             settled = true;
             clearTimeout(forceTimer);
-            if (backendLogStream) backendLogStream.end();
-            backendLogStream = null;
+            closeBackendLogStreams();
             resolve();
         };
         const forceTimer = setTimeout(() => {
@@ -229,6 +276,29 @@ function createMainWindow(url) {
     mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
         if (!targetUrl.startsWith(url)) event.preventDefault();
     });
+    mainWindow.webContents.session.on('will-download', async (event, item, webContents) => {
+        if (webContents !== mainWindow?.webContents) return;
+        item.pause();
+        try {
+            const result = await dialog.showSaveDialog(mainWindow, {
+                title: '保存备份文件',
+                defaultPath: item.getFilename(),
+                filters: [
+                    { name: '备份文件', extensions: ['zip', 'db'] },
+                    { name: '所有文件', extensions: ['*'] }
+                ]
+            });
+            if (result.canceled || !result.filePath) {
+                item.cancel();
+                return;
+            }
+            item.setSavePath(result.filePath);
+            item.resume();
+        } catch (error) {
+            item.cancel();
+            dialog.showErrorBox(APP_NAME, `备份文件保存失败：${error.message}`);
+        }
+    });
     mainWindow.once('ready-to-show', () => {
         mainWindow.maximize();
         mainWindow.show();
@@ -239,9 +309,14 @@ function createMainWindow(url) {
 
 async function launchApplication() {
     const writable = initializeWritableData();
+    desktopErrorLogStream = guardLogStream(
+        await createRotatingLogWriter(writable.logsDir, 'desktop-error.log'),
+        '桌面错误日志'
+    );
+    startLogMaintenance(writable.logsDir);
     const port = await findAvailablePort();
     const origin = `http://127.0.0.1:${port}`;
-    startBackend(port, writable);
+    await startBackend(port, writable);
     await waitForHealth(`${origin}/api/health`);
     createMainWindow(origin);
 }
@@ -259,7 +334,8 @@ if (!app.requestSingleInstanceLock()) {
         configureAutoStart();
         return launchApplication();
     }).catch((error) => {
-        dialog.showErrorBox(APP_NAME, `${error.message}\n请查看用户数据目录中的 logs/backend.log。`);
+        logDesktopError('application-start', error);
+        dialog.showErrorBox(APP_NAME, `${error.message}\n请查看用户数据目录中的 logs/desktop-error.log 和 logs/backend-error.log。`);
         app.quit();
     });
 
@@ -269,6 +345,10 @@ if (!app.requestSingleInstanceLock()) {
         event.preventDefault();
         isQuitting = true;
         stopBackend().finally(() => {
+            if (logCleanupTimer) clearInterval(logCleanupTimer);
+            logCleanupTimer = null;
+            desktopErrorLogStream?.end();
+            desktopErrorLogStream = null;
             quitReady = true;
             app.quit();
         });

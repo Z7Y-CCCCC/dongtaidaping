@@ -9,6 +9,7 @@
   "scripts": {
     "prepare:resources": "node scripts/prepare-resources.cjs && node scripts/generate-third-party-notices.cjs",
     "build:frontend": "npm --prefix ../frontend run build",
+    "test:logs": "node scripts/log-manager-test.cjs",
     "dist": "npm run build:frontend && npm run prepare:resources && electron-builder --win nsis --x64"
   },
   "devDependencies": {
@@ -24,6 +25,7 @@
     },
     "files": [
       "main.cjs",
+      "logManager.cjs",
       "package.json",
       "assets/**/*"
     ],

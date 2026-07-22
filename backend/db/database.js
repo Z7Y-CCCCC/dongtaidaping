@@ -565,6 +565,38 @@ async function createDatabaseBackup(reason = 'manual') {
     return backupPromise;
 }
 
+async function importDatabaseBackupFile(sourceFilename, reason = 'site-import') {
+    await getDb();
+    if (dialectName() !== 'sqlite') {
+        throw new Error('外部文件恢复仅支持 SQLite 数据库');
+    }
+
+    const source = path.resolve(String(sourceFilename || ''));
+    const verification = verifySqliteFile(source);
+    if (!verification.valid) throw new Error(`导入数据库完整性检查失败: ${verification.error}`);
+
+    ensureDirectory(BACKUP_DIR);
+    const safeReason = sanitizeBackupReason(reason);
+    const filename = `factory-${timestampToken()}-${safeReason}.db`;
+    const destination = path.join(BACKUP_DIR, filename);
+    const temporary = `${destination}.${process.pid}.tmp`;
+    fs.rmSync(temporary, { force: true });
+
+    try {
+        fs.copyFileSync(source, temporary);
+        const copiedVerification = verifySqliteFile(temporary);
+        if (!copiedVerification.valid) throw new Error(copiedVerification.error);
+        fs.renameSync(temporary, destination);
+        pruneDatabaseBackups();
+        return {
+            ...backupDescriptor(destination, { valid: true }),
+            reason: safeReason
+        };
+    } finally {
+        fs.rmSync(temporary, { force: true });
+    }
+}
+
 async function restoreDatabaseBackup(filename) {
     await getDb();
     if (dialectName() !== 'sqlite') {
@@ -576,26 +608,41 @@ async function restoreDatabaseBackup(filename) {
     const verification = verifySqliteFile(source);
     if (!verification.valid) throw new Error(`备份完整性检查失败: ${verification.error}`);
 
-    const rollback = await createDatabaseBackup('before-restore');
     const target = path.resolve(activeConfig.filename || DEFAULT_CONFIG.filename);
-    await closeDb();
+    ensureDirectory(RECOVERY_DIR);
+    const restoreSource = path.join(RECOVERY_DIR, `restore-source-${timestampToken()}-${process.pid}.db`);
+    fs.rmSync(restoreSource, { force: true });
 
     try {
-        quarantineSqliteFiles(target, 'before-restore');
-        installSqliteCopy(source, target);
-        await getDb();
-        lastRecovery = {
-            reason: 'manual_restore',
-            sourceType: 'backup',
-            source: path.basename(source),
-            recoveredAt: new Date().toISOString()
-        };
-        return { success: true, recovery: lastRecovery };
-    } catch (error) {
+        // Keep the selected source outside the rotating backup directory. With a
+        // retention of 1, creating the rollback backup below would otherwise
+        // prune the very file we are about to restore.
+        fs.copyFileSync(source, restoreSource);
+        const copiedVerification = verifySqliteFile(restoreSource);
+        if (!copiedVerification.valid) throw new Error(`恢复源复制后校验失败: ${copiedVerification.error}`);
+
+        const rollback = await createDatabaseBackup('before-restore');
         await closeDb();
-        installSqliteCopy(path.join(BACKUP_DIR, rollback.filename), target);
-        await getDb();
-        throw error;
+
+        try {
+            quarantineSqliteFiles(target, 'before-restore');
+            installSqliteCopy(restoreSource, target);
+            await getDb();
+            lastRecovery = {
+                reason: 'manual_restore',
+                sourceType: 'backup',
+                source: path.basename(source),
+                recoveredAt: new Date().toISOString()
+            };
+            return { success: true, recovery: lastRecovery, rollback };
+        } catch (error) {
+            await closeDb();
+            installSqliteCopy(path.join(BACKUP_DIR, rollback.filename), target);
+            await getDb();
+            throw error;
+        }
+    } finally {
+        fs.rmSync(restoreSource, { force: true });
     }
 }
 
@@ -1474,6 +1521,7 @@ module.exports = {
     reconnectDb,
     getDbStatus,
     createDatabaseBackup,
+    importDatabaseBackupFile,
     restoreDatabaseBackup,
     getDatabaseBackupStatus,
     resolveDatabaseBackupPath,
