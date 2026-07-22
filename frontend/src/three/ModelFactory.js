@@ -4,6 +4,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as cloneObject3D } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { FurnaceModel } from './FurnaceModel.js';
 import { buildDeviceLabelMarkup, updateDeviceLabelElements, applyDeviceLabelStyle } from '../runtime/uiConfig.js';
+import { getBackendOrigin } from '../runtime/backendEndpoint.js';
 
 const loader = new GLTFLoader();
 const modelCache = new Map();
@@ -12,10 +13,8 @@ export function resolveBackendAssetUrl(filePath) {
     if (!filePath) return '';
     if (/^https?:\/\//i.test(filePath)) return filePath;
 
-    const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
-    const host = window.location.hostname || 'localhost';
     const normalizedPath = filePath.startsWith('/') ? filePath : `/${filePath}`;
-    return `${protocol}//${host}:3001${normalizedPath}`;
+    return `${getBackendOrigin()}${normalizedPath}`;
 }
 
 export function loadGltf(url) {

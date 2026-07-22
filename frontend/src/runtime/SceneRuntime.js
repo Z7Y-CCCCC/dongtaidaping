@@ -221,13 +221,20 @@ export class SceneRuntime {
             workshops,
             models,
             cameraMode,
+            renderOptions,
             onLevelChange,
             onDeviceSelect,
             onDeviceRegistered,
             interactionOptions
         } = this.options;
 
-        this.sceneManager = new SceneManager(this.containerElement, onLevelChange, onDeviceSelect, interactionOptions);
+        this.sceneManager = new SceneManager(
+            this.containerElement,
+            onLevelChange,
+            onDeviceSelect,
+            interactionOptions,
+            renderOptions
+        );
 
         const definitions = flattenDeviceDefinitions(workshops || []);
         const results = new Array(definitions.length);

@@ -4,7 +4,9 @@ import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { adminApi } from '../config/factoryConfig.js'
+import { API_BASE } from '../runtime/backendEndpoint.js'
 import { SceneRuntime } from '../runtime/SceneRuntime.js'
+import { RENDER_PROFILE_OPTIONS, normalizeRenderSettings } from '../runtime/renderConfig.js'
 import WidgetRenderer from '../runtime/WidgetRenderer.vue'
 import { createDeviceModel, resolveBackendAssetUrl } from '../three/ModelFactory.js'
 import {
@@ -1040,13 +1042,29 @@ const settings = reactive({
     realtime_stale_ms: '6000',
     display_mode: 'industrial_twin',
     // 视角模式
-    camera_mode: 'auto'
+    camera_mode: 'auto',
+    render_profile: 'balanced',
+    render_target_fps: 45,
+    render_scale: 1,
+    render_antialias: false,
+    render_label_fps: 12
 })
+
+const renderProfileOptions = RENDER_PROFILE_OPTIONS
+const resolvedRenderSettings = computed(() => normalizeRenderSettings(settings))
+const selectedRenderProfile = computed(() => (
+    renderProfileOptions.find(item => item.value === settings.render_profile)
+    || renderProfileOptions.find(item => item.value === 'balanced')
+))
 
 async function loadSettings() {
     const s = await adminApi.getSettings()
     if (s.data_mode !== 'simulation') s.data_mode = 'integrated_plc'
     Object.assign(settings, s)
+    settings.render_target_fps = Number(settings.render_target_fps || 45)
+    settings.render_scale = Number(settings.render_scale || 1)
+    settings.render_label_fps = Number(settings.render_label_fps || 12)
+    settings.render_antialias = ['1', 'true', 'yes', 'on'].includes(String(settings.render_antialias).toLowerCase())
     await loadDatabaseConfig()
     // 同时获取引擎状态
     loadEngineStatus()
@@ -1181,7 +1199,7 @@ watch(() => databaseConfig.type, (type, oldType) => {
 
 async function loadEngineStatus() {
     try {
-        const res = await fetch('http://localhost:3001/api/engine/status')
+        const res = await fetch(`${API_BASE}/engine/status`)
         const data = await res.json()
         Object.assign(engineStatus, data)
     } catch (e) {
@@ -1204,14 +1222,19 @@ async function saveSettings() {
         data_mode: settings.data_mode,
         realtime_stale_ms: settings.realtime_stale_ms,
         display_mode: settings.display_mode,
-        camera_mode: settings.camera_mode
+        camera_mode: settings.camera_mode,
+        render_profile: settings.render_profile,
+        render_target_fps: settings.render_target_fps,
+        render_scale: settings.render_scale,
+        render_antialias: settings.render_antialias,
+        render_label_fps: settings.render_label_fps
     })
     if (result?.error) return alert(result.error, { title: '设置保存失败', type: 'danger' })
     if (!result?.success) return alert('设置保存失败：后端没有返回成功状态', { title: '设置保存失败', type: 'danger' })
     // 保存后自动重启数据引擎
     try {
-        await fetch('http://localhost:3001/api/engine/restart', { method: 'POST' })
-        alert('设置已保存，数据引擎正在重启以应用新配置...', { title: '保存成功', type: 'success' })
+        await fetch(`${API_BASE}/engine/restart`, { method: 'POST' })
+        alert('设置已保存。数据引擎正在重启；渲染性能设置将在大屏刷新后生效。', { title: '保存成功', type: 'success' })
     } catch (e) {
         alert('设置已保存，但数据引擎重启失败，请手动重启后端服务', { title: '保存成功', type: 'warning' })
     }
@@ -5141,7 +5164,7 @@ const mainTabs = [
     { key: 'composer', label: '现场编排器', icon: 'composer' },
     { key: 'models', label: '模型库', icon: 'models' },
     { key: 'platform', label: '组件配置', icon: 'platform' },
-    { key: 'settings', label: '连接设置', icon: 'settings' }
+    { key: 'settings', label: '系统设置', icon: 'settings' }
 ]
 </script>
 
@@ -6715,10 +6738,10 @@ const mainTabs = [
                     </div>
                 </div>
 
-                <!-- ======== 连接设置 ======== -->
+                <!-- ======== 系统设置 ======== -->
                 <div v-if="activeTab === 'settings'" class="tab-content">
-                    <h2>连接设置</h2>
-                    <p class="desc">配置数字孪生系统的数据通路、PLC 连接参数和通信方式。</p>
+                    <h2>系统设置</h2>
+                    <p class="desc">配置大屏渲染性能、数据通路、PLC 连接参数和通信方式。</p>
 
                     <!-- 引擎运行状态 -->
                     <div class="engine-status-card" :class="'status-' + engineStatus.plcStatus?.status">
@@ -6805,6 +6828,45 @@ const mainTabs = [
                             </div>
                         </div>
 
+                        <!-- ===== 渲染性能 ===== -->
+                        <div class="settings-section">
+                            <h3 class="section-title">大屏渲染性能</h3>
+                            <div class="settings-grid">
+                                <label>性能档位
+                                    <select v-model="settings.render_profile" class="input">
+                                        <option v-for="profile in renderProfileOptions" :key="profile.value" :value="profile.value">
+                                            {{ profile.label }}
+                                        </option>
+                                    </select>
+                                </label>
+                                <label>当前生效参数
+                                    <div class="input render-setting-readonly">
+                                        {{ resolvedRenderSettings.targetFps }} FPS / {{ Math.round(resolvedRenderSettings.renderScale * 100) }}% 分辨率
+                                    </div>
+                                </label>
+                            </div>
+
+                            <div class="mode-hint render-profile-hint">
+                                <p><strong>{{ selectedRenderProfile?.label }}：</strong>{{ selectedRenderProfile?.description }}</p>
+                                <p>浮标刷新 {{ resolvedRenderSettings.labelFps }} FPS；抗锯齿{{ resolvedRenderSettings.antialias ? '开启' : '关闭' }}。保存后刷新大屏页面生效。</p>
+                            </div>
+
+                            <div v-if="settings.render_profile === 'custom'" class="settings-grid render-custom-grid">
+                                <label>目标帧率 (15-144 FPS)
+                                    <input v-model.number="settings.render_target_fps" type="number" min="15" max="144" step="1" class="input" />
+                                </label>
+                                <label>渲染分辨率倍率 (0.5-1.5)
+                                    <input v-model.number="settings.render_scale" type="number" min="0.5" max="1.5" step="0.05" class="input" />
+                                </label>
+                                <label>3D 浮标刷新率 (1-30 FPS)
+                                    <input v-model.number="settings.render_label_fps" type="number" min="1" max="30" step="1" class="input" />
+                                </label>
+                                <label>抗锯齿
+                                    <span class="checkbox-line"><input v-model="settings.render_antialias" type="checkbox" /> 启用 WebGL 抗锯齿</span>
+                                </label>
+                            </div>
+                        </div>
+
                         <!-- ===== 数据通路选择 ===== -->
                         <div class="settings-section">
                             <h3 class="section-title">数据通路模式</h3>
@@ -6856,7 +6918,7 @@ const mainTabs = [
                             </div>
                         </div>
 
-                        <button @click="saveSettings" class="btn btn-primary" style="margin-top:24px; padding: 10px 30px; font-size: 15px;">保存所有连接设置</button>
+                        <button @click="saveSettings" class="btn btn-primary" style="margin-top:24px; padding: 10px 30px; font-size: 15px;">保存所有系统设置</button>
                     </div>
                 </div>
 
@@ -9559,6 +9621,11 @@ const mainTabs = [
 }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 .settings-grid label { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: #515154; font-weight: 500; }
+.render-setting-readonly { display: flex; align-items: center; color: #1d1d1f; background: #f5f5f7; }
+.render-profile-hint { margin-top: 16px; }
+.render-profile-hint p { margin: 4px 0; }
+.render-custom-grid { margin-top: 18px; padding-top: 18px; border-top: 1px solid #e5e5e7; }
+.checkbox-line { display: flex; align-items: center; gap: 8px; min-height: 38px; font-weight: 400; }
 .mode-hint { margin-top: 16px; padding: 16px 20px; background: rgba(0, 102, 204, 0.03); border: 1px solid rgba(0, 102, 204, 0.1); border-radius: 8px; }
 .mode-hint p { margin: 6px 0; font-size: 13px; color: #434345; line-height: 1.6; }
 .mode-hint code { background: rgba(0, 0, 0, 0.04); padding: 2px 6px; border-radius: 4px; font-size: 12px; color: #1d1d1f; }

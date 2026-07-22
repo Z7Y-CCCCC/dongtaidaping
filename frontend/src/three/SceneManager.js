@@ -148,7 +148,7 @@ function getLineBaseZ(globalLineIndex) {
 }
 
 export class SceneManager {
-    constructor(containerElement, onLevelChange, onDeviceSelect, interactionOptions = {}) {
+    constructor(containerElement, onLevelChange, onDeviceSelect, interactionOptions = {}, renderOptions = {}) {
         this.container = containerElement;
         const bounds = this.container?.getBoundingClientRect?.();
         this.width = Math.max(1, Math.round(bounds?.width || window.innerWidth));
@@ -157,6 +157,7 @@ export class SceneManager {
         this.onLevelChange = onLevelChange; // Callback 通知 Vue 层级变化
         this.onDeviceSelect = onDeviceSelect; // Callback 传递选中的设备数据
         this.interactionOptions = interactionOptions || {};
+        this.renderOptions = renderOptions || {};
 
         this.currentLevel = 0; // 0: 全局, 1: 产线, 2: 单机
         this.furnaces = [];
@@ -177,10 +178,12 @@ export class SceneManager {
         this.lastRenderTime = 0;
         this.lastStatsTime = performance.now();
         this.lastStatsFrame = 0;
-        this.targetFrameMs = 1000 / 30;
-        this.maxPixelRatio = 1;
-        this.labelRenderEveryStatic = 6;
-        this.labelRenderEveryMoving = 2;
+        this.targetFps = Math.max(15, Math.min(144, Number(this.renderOptions.targetFps) || 45));
+        this.targetFrameMs = 1000 / this.targetFps;
+        this.renderScale = Math.max(0.5, Math.min(1.5, Number(this.renderOptions.renderScale) || 1));
+        this.antialiasEnabled = this.renderOptions.antialias === true;
+        this.labelTargetFps = Math.max(1, Math.min(30, Number(this.renderOptions.labelFps) || 12));
+        this.lastLabelRenderTime = 0;
         this.forceLabelRefreshUntil = 0;
         this.connectionBadgesSuppressedUntil = 0;
         this.connectionBadgeRestoreTimer = null;
@@ -259,12 +262,12 @@ export class SceneManager {
 
     initRenderer() {
         this.renderer = new THREE.WebGLRenderer({
-            antialias: false,
+            antialias: this.antialiasEnabled,
             powerPreference: 'high-performance',
             precision: 'mediump'
         });
         this.renderer.setSize(this.width, this.height);
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.maxPixelRatio));
+        this.renderer.setPixelRatio(this.renderScale);
         this.renderer.domElement.style.touchAction = 'none';
         this.renderer.outputColorSpace = THREE.SRGBColorSpace;
         this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -1107,7 +1110,7 @@ export class SceneManager {
         this.camera.aspect = this.width / this.height;
         this.camera.updateProjectionMatrix();
         this.renderer.setSize(this.width, this.height);
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.maxPixelRatio));
+        this.renderer.setPixelRatio(this.renderScale);
         this.labelRenderer.setSize(this.width, this.height);
         this.requestLabelRefresh(300);
     }
@@ -1116,11 +1119,13 @@ export class SceneManager {
         if (this.disposed) return;
         this.animationFrameId = requestAnimationFrame(this.boundAnimate);
 
-        if (this.lastRenderTime && now - this.lastRenderTime < this.targetFrameMs) return;
+        const elapsedSinceRender = this.lastRenderTime ? now - this.lastRenderTime : this.targetFrameMs;
+        if (elapsedSinceRender < this.targetFrameMs) return;
 
-        const previousRenderTime = this.lastRenderTime || this.lastFrameTime;
-        const delta = Math.min((now - previousRenderTime) / 1000, 0.1);
-        this.lastRenderTime = now;
+        const delta = Math.min((now - this.lastFrameTime) / 1000, 0.1);
+        this.lastRenderTime = this.lastRenderTime
+            ? now - (elapsedSinceRender % this.targetFrameMs)
+            : now;
         this.lastFrameTime = now;
 
         for (const obj of this.updatables) {
@@ -1142,16 +1147,26 @@ export class SceneManager {
                 points: this.renderer.info.render.points,
                 pixelRatio: this.renderer.getPixelRatio(),
                 renderFps: Number(renderFps.toFixed(1)),
-                targetFps: Math.round(1000 / this.targetFrameMs)
+                targetFps: this.targetFps,
+                renderProfile: this.renderOptions.profile || 'balanced',
+                antialias: this.antialiasEnabled,
+                labelTargetFps: this.labelTargetFps
             };
             this.lastStatsTime = now;
             this.lastStatsFrame = this.frameCount;
         }
         const hasConnectionBadges = this.hasVisibleConnectionBadges();
         if (this.labelsVisible || this.factoryGuideLayer?.visible || hasConnectionBadges) {
-            const labelEvery = now < this.forceLabelRefreshUntil ? this.labelRenderEveryMoving : this.labelRenderEveryStatic;
-            if (this.frameCount % labelEvery === 0) {
+            const requestedLabelFps = now < this.forceLabelRefreshUntil
+                ? Math.min(this.targetFps, this.labelTargetFps * 2)
+                : this.labelTargetFps;
+            const labelFrameMs = 1000 / requestedLabelFps;
+            const labelElapsed = this.lastLabelRenderTime ? now - this.lastLabelRenderTime : labelFrameMs;
+            if (labelElapsed >= labelFrameMs) {
                 this.labelRenderer.render(this.scene, this.camera);
+                this.lastLabelRenderTime = this.lastLabelRenderTime
+                    ? now - (labelElapsed % labelFrameMs)
+                    : now;
             }
         }
     }

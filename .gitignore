@@ -4,6 +4,10 @@ backend/node_modules/
 mock-server/node_modules/
 
 frontend/dist/
+desktop/node_modules/
+desktop/dist/
+desktop/resources/
+安装包/
 backend/data/*.db
 backend/data/*.db-*
 backend/data/database-config.json

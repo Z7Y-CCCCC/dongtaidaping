@@ -141,6 +141,20 @@ npm run dev
 - 大屏：`http://localhost:5173/`
 - 后台：`http://localhost:5173/admin`
 
+## 大屏渲染性能档位
+
+后台“系统设置 → 大屏渲染性能”可以按部署电脑配置选择：
+
+| 档位 | 目标帧率 | 渲染分辨率 | 适用场景 |
+| --- | ---: | ---: | --- |
+| 低配兼容 | 30 FPS | 75% | 无独显、4K 大屏或较老电脑 |
+| 均衡 | 45 FPS | 100% | 普通核显，兼顾清晰度和流畅度 |
+| 流畅 | 60 FPS | 100% | 性能较好的核显或普通独显 |
+| 高画质 | 60 FPS | 125% | 有独显的展示电脑 |
+| 自定义 | 15-144 FPS | 50%-150% | 工程师按现场实测调整 |
+
+自定义档还可以控制 WebGL 抗锯齿和 3D 浮标刷新率。保存后刷新大屏页面生效。
+
 ## 数据库配置
 
 默认配置在 `backend/db/database.js`：
@@ -285,6 +299,16 @@ npm run build
 node --check backend/server.js
 node --check backend/services/plcReader.js
 ```
+
+Windows 客户安装包：
+
+```bash
+cd desktop
+npm install
+npm run dist
+```
+
+安装包输出到项目根目录的 `安装包/`。安装后无需另行安装 Node.js、数据库或浏览器；客户数据默认保存在 Windows 用户应用数据目录，卸载时不会自动删除。
 
 ## 提交说明
 

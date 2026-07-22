@@ -5,6 +5,7 @@ import { SceneRuntime } from './runtime/SceneRuntime.js'
 import { createDashboardDataStore } from './runtime/DataStore.js'
 import { getSceneCamera } from './runtime/LayoutConfig.js'
 import WidgetRenderer from './runtime/WidgetRenderer.vue'
+import { normalizeRenderSettings } from './runtime/renderConfig.js'
 import {
   DEFAULT_DEVICE_LABEL_CONFIG,
   DEFAULT_DIAGNOSTIC_CONFIG,
@@ -256,6 +257,7 @@ onMounted(async () => {
     workshops: getWorkshops(),
     models: factoryConfig.models || [],
     cameraMode: getSetting('camera_mode', sceneCamera.mode || 'auto'),
+    renderOptions: normalizeRenderSettings(factoryConfig.settings),
     deviceLabelConfig: deviceLabelConfig.value,
     onLevelChange: level => { currentLevel.value = level },
     onDeviceSelect: deviceId => dataStore.selectDevice(deviceId),

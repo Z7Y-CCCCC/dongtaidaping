@@ -1,6 +1,5 @@
 import { reactive, ref } from 'vue'
-
-const API_BASE = 'http://localhost:3001/api'
+import { API_BASE } from '../runtime/backendEndpoint.js'
 
 // 全局响应式配置状态
 const factoryConfig = reactive({
@@ -63,7 +62,12 @@ async function loadConfig() {
 function useFallbackConfig() {
     factoryConfig.settings = {
         factory_name: '智能热处理数字孪生控制中心',
-        data_mode: 'integrated_plc'
+        data_mode: 'integrated_plc',
+        render_profile: 'balanced',
+        render_target_fps: '45',
+        render_scale: '1',
+        render_antialias: 'false',
+        render_label_fps: '12'
     }
     
     const lineNames = ['A 产线', 'B 产线', 'C 产线', 'D 产线']

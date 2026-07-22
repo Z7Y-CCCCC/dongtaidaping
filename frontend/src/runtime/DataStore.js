@@ -1,6 +1,5 @@
 import { reactive, ref } from 'vue';
-
-const API_BASE = 'http://localhost:3001/api';
+import { API_BASE, getWebSocketUrl } from './backendEndpoint.js';
 
 function getDeviceQuality(data) {
     const groups = data?.quality || {};
@@ -379,9 +378,7 @@ export function createDashboardDataStore(options = {}) {
             reconnectTimer = null;
         }
 
-        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsHost = window.location.hostname || 'localhost';
-        const wsUrl = `${wsProtocol}//${wsHost}:3001/ws`;
+        const wsUrl = getWebSocketUrl('/ws');
         wsClient = new WebSocket(wsUrl);
 
         wsClient.onopen = () => {

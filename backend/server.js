@@ -18,10 +18,17 @@ const { stringifyModelMetadata } = require('./services/modelAssetMetadata');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
+const HOST = process.env.HOST || '127.0.0.1';
 
-const uploadsDir = path.join(__dirname, 'uploads', 'models');
+const uploadsRootDir = process.env.UPLOADS_DIR
+    ? path.resolve(process.env.UPLOADS_DIR)
+    : path.join(__dirname, 'uploads');
+const uploadsDir = path.join(uploadsRootDir, 'models');
 const assetsDir = path.join(__dirname, 'assets');
 const assetModelsDir = path.join(assetsDir, 'models');
+const frontendDistDir = process.env.FRONTEND_DIST
+    ? path.resolve(process.env.FRONTEND_DIST)
+    : null;
 
 for (const dir of [uploadsDir, assetModelsDir]) {
     if (!fs.existsSync(dir)) {
@@ -29,9 +36,9 @@ for (const dir of [uploadsDir, assetModelsDir]) {
     }
 }
 
-app.use(cors());
+if (process.env.ENABLE_CORS !== 'false') app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads', express.static(uploadsRootDir));
 app.use('/assets', express.static(assetsDir));
 
 app.use('/api/config', require('./routes/config'));
@@ -67,7 +74,9 @@ function resolveModelFileDeletePlan(modelFilePath) {
     if (!modelFilePath) return null;
 
     const relativePath = modelFilePath.replace(/^[/\\]+/, '');
-    const fullPath = path.resolve(__dirname, relativePath);
+    const fullPath = relativePath.startsWith('uploads/')
+        ? path.resolve(uploadsRootDir, relativePath.slice('uploads/'.length))
+        : path.resolve(__dirname, relativePath);
     const uploadRoot = path.resolve(uploadsDir);
     const assetRoot = path.resolve(assetModelsDir);
 
@@ -273,6 +282,16 @@ app.get('/api/health', (req, res) => {
     });
 });
 
+if (frontendDistDir && fs.existsSync(path.join(frontendDistDir, 'index.html'))) {
+    app.use(express.static(frontendDistDir));
+    app.get('*', (req, res, next) => {
+        if (req.path.startsWith('/api/') || req.path.startsWith('/assets/') || req.path.startsWith('/uploads/') || req.path === '/ws') {
+            return next();
+        }
+        return res.sendFile(path.join(frontendDistDir, 'index.html'));
+    });
+}
+
 app.get('/api/database/config', (req, res) => {
     res.json(publicDatabaseConfig(loadDatabaseConfig()));
 });
@@ -318,14 +337,26 @@ async function startServer() {
     const dataEngine = new DataEngine(wsServer);
     global.dataEngine = dataEngine;
 
-    httpServer.listen(PORT, () => {
-        console.log(`\n数字孪生后端服务已启动: http://localhost:${PORT}`);
+    let shuttingDown = false;
+    const shutdown = () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        try { dataEngine.stop(); } catch (e) { /* ignore */ }
+        try { wsServer.close(); } catch (e) { /* ignore */ }
+        httpServer.close(() => process.exit(0));
+        setTimeout(() => process.exit(0), 2500).unref();
+    };
+    process.once('SIGTERM', shutdown);
+    process.once('SIGINT', shutdown);
+
+    httpServer.listen(PORT, HOST, () => {
+        console.log(`\n数字孪生后端服务已启动: http://${HOST}:${PORT}`);
         const dbConfig = publicDatabaseConfig(loadDatabaseConfig());
         console.log(`   Database:    ${dbConfig.type} ${dbConfig.host || dbConfig.filename}:${dbConfig.port || ''}/${dbConfig.database || ''}`);
-        console.log(`   配置 API:    http://localhost:${PORT}/api/config`);
-        console.log(`   管理 API:    http://localhost:${PORT}/api/lines | devices | datapoints | settings`);
-        console.log(`   引擎状态:    http://localhost:${PORT}/api/engine/status`);
-        console.log(`   WebSocket:   ws://localhost:${PORT}/ws\n`);
+        console.log(`   配置 API:    http://${HOST}:${PORT}/api/config`);
+        console.log(`   管理 API:    http://${HOST}:${PORT}/api/lines | devices | datapoints | settings`);
+        console.log(`   引擎状态:    http://${HOST}:${PORT}/api/engine/status`);
+        console.log(`   WebSocket:   ws://${HOST}:${PORT}/ws\n`);
 
         setTimeout(() => {
             getDb()

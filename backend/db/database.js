@@ -1,7 +1,9 @@
 const fs = require('fs');
 const path = require('path');
 
-const DATA_DIR = path.join(__dirname, '..', 'data');
+const DATA_DIR = process.env.APP_DATA_DIR
+    ? path.resolve(process.env.APP_DATA_DIR)
+    : path.join(__dirname, '..', 'data');
 const CONFIG_PATH = path.join(DATA_DIR, 'database-config.json');
 
 const DEFAULT_CONFIG = {
@@ -955,7 +957,12 @@ async function seedDefaults() {
         ['data_mode', 'integrated_plc'],
         ['simulation_interval_ms', '2000'],
         ['realtime_stale_ms', '6000'],
-        ['display_mode', 'industrial_twin']
+        ['display_mode', 'industrial_twin'],
+        ['render_profile', 'balanced'],
+        ['render_target_fps', '45'],
+        ['render_scale', '1'],
+        ['render_antialias', 'false'],
+        ['render_label_fps', '12']
     ];
     for (const [key, value] of rows) {
         await db.insertIgnore('settings', { key, value }, 'key');
