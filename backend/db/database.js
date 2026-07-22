@@ -5,6 +5,10 @@ const DATA_DIR = process.env.APP_DATA_DIR
     ? path.resolve(process.env.APP_DATA_DIR)
     : path.join(__dirname, '..', 'data');
 const CONFIG_PATH = path.join(DATA_DIR, 'database-config.json');
+const BACKUP_DIR = path.resolve(process.env.DB_BACKUP_DIR || path.join(DATA_DIR, 'backups'));
+const RECOVERY_DIR = path.resolve(process.env.DB_RECOVERY_DIR || path.join(DATA_DIR, 'recovery'));
+const BACKUP_INTERVAL_MS = positiveInteger(process.env.DB_BACKUP_INTERVAL_MS, 6 * 60 * 60 * 1000);
+const BACKUP_RETENTION = positiveInteger(process.env.DB_BACKUP_RETENTION, 10);
 
 const DEFAULT_CONFIG = {
     type: 'mysql',
@@ -27,6 +31,15 @@ let mysqlDriver;
 let pgDriver;
 let sqlserverDriver;
 let sqliteDriver;
+let backupTimer;
+let backupPromise;
+let lastBackup = null;
+let lastRecovery = null;
+
+function positiveInteger(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : fallback;
+}
 
 function getMysql() {
     if (!mysqlDriver) mysqlDriver = require('mysql2/promise');
@@ -50,6 +63,184 @@ function getSqliteDatabase() {
 
 function ensureDataDir() {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function ensureDirectory(directory) {
+    fs.mkdirSync(directory, { recursive: true });
+    return directory;
+}
+
+function timestampToken(date = new Date()) {
+    return date.toISOString().replace(/[-:.]/g, '');
+}
+
+function sanitizeBackupReason(reason) {
+    const value = String(reason || 'manual').toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+    return value.replace(/^-+|-+$/g, '').slice(0, 32) || 'manual';
+}
+
+function sqliteQuickCheck(db) {
+    const result = db.pragma('quick_check', { simple: true });
+    if (String(result).toLowerCase() !== 'ok') {
+        throw new Error(`SQLite 完整性检查失败: ${result}`);
+    }
+}
+
+function verifySqliteFile(filename) {
+    const resolved = path.resolve(filename);
+    if (!fs.existsSync(resolved)) return { valid: false, error: '文件不存在' };
+
+    const Database = getSqliteDatabase();
+    let db;
+    try {
+        db = new Database(resolved, { readonly: true, fileMustExist: true });
+        sqliteQuickCheck(db);
+        return { valid: true, error: null };
+    } catch (error) {
+        return { valid: false, error: error.message };
+    } finally {
+        try { db?.close(); } catch (error) { /* ignore */ }
+    }
+}
+
+function configureSqlite(db) {
+    db.pragma('busy_timeout = 5000');
+    db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = FULL');
+    db.pragma('foreign_keys = ON');
+    db.pragma('wal_autocheckpoint = 1000');
+    sqliteQuickCheck(db);
+    return db;
+}
+
+function backupDescriptor(filename, options = {}) {
+    const stat = fs.statSync(filename);
+    return {
+        filename: path.basename(filename),
+        size: stat.size,
+        createdAt: stat.mtime.toISOString(),
+        valid: options.valid ?? null,
+        error: options.error || null
+    };
+}
+
+function listDatabaseBackups({ validate = true } = {}) {
+    ensureDirectory(BACKUP_DIR);
+    return fs.readdirSync(BACKUP_DIR, { withFileTypes: true })
+        .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.db'))
+        .map(entry => path.join(BACKUP_DIR, entry.name))
+        .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)
+        .map(filename => {
+            const verification = validate ? verifySqliteFile(filename) : { valid: null, error: null };
+            return backupDescriptor(filename, verification);
+        });
+}
+
+function resolveDatabaseBackupPath(filename) {
+    const name = path.basename(String(filename || ''));
+    if (!name || name !== filename || !name.toLowerCase().endsWith('.db')) {
+        throw new Error('备份文件名不合法');
+    }
+    const resolved = path.join(BACKUP_DIR, name);
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+        throw new Error('备份文件不存在');
+    }
+    return resolved;
+}
+
+function latestRecoverySource() {
+    const backup = listDatabaseBackups({ validate: true }).find(item => item.valid);
+    if (backup) return { type: 'backup', filename: path.join(BACKUP_DIR, backup.filename) };
+
+    const template = process.env.SQLITE_RECOVERY_TEMPLATE
+        ? path.resolve(process.env.SQLITE_RECOVERY_TEMPLATE)
+        : '';
+    if (template && verifySqliteFile(template).valid) {
+        return { type: 'template', filename: template };
+    }
+    return null;
+}
+
+function removeSqliteSidecars(filename) {
+    for (const suffix of ['-wal', '-shm']) {
+        try { fs.rmSync(`${filename}${suffix}`, { force: true }); } catch (error) { /* ignore */ }
+    }
+}
+
+function installSqliteCopy(source, destination) {
+    ensureDirectory(path.dirname(destination));
+    const temporary = `${destination}.restore-${process.pid}-${Date.now()}.tmp`;
+    fs.copyFileSync(source, temporary);
+    const verification = verifySqliteFile(temporary);
+    if (!verification.valid) {
+        fs.rmSync(temporary, { force: true });
+        throw new Error(`恢复源无效: ${verification.error}`);
+    }
+    removeSqliteSidecars(destination);
+    fs.rmSync(destination, { force: true });
+    fs.renameSync(temporary, destination);
+}
+
+function quarantineSqliteFiles(filename, label = 'corrupt') {
+    ensureDirectory(RECOVERY_DIR);
+    const token = timestampToken();
+    const moved = [];
+    for (const suffix of ['', '-wal', '-shm']) {
+        const source = `${filename}${suffix}`;
+        if (!fs.existsSync(source)) continue;
+        const destination = path.join(
+            RECOVERY_DIR,
+            `${path.basename(filename)}${suffix}.${token}.${label}`
+        );
+        fs.renameSync(source, destination);
+        moved.push({ source, destination });
+    }
+    return moved;
+}
+
+function openSqliteWithRecovery(filename) {
+    const Database = getSqliteDatabase();
+    const resolved = path.resolve(filename);
+    ensureDirectory(path.dirname(resolved));
+
+    if (!fs.existsSync(resolved)) {
+        const recoverySource = latestRecoverySource();
+        if (recoverySource) {
+            installSqliteCopy(recoverySource.filename, resolved);
+            lastRecovery = {
+                reason: 'database_missing',
+                sourceType: recoverySource.type,
+                source: path.basename(recoverySource.filename),
+                recoveredAt: new Date().toISOString()
+            };
+        }
+    }
+
+    let db;
+    try {
+        db = new Database(resolved);
+        return configureSqlite(db);
+    } catch (error) {
+        try { db?.close(); } catch (closeError) { /* ignore */ }
+        const recoverySource = latestRecoverySource();
+        if (!recoverySource) {
+            throw new Error(`SQLite 数据库损坏且没有有效备份: ${error.message}`);
+        }
+
+        const quarantined = quarantineSqliteFiles(resolved, 'corrupt');
+        installSqliteCopy(recoverySource.filename, resolved);
+        db = configureSqlite(new Database(resolved));
+        lastRecovery = {
+            reason: 'integrity_failure',
+            sourceType: recoverySource.type,
+            source: path.basename(recoverySource.filename),
+            quarantined: quarantined.map(item => path.basename(item.destination)),
+            recoveredAt: new Date().toISOString(),
+            error: error.message
+        };
+        console.warn(`[DB] 主数据库损坏，已从${recoverySource.type === 'backup' ? '备份' : '模板'}恢复: ${recoverySource.filename}`);
+        return db;
+    }
 }
 
 function readStoredConfig() {
@@ -276,11 +467,8 @@ async function initDb() {
         const sqlserver = getSqlServer();
         pool = await sqlserver.connect(sqlServerConnectionConfig(activeConfig));
     } else if (dialect === 'sqlite') {
-        const Database = getSqliteDatabase();
         ensureDataDir();
-        sqliteDb = new Database(activeConfig.filename || DEFAULT_CONFIG.filename);
-        sqliteDb.pragma('journal_mode = WAL');
-        sqliteDb.pragma('foreign_keys = ON');
+        sqliteDb = openSqliteWithRecovery(activeConfig.filename || DEFAULT_CONFIG.filename);
     } else {
         throw new Error(`不支持的数据库类型: ${activeConfig.type}`);
     }
@@ -332,6 +520,135 @@ async function reconnectDb() {
     return getDb();
 }
 
+function pruneDatabaseBackups() {
+    const backups = listDatabaseBackups({ validate: false });
+    for (const backup of backups.slice(BACKUP_RETENTION)) {
+        fs.rmSync(path.join(BACKUP_DIR, backup.filename), { force: true });
+    }
+}
+
+async function createDatabaseBackup(reason = 'manual') {
+    if (backupPromise) return backupPromise;
+
+    backupPromise = (async () => {
+        await getDb();
+        if (dialectName() !== 'sqlite' || !sqliteDb) {
+            throw new Error('自动文件备份仅支持 SQLite 数据库');
+        }
+
+        ensureDirectory(BACKUP_DIR);
+        const safeReason = sanitizeBackupReason(reason);
+        const filename = `factory-${timestampToken()}-${safeReason}.db`;
+        const destination = path.join(BACKUP_DIR, filename);
+        const temporary = `${destination}.${process.pid}.tmp`;
+        fs.rmSync(temporary, { force: true });
+
+        try {
+            await sqliteDb.backup(temporary);
+            const verification = verifySqliteFile(temporary);
+            if (!verification.valid) throw new Error(verification.error);
+            fs.renameSync(temporary, destination);
+            pruneDatabaseBackups();
+            lastBackup = {
+                ...backupDescriptor(destination, { valid: true }),
+                reason: safeReason
+            };
+            console.log(`[DB] SQLite 备份完成: ${destination}`);
+            return lastBackup;
+        } finally {
+            fs.rmSync(temporary, { force: true });
+        }
+    })().finally(() => {
+        backupPromise = null;
+    });
+
+    return backupPromise;
+}
+
+async function restoreDatabaseBackup(filename) {
+    await getDb();
+    if (dialectName() !== 'sqlite') {
+        throw new Error('文件恢复仅支持 SQLite 数据库');
+    }
+
+    if (backupPromise) await backupPromise;
+    const source = resolveDatabaseBackupPath(filename);
+    const verification = verifySqliteFile(source);
+    if (!verification.valid) throw new Error(`备份完整性检查失败: ${verification.error}`);
+
+    const rollback = await createDatabaseBackup('before-restore');
+    const target = path.resolve(activeConfig.filename || DEFAULT_CONFIG.filename);
+    await closeDb();
+
+    try {
+        quarantineSqliteFiles(target, 'before-restore');
+        installSqliteCopy(source, target);
+        await getDb();
+        lastRecovery = {
+            reason: 'manual_restore',
+            sourceType: 'backup',
+            source: path.basename(source),
+            recoveredAt: new Date().toISOString()
+        };
+        return { success: true, recovery: lastRecovery };
+    } catch (error) {
+        await closeDb();
+        installSqliteCopy(path.join(BACKUP_DIR, rollback.filename), target);
+        await getDb();
+        throw error;
+    }
+}
+
+function getDatabaseBackupStatus() {
+    const config = activeConfig || loadDatabaseConfig();
+    const supported = dialectName(config) === 'sqlite';
+    return {
+        supported,
+        automatic: supported,
+        intervalMs: BACKUP_INTERVAL_MS,
+        retention: BACKUP_RETENTION,
+        directory: BACKUP_DIR,
+        lastBackup,
+        lastRecovery,
+        backups: supported ? listDatabaseBackups({ validate: true }) : []
+    };
+}
+
+async function startDatabaseMaintenance() {
+    await getDb();
+    if (dialectName() !== 'sqlite') return getDatabaseBackupStatus();
+    if (backupTimer) clearInterval(backupTimer);
+
+    try {
+        await createDatabaseBackup('startup');
+    } catch (error) {
+        console.error('[DB] 启动备份失败:', error.message);
+    }
+
+    backupTimer = setInterval(() => {
+        createDatabaseBackup('scheduled').catch(error => {
+            console.error('[DB] 定时备份失败:', error.message);
+        });
+    }, BACKUP_INTERVAL_MS);
+    backupTimer.unref?.();
+    return getDatabaseBackupStatus();
+}
+
+async function stopDatabaseMaintenance(options = {}) {
+    if (backupTimer) {
+        clearInterval(backupTimer);
+        backupTimer = null;
+    }
+    if (options.backup !== false && sqliteDb && dialectName() === 'sqlite') {
+        try {
+            await createDatabaseBackup(options.reason || 'shutdown');
+        } catch (error) {
+            console.error('[DB] 退出备份失败:', error.message);
+        }
+    }
+    if (backupPromise) await backupPromise;
+}
+
 async function testDatabaseConfig(input) {
     const config = normalizeConfig({
         ...loadDatabaseConfig(),
@@ -379,6 +696,7 @@ async function testDatabaseConfig(input) {
         ensureDataDir();
         const db = new Database(config.filename || DEFAULT_CONFIG.filename);
         db.prepare('SELECT 1').get();
+        sqliteQuickCheck(db);
         db.close();
         return true;
     }
@@ -1155,6 +1473,13 @@ module.exports = {
     closeDb,
     reconnectDb,
     getDbStatus,
+    createDatabaseBackup,
+    restoreDatabaseBackup,
+    getDatabaseBackupStatus,
+    resolveDatabaseBackupPath,
+    startDatabaseMaintenance,
+    stopDatabaseMaintenance,
+    verifySqliteFile,
     loadDatabaseConfig,
     saveDatabaseConfig,
     publicDatabaseConfig,

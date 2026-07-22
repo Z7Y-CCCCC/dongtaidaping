@@ -6,8 +6,15 @@ const http = require('http');
 const multer = require('multer');
 const {
     getDb,
+    closeDb,
     getDbStatus,
     reconnectDb,
+    createDatabaseBackup,
+    restoreDatabaseBackup,
+    getDatabaseBackupStatus,
+    resolveDatabaseBackupPath,
+    startDatabaseMaintenance,
+    stopDatabaseMaintenance,
     loadDatabaseConfig,
     publicDatabaseConfig,
     saveDatabaseConfig,
@@ -307,13 +314,56 @@ app.post('/api/database/test', async (req, res) => {
 
 app.put('/api/database/config', async (req, res) => {
     try {
+        await stopDatabaseMaintenance({ backup: true, reason: 'before-config-change' });
         const config = saveDatabaseConfig(req.body || {});
         await reconnectDb();
+        await startDatabaseMaintenance();
         if (global.dataEngine) {
             await global.dataEngine.restart();
         }
         res.json({ success: true, config });
     } catch (e) {
+        res.status(400).json({ success: false, error: e.message });
+    }
+});
+
+app.get('/api/database/backups', (req, res) => {
+    try {
+        res.json(getDatabaseBackupStatus());
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/database/backups', async (req, res) => {
+    try {
+        const backup = await createDatabaseBackup('manual');
+        res.json({ success: true, backup, status: getDatabaseBackupStatus() });
+    } catch (e) {
+        res.status(400).json({ success: false, error: e.message });
+    }
+});
+
+app.get('/api/database/backups/:filename/download', (req, res) => {
+    try {
+        const filename = resolveDatabaseBackupPath(req.params.filename);
+        res.download(filename, path.basename(filename));
+    } catch (e) {
+        res.status(404).json({ error: e.message });
+    }
+});
+
+app.post('/api/database/backups/:filename/restore', async (req, res) => {
+    const dataEngine = global.dataEngine;
+    try {
+        dataEngine?.stop();
+        const result = await restoreDatabaseBackup(req.params.filename);
+        if (dataEngine) await dataEngine.start();
+        res.json({ ...result, status: getDatabaseBackupStatus() });
+    } catch (e) {
+        if (dataEngine) {
+            try { await dataEngine.start(); } catch (restartError) { /* report original restore error */ }
+        }
         res.status(400).json({ success: false, error: e.message });
     }
 });
@@ -338,14 +388,40 @@ async function startServer() {
     global.dataEngine = dataEngine;
 
     let shuttingDown = false;
-    const shutdown = () => {
+    const shutdown = async () => {
         if (shuttingDown) return;
         shuttingDown = true;
+        const forceExit = setTimeout(() => process.exit(1), 12000);
+        forceExit.unref?.();
         try { dataEngine.stop(); } catch (e) { /* ignore */ }
         try { wsServer.close(); } catch (e) { /* ignore */ }
-        httpServer.close(() => process.exit(0));
-        setTimeout(() => process.exit(0), 2500).unref();
+        httpServer.close();
+        try {
+            await stopDatabaseMaintenance({ backup: true, reason: 'shutdown' });
+            await closeDb();
+            clearTimeout(forceExit);
+            process.exit(0);
+        } catch (error) {
+            console.error('[Shutdown] 安全退出失败:', error.message);
+            process.exit(1);
+        }
     };
+
+    const desktopShutdownToken = String(process.env.DESKTOP_SHUTDOWN_TOKEN || '');
+    if (desktopShutdownToken) {
+        app.post('/api/internal/shutdown', (req, res) => {
+            const remoteAddress = String(req.socket.remoteAddress || '');
+            const isLoopback = remoteAddress === '::1' || /^(::ffff:)?127\.0\.0\.1$/.test(remoteAddress);
+            const suppliedToken = String(req.get('x-shutdown-token') || '');
+            if (!isLoopback || suppliedToken !== desktopShutdownToken) {
+                res.status(403).json({ success: false, error: '拒绝访问' });
+                return;
+            }
+
+            res.status(202).json({ success: true, message: '正在安全退出' });
+            res.once('finish', () => setImmediate(shutdown));
+        });
+    }
     process.once('SIGTERM', shutdown);
     process.once('SIGINT', shutdown);
 
@@ -360,6 +436,7 @@ async function startServer() {
 
         setTimeout(() => {
             getDb()
+                .then(() => startDatabaseMaintenance())
                 .then(() => dataEngine.start())
                 .catch((error) => {
                     console.error('[DataEngine] 启动失败:', error.message);

@@ -1,5 +1,6 @@
 const { app, BrowserWindow, dialog, shell } = require('electron');
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const net = require('net');
@@ -9,7 +10,10 @@ const APP_NAME = '热处理数字孪生大屏';
 let mainWindow = null;
 let backendProcess = null;
 let backendLogStream = null;
+let backendPort = null;
+let backendShutdownToken = null;
 let isQuitting = false;
+let quitReady = false;
 
 function ensureDirectory(directory) {
     fs.mkdirSync(directory, { recursive: true });
@@ -44,6 +48,16 @@ function initializeWritableData() {
     }
 
     return { dataDir, uploadsDir, logsDir };
+}
+
+function configureAutoStart() {
+    if (!app.isPackaged || process.platform !== 'win32' || process.env.DISABLE_AUTO_START === 'true') return;
+    app.setLoginItemSettings({
+        openAtLogin: true,
+        openAsHidden: false,
+        path: process.execPath,
+        args: ['--autostart']
+    });
 }
 
 function findAvailablePort(startPort = 3001) {
@@ -98,6 +112,8 @@ function startBackend(port, writable) {
     const nodeBinary = path.join(process.resourcesPath, 'runtime', 'node.exe');
     const frontendDir = path.join(process.resourcesPath, 'frontend');
     const logPath = path.join(writable.logsDir, 'backend.log');
+    backendPort = port;
+    backendShutdownToken = crypto.randomBytes(32).toString('hex');
     backendLogStream = fs.createWriteStream(logPath, { flags: 'a' });
 
     backendProcess = spawn(nodeBinary, [path.join(backendDir, 'server.js')], {
@@ -112,6 +128,8 @@ function startBackend(port, writable) {
             UPLOADS_DIR: writable.uploadsDir,
             FRONTEND_DIST: frontendDir,
             ENABLE_CORS: 'false',
+            SQLITE_RECOVERY_TEMPLATE: path.join(process.resourcesPath, 'templates', 'factory-template.db'),
+            DESKTOP_SHUTDOWN_TOKEN: backendShutdownToken,
             NODE_PATH: path.join(process.resourcesPath, 'backend-dependencies')
         },
         stdio: ['ignore', 'pipe', 'pipe']
@@ -128,13 +146,63 @@ function startBackend(port, writable) {
     });
 }
 
+function requestBackendShutdown(port, token) {
+    return new Promise((resolve, reject) => {
+        const request = http.request({
+            host: '127.0.0.1',
+            port,
+            path: '/api/internal/shutdown',
+            method: 'POST',
+            headers: {
+                'x-shutdown-token': token,
+                'content-length': '0'
+            }
+        }, response => {
+            response.resume();
+            if (response.statusCode === 202) {
+                resolve();
+                return;
+            }
+            reject(new Error(`安全退出请求失败: HTTP ${response.statusCode}`));
+        });
+        request.setTimeout(2000, () => request.destroy(new Error('安全退出请求超时')));
+        request.on('error', reject);
+        request.end();
+    });
+}
+
 function stopBackend() {
-    if (backendProcess && !backendProcess.killed) {
-        backendProcess.kill('SIGTERM');
-    }
+    const processToStop = backendProcess;
+    const port = backendPort;
+    const token = backendShutdownToken;
     backendProcess = null;
-    if (backendLogStream) backendLogStream.end();
-    backendLogStream = null;
+    backendPort = null;
+    backendShutdownToken = null;
+    if (!processToStop || processToStop.killed) {
+        if (backendLogStream) backendLogStream.end();
+        backendLogStream = null;
+        return Promise.resolve();
+    }
+
+    return new Promise(resolve => {
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(forceTimer);
+            if (backendLogStream) backendLogStream.end();
+            backendLogStream = null;
+            resolve();
+        };
+        const forceTimer = setTimeout(() => {
+            try { processToStop.kill(); } catch (error) { /* ignore */ }
+            finish();
+        }, 14000);
+        processToStop.once('exit', finish);
+        requestBackendShutdown(port, token).catch(() => {
+            try { processToStop.kill(); } catch (error) { finish(); }
+        });
+    });
 }
 
 function createMainWindow(url) {
@@ -187,14 +255,22 @@ if (!app.requestSingleInstanceLock()) {
         mainWindow.focus();
     });
 
-    app.whenReady().then(launchApplication).catch((error) => {
+    app.whenReady().then(() => {
+        configureAutoStart();
+        return launchApplication();
+    }).catch((error) => {
         dialog.showErrorBox(APP_NAME, `${error.message}\n请查看用户数据目录中的 logs/backend.log。`);
         app.quit();
     });
 
     app.on('window-all-closed', () => app.quit());
-    app.on('before-quit', () => {
+    app.on('before-quit', (event) => {
+        if (quitReady) return;
+        event.preventDefault();
         isQuitting = true;
-        stopBackend();
+        stopBackend().finally(() => {
+            quitReady = true;
+            app.quit();
+        });
     });
 }

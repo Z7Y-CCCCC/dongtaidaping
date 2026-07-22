@@ -5,7 +5,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "test:plc": "node scripts/plc-integration-test.cjs",
+    "test:recovery": "node scripts/power-recovery-test.cjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",

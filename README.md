@@ -21,8 +21,9 @@
 | --- | --- |
 | 前端 | Vue 3、Vite、Three.js、GSAP、ECharts |
 | 后端 | Node.js、Express、WebSocket(ws)、nodes7 |
-| 默认数据库 | MySQL/MariaDB |
-| 可选数据库 | SQLite、PostgreSQL、SQL Server |
+| 开发默认数据库 | MySQL/MariaDB |
+| Windows 安装版数据库 | 本地 SQLite（WAL + 全同步写入） |
+| 可选数据库 | PostgreSQL、SQL Server |
 | 工具 | Blender Python 建模脚本、PLC 模拟脚本 |
 
 ## 目录结构
@@ -180,6 +181,26 @@ npm run dev
 | `DB_USER` 或 `MYSQL_USER` | 用户名 |
 | `DB_PASSWORD` 或 `MYSQL_PASSWORD` | 密码 |
 | `DB_NAME` 或 `MYSQL_DATABASE` | 数据库名 |
+| `SQLITE_FILE` | SQLite 数据库文件 |
+
+## SQLite 断电恢复与备份
+
+Windows 安装版默认使用 SQLite，并启用以下保护：
+
+- `WAL` 日志模式与 `synchronous=FULL`，降低突然断电造成已提交数据丢失或主库损坏的风险。
+- 每次启动、每 6 小时、正常退出时自动创建一致性备份，默认保留最近 10 份。
+- 启动时执行 `quick_check`；主库损坏时隔离原数据库及 WAL/SHM 文件，并从最新有效备份恢复。
+- 后台“数据库连接 → 断电恢复与备份”支持立即备份、下载和手工恢复；恢复前会自动生成回滚备份。
+
+安装版数据默认位于：
+
+```text
+%APPDATA%\heat-treatment-digital-twin-desktop\data\factory.db
+%APPDATA%\heat-treatment-digital-twin-desktop\data\backups\
+%APPDATA%\heat-treatment-digital-twin-desktop\data\recovery\
+```
+
+安装版会注册 Windows 登录后自动启动。若要求停电来电后无人值守恢复展示，还必须在现场电脑 BIOS 中开启来电自动开机，并为专用展示账号配置 Windows 自动登录。
 
 后台也有“数据库连接”配置入口。保存后后端会重连数据库并重启数据引擎。
 
@@ -299,6 +320,16 @@ npm run build
 node --check backend/server.js
 node --check backend/services/plcReader.js
 ```
+
+PLC 与断电恢复集成测试：
+
+```bash
+cd backend
+npm run test:plc
+npm run test:recovery
+```
+
+PLC 测试默认从相邻的 `排产/PLC仿真调试器` 启动 Snap7 服务，所有数据库与日志均写入项目的 `output/` 隔离目录。
 
 Windows 客户安装包：
 

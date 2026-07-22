@@ -1140,6 +1140,18 @@ const databaseConfig = reactive({
 })
 const databaseTestStatus = ref('')
 const databaseSaving = ref(false)
+const databaseBackupBusy = ref(false)
+const databaseBackupMessage = ref('')
+const databaseBackupStatus = reactive({
+    supported: false,
+    automatic: false,
+    intervalMs: 0,
+    retention: 0,
+    directory: '',
+    lastBackup: null,
+    lastRecovery: null,
+    backups: []
+})
 const databaseDefaultPorts = {
     mysql: 3307,
     postgres: 5432,
@@ -1150,9 +1162,69 @@ async function loadDatabaseConfig() {
     try {
         const config = await adminApi.getDatabaseConfig()
         Object.assign(databaseConfig, config)
+        await loadDatabaseBackups()
     } catch (e) {
         databaseTestStatus.value = '数据库配置读取失败'
     }
+}
+
+async function loadDatabaseBackups() {
+    try {
+        const status = await adminApi.getDatabaseBackups()
+        Object.assign(databaseBackupStatus, status, { backups: status.backups || [] })
+    } catch (e) {
+        databaseBackupMessage.value = `备份状态读取失败：${e.message || e}`
+    }
+}
+
+async function createDatabaseBackup() {
+    databaseBackupBusy.value = true
+    databaseBackupMessage.value = '正在创建一致性备份...'
+    try {
+        const result = await adminApi.createDatabaseBackup()
+        Object.assign(databaseBackupStatus, result.status || {})
+        databaseBackupMessage.value = `备份完成：${result.backup?.filename || ''}`
+    } catch (e) {
+        databaseBackupMessage.value = `备份失败：${e.message || e}`
+    } finally {
+        databaseBackupBusy.value = false
+    }
+}
+
+async function restoreDatabaseBackup(backup) {
+    if (!(await confirm(`恢复备份 ${backup.filename}？当前数据库会先自动备份，然后数据引擎将重新启动。`))) return
+    databaseBackupBusy.value = true
+    databaseBackupMessage.value = '正在校验并恢复备份...'
+    try {
+        const result = await adminApi.restoreDatabaseBackup(backup.filename)
+        Object.assign(databaseBackupStatus, result.status || {})
+        databaseBackupMessage.value = `已恢复：${backup.filename}`
+        await Promise.all([loadSettings(), loadWorkshops(), loadLines(), loadDevices(), loadModels(), loadPlatform()])
+    } catch (e) {
+        databaseBackupMessage.value = `恢复失败：${e.message || e}`
+    } finally {
+        databaseBackupBusy.value = false
+    }
+}
+
+function downloadDatabaseBackup(backup) {
+    const link = document.createElement('a')
+    link.href = adminApi.databaseBackupDownloadUrl(backup.filename)
+    link.download = backup.filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+}
+
+function formatBackupSize(bytes) {
+    const value = Number(bytes || 0)
+    if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`
+    return `${(value / 1024 / 1024).toFixed(1)} MB`
+}
+
+function formatBackupInterval(milliseconds) {
+    const hours = Number(milliseconds || 0) / 3600000
+    return hours >= 1 ? `${Number(hours.toFixed(1))} 小时` : `${Math.round(milliseconds / 60000)} 分钟`
 }
 
 async function testDatabaseConnection() {
@@ -1177,6 +1249,7 @@ async function saveDatabaseConnection() {
         }
         Object.assign(databaseConfig, result.config || databaseConfig)
         databaseTestStatus.value = '保存成功，数据库已重新连接'
+        await loadDatabaseBackups()
         await Promise.all([loadSettings(), loadWorkshops(), loadLines(), loadDevices(), loadModels(), loadPlatform()])
     } catch (e) {
         databaseTestStatus.value = `保存失败：${e.message || e}`
@@ -6800,6 +6873,38 @@ const mainTabs = [
                                 <button @click="saveDatabaseConnection" class="btn btn-primary" :disabled="databaseSaving">保存数据库连接</button>
                                 <span style="font-size:13px; color:#515154">{{ databaseTestStatus }}</span>
                             </div>
+
+                            <div v-if="databaseConfig.type === 'sqlite' && databaseBackupStatus.supported" class="database-backup-panel">
+                                <div class="database-backup-header">
+                                    <div>
+                                        <strong>断电恢复与备份</strong>
+                                        <p>
+                                            WAL 全同步写入；每 {{ formatBackupInterval(databaseBackupStatus.intervalMs) }} 自动备份，
+                                            保留最近 {{ databaseBackupStatus.retention }} 份，退出时再备份一次。
+                                        </p>
+                                    </div>
+                                    <button @click="createDatabaseBackup" class="btn" :disabled="databaseBackupBusy">立即备份</button>
+                                </div>
+                                <p v-if="databaseBackupStatus.lastRecovery" class="database-recovery-notice">
+                                    最近恢复：{{ new Date(databaseBackupStatus.lastRecovery.recoveredAt).toLocaleString() }}，
+                                    来源 {{ databaseBackupStatus.lastRecovery.source }}
+                                </p>
+                                <p v-if="databaseBackupMessage" class="database-backup-message">{{ databaseBackupMessage }}</p>
+                                <div class="database-backup-list">
+                                    <div v-for="backup in databaseBackupStatus.backups" :key="backup.filename" class="database-backup-row">
+                                        <div>
+                                            <strong>{{ backup.filename }}</strong>
+                                            <span>{{ new Date(backup.createdAt).toLocaleString() }} · {{ formatBackupSize(backup.size) }}</span>
+                                        </div>
+                                        <span class="backup-validity" :class="backup.valid ? 'is-valid' : 'is-invalid'">
+                                            {{ backup.valid ? '校验通过' : '已损坏' }}
+                                        </span>
+                                        <button @click="downloadDatabaseBackup(backup)" class="btn btn-small" :disabled="!backup.valid">下载</button>
+                                        <button @click="restoreDatabaseBackup(backup)" class="btn btn-small" :disabled="databaseBackupBusy || !backup.valid">恢复</button>
+                                    </div>
+                                    <div v-if="databaseBackupStatus.backups.length === 0" class="empty-hint">暂无备份</div>
+                                </div>
+                            </div>
                         </div>
 
                         <!-- ===== 基础设置 ===== -->
@@ -9626,6 +9731,20 @@ const mainTabs = [
 .render-profile-hint p { margin: 4px 0; }
 .render-custom-grid { margin-top: 18px; padding-top: 18px; border-top: 1px solid #e5e5e7; }
 .checkbox-line { display: flex; align-items: center; gap: 8px; min-height: 38px; font-weight: 400; }
+.database-backup-panel { margin-top: 22px; padding-top: 20px; border-top: 1px solid #e5e5e7; }
+.database-backup-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.database-backup-header p { margin: 6px 0 0; color: #6e6e73; font-size: 13px; line-height: 1.6; }
+.database-recovery-notice { margin: 14px 0 0; padding: 10px 12px; background: #fff8e6; border-left: 3px solid #c68a00; color: #5c4300; font-size: 13px; }
+.database-backup-message { margin: 12px 0 0; color: #515154; font-size: 13px; }
+.database-backup-list { margin-top: 14px; border-top: 1px solid #e5e5e7; }
+.database-backup-row { display: grid; grid-template-columns: minmax(280px, 1fr) auto auto auto; align-items: center; gap: 10px; min-height: 58px; padding: 8px 0; border-bottom: 1px solid #ededee; }
+.database-backup-row > div { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.database-backup-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.database-backup-row span { color: #6e6e73; font-size: 12px; }
+.backup-validity { white-space: nowrap; }
+.backup-validity.is-valid { color: #16713a; }
+.backup-validity.is-invalid { color: #b42318; }
+.btn-small { min-height: 32px; padding: 5px 10px; font-size: 12px; }
 .mode-hint { margin-top: 16px; padding: 16px 20px; background: rgba(0, 102, 204, 0.03); border: 1px solid rgba(0, 102, 204, 0.1); border-radius: 8px; }
 .mode-hint p { margin: 6px 0; font-size: 13px; color: #434345; line-height: 1.6; }
 .mode-hint code { background: rgba(0, 0, 0, 0.04); padding: 2px 6px; border-radius: 4px; font-size: 12px; color: #1d1d1f; }
@@ -9663,6 +9782,13 @@ const mainTabs = [
     }
     .model-spec-form {
         grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .database-backup-row {
+        grid-template-columns: minmax(220px, 1fr) auto auto;
+    }
+    .backup-validity {
+        grid-column: 1 / -1;
+        grid-row: 2;
     }
 }
 </style>
