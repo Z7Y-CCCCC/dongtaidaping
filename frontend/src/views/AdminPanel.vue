@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, onActivated, onDeactivated, computed, watch, nextTick } from 'vue'
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
@@ -16,6 +16,8 @@ import {
     buildDiagnosticGroups,
     normalizeDeviceLabelConfig
 } from '../runtime/uiConfig.js'
+
+defineOptions({ name: 'AdminPanel' })
 
 const ADMIN_UI_STATE_KEY = 'digital_twin_admin_ui_state_v1'
 
@@ -4162,7 +4164,9 @@ watch([workshops, lines, devices, models], () => {
 watch(activeTab, async (tab) => {
     if (tab === 'composer') {
         ensureComposerSelection()
-        syncComposerDraftFromSelection()
+        if (!composerDraft.id || composerDraft.id !== selectedComposerDeviceId.value) {
+            syncComposerDraftFromSelection()
+        }
         await nextTick()
         scheduleComposerPreview()
     } else {
@@ -4242,6 +4246,22 @@ onMounted(async () => {
     syncComposerDraftFromSelection()
     await nextTick()
     scheduleComposerPreview()
+})
+
+onActivated(async () => {
+    await nextTick()
+    if (activeTab.value === 'composer') scheduleComposerPreview()
+    if (activeTab.value === 'models') await renderSelectedModelPreview()
+    if (activeTab.value === 'point-monitor') startPointMonitor()
+})
+
+onDeactivated(() => {
+    finishLinePreviewDrag()
+    cancelLineDeviceDrag()
+    cancelLineDevicePoolMove()
+    stopPointMonitor()
+    disposeComposerPreview()
+    disposeModelPreview()
 })
 
 onUnmounted(() => {
@@ -5255,7 +5275,7 @@ const mainTabs = [
                 </span>
                 <h1>数字孪生后台配置管理</h1>
             </div>
-            <a href="/" class="back-link">← 返回大屏</a>
+            <RouterLink to="/" class="back-link">← 返回大屏</RouterLink>
         </header>
 
         <div class="admin-body">
@@ -5291,26 +5311,28 @@ const mainTabs = [
                             </svg>
                         </span>
                         <span class="nav-label">工厂建模</span>
-                        <span class="nav-chevron">{{ isFactoryMenuOpen ? '⌃' : '⌄' }}</span>
+                        <span class="nav-chevron">⌄</span>
                     </button>
-                    <div v-show="isFactoryMenuOpen || isAdminNavCollapsed" class="nav-submenu">
-                        <button
-                            v-for="tab in factoryTabs"
-                            :key="tab.key"
-                            type="button"
-                            class="nav-item nav-subitem"
-                            :class="{ active: activeTab === tab.key }"
-                            :title="tab.label"
-                            @click="selectAdminTab(tab.key)"
-                        >
-                            <span class="nav-icon" aria-hidden="true">
-                                <svg viewBox="0 0 24 24">
-                                    <path v-for="(path, index) in navIconPaths[tab.icon]" :key="index" :d="path" />
-                                </svg>
-                            </span>
-                            <span class="nav-label">{{ tab.label }}</span>
-                        </button>
-                    </div>
+                    <Transition name="nav-submenu">
+                        <div v-if="isFactoryMenuOpen || isAdminNavCollapsed" class="nav-submenu">
+                            <button
+                                v-for="tab in factoryTabs"
+                                :key="tab.key"
+                                type="button"
+                                class="nav-item nav-subitem"
+                                :class="{ active: activeTab === tab.key }"
+                                :title="tab.label"
+                                @click="selectAdminTab(tab.key)"
+                            >
+                                <span class="nav-icon" aria-hidden="true">
+                                    <svg viewBox="0 0 24 24">
+                                        <path v-for="(path, index) in navIconPaths[tab.icon]" :key="index" :d="path" />
+                                    </svg>
+                                </span>
+                                <span class="nav-label">{{ tab.label }}</span>
+                            </button>
+                        </div>
+                    </Transition>
                 </div>
                 <div class="nav-group" :class="{ active: dataTabKeys.includes(activeTab), open: isDataMenuOpen }">
                     <button
@@ -5326,26 +5348,28 @@ const mainTabs = [
                             </svg>
                         </span>
                         <span class="nav-label">数据采集</span>
-                        <span class="nav-chevron">{{ isDataMenuOpen ? '⌃' : '⌄' }}</span>
+                        <span class="nav-chevron">⌄</span>
                     </button>
-                    <div v-show="isDataMenuOpen || isAdminNavCollapsed" class="nav-submenu">
-                        <button
-                            v-for="tab in dataTabs"
-                            :key="tab.key"
-                            type="button"
-                            class="nav-item nav-subitem"
-                            :class="{ active: activeTab === tab.key }"
-                            :title="tab.label"
-                            @click="selectAdminTab(tab.key)"
-                        >
-                            <span class="nav-icon" aria-hidden="true">
-                                <svg viewBox="0 0 24 24">
-                                    <path v-for="(path, index) in navIconPaths[tab.icon]" :key="index" :d="path" />
-                                </svg>
-                            </span>
-                            <span class="nav-label">{{ tab.label }}</span>
-                        </button>
-                    </div>
+                    <Transition name="nav-submenu">
+                        <div v-if="isDataMenuOpen || isAdminNavCollapsed" class="nav-submenu">
+                            <button
+                                v-for="tab in dataTabs"
+                                :key="tab.key"
+                                type="button"
+                                class="nav-item nav-subitem"
+                                :class="{ active: activeTab === tab.key }"
+                                :title="tab.label"
+                                @click="selectAdminTab(tab.key)"
+                            >
+                                <span class="nav-icon" aria-hidden="true">
+                                    <svg viewBox="0 0 24 24">
+                                        <path v-for="(path, index) in navIconPaths[tab.icon]" :key="index" :d="path" />
+                                    </svg>
+                                </span>
+                                <span class="nav-label">{{ tab.label }}</span>
+                            </button>
+                        </div>
+                    </Transition>
                 </div>
                 <button
                     v-for="tab in mainTabs.slice(1)"
@@ -5376,6 +5400,8 @@ const mainTabs = [
 
             <!-- 右侧内容区 -->
             <main class="admin-content">
+                <Transition name="tab-switch" mode="out-in">
+                    <div :key="activeTab" class="tab-transition-host">
 
                 <!-- ======== 现场编排器 ======== -->
                 <div v-if="activeTab === 'composer'" class="tab-content composer-tab" :class="{ 'preview-wide': isComposerPreviewWide }">
@@ -5916,8 +5942,9 @@ const mainTabs = [
                     <button @click="openCreateDevice" class="btn btn-primary" style="margin-bottom:20px">+ 添加设备</button>
 
                     <!-- 设备表单弹窗 -->
-                    <div v-if="showDeviceForm" class="modal-overlay" @click.self="showDeviceForm = false">
-                        <div class="modal-box">
+                    <Transition name="modal-fade">
+                        <div v-if="showDeviceForm" class="modal-overlay" @click.self="showDeviceForm = false">
+                            <div class="modal-box">
                             <h3>{{ isEditMode ? '编辑设备' : '新增设备' }}</h3>
                             <div class="form-grid">
                                 <label>设备 ID<input v-model="editingDevice.id" :disabled="isEditMode" class="input" placeholder="如 Furnace_21" /></label>
@@ -5994,8 +6021,9 @@ const mainTabs = [
                                 <button @click="saveDevice" class="btn btn-primary">保存</button>
                                 <button @click="showDeviceForm = false" class="btn">取消</button>
                             </div>
+                            </div>
                         </div>
-                    </div>
+                    </Transition>
 
                     <!-- 设备列表 -->
                     <div v-for="line in lines" :key="line.id" class="device-group">
@@ -7027,26 +7055,31 @@ const mainTabs = [
                     </div>
                 </div>
 
+                    </div>
+                </Transition>
+
             </main>
         </div>
 
-        <div v-if="appDialog.visible" class="app-dialog-overlay" @click.self="appDialog.showCancel ? closeAppDialog(false) : null">
-            <section class="app-dialog" :class="'dialog-' + appDialog.type" role="dialog" aria-modal="true">
-                <div class="app-dialog-mark"></div>
-                <div class="app-dialog-body">
-                    <h3>{{ appDialog.title }}</h3>
-                    <p>{{ appDialog.message }}</p>
-                </div>
-                <div class="app-dialog-actions">
-                    <button v-if="appDialog.showCancel" type="button" class="btn" @click="closeAppDialog(false)">
-                        {{ appDialog.cancelText }}
-                    </button>
-                    <button type="button" class="btn btn-primary" @click="closeAppDialog(true)">
-                        {{ appDialog.confirmText }}
-                    </button>
-                </div>
-            </section>
-        </div>
+        <Transition name="dialog-fade">
+            <div v-if="appDialog.visible" class="app-dialog-overlay" @click.self="appDialog.showCancel ? closeAppDialog(false) : null">
+                <section class="app-dialog" :class="'dialog-' + appDialog.type" role="dialog" aria-modal="true">
+                    <div class="app-dialog-mark"></div>
+                    <div class="app-dialog-body">
+                        <h3>{{ appDialog.title }}</h3>
+                        <p>{{ appDialog.message }}</p>
+                    </div>
+                    <div class="app-dialog-actions">
+                        <button v-if="appDialog.showCancel" type="button" class="btn" @click="closeAppDialog(false)">
+                            {{ appDialog.cancelText }}
+                        </button>
+                        <button type="button" class="btn btn-primary" @click="closeAppDialog(true)">
+                            {{ appDialog.confirmText }}
+                        </button>
+                    </div>
+                </section>
+            </div>
+        </Transition>
     </div>
 </template>
 
@@ -7157,12 +7190,32 @@ const mainTabs = [
     margin-left: auto;
     color: #86868b;
     font-size: 13px;
+    transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.nav-group.open .nav-chevron {
+    transform: rotate(180deg);
 }
 .nav-submenu {
     display: flex;
     flex-direction: column;
     gap: 4px;
     padding-left: 16px;
+    max-height: 180px;
+    transform-origin: top;
+}
+.nav-submenu-enter-active,
+.nav-submenu-leave-active {
+    overflow: hidden;
+    transition:
+        max-height 240ms cubic-bezier(0.22, 1, 0.36, 1),
+        opacity 160ms ease,
+        transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.nav-submenu-enter-from,
+.nav-submenu-leave-to {
+    max-height: 0;
+    opacity: 0;
+    transform: translateY(-6px);
 }
 .nav-subitem {
     min-height: 38px;
@@ -7241,6 +7294,23 @@ const mainTabs = [
 .admin-container.line-planner-active .admin-content {
     padding: 10px 12px 12px;
     overflow: visible;
+}
+
+.tab-transition-host {
+    position: relative;
+    min-height: 100%;
+}
+.tab-switch-enter-active,
+.tab-switch-leave-active {
+    transition: opacity 150ms ease, transform 210ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.tab-switch-enter-from {
+    opacity: 0;
+    transform: translateY(8px);
+}
+.tab-switch-leave-to {
+    opacity: 0;
+    transform: translateY(-4px);
 }
 
 .tab-content {
@@ -8437,15 +8507,20 @@ const mainTabs = [
 .btn {
     padding: 8px 16px; border: none; border-radius: 8px;
     background: #e8e8ed; color: #0066cc; cursor: pointer; font-size: 14px;
-    font-weight: 500; transition: all 0.2s ease;
+    font-weight: 500; transition: color 160ms ease, background-color 160ms ease, box-shadow 180ms ease, transform 140ms ease;
 }
-.btn:hover { background: #d8d8dd; color: #0055b3; }
+.btn:not(:disabled):hover { background: #d8d8dd; color: #0055b3; transform: translateY(-1px); }
+.btn:not(:disabled):active { transform: translateY(0) scale(0.98); }
 .btn:disabled { background: #f5f5f7; color: #a1a1a6; cursor: not-allowed; }
 .btn-primary { background: #0071e3; color: #ffffff; }
-.btn-primary:hover { background: #0077ed; color: #ffffff; }
+.btn-primary:not(:disabled):hover { background: #0077ed; color: #ffffff; }
 .btn-danger { background: rgba(255, 59, 48, 0.1); color: #ff3b30; }
-.btn-danger:hover { background: rgba(255, 59, 48, 0.2); color: #ff3b30; }
+.btn-danger:not(:disabled):hover { background: rgba(255, 59, 48, 0.2); color: #ff3b30; }
 .btn-sm { padding: 5px 12px; font-size: 12px; border-radius: 6px; }
+
+button:enabled:active {
+    filter: brightness(0.96);
+}
 
 /* 表格 */
 .data-table { width: 100%; border-collapse: collapse; margin-bottom: 28px; font-size: 14px; }
@@ -9138,11 +9213,24 @@ const mainTabs = [
     border-radius: 20px; box-shadow: 0 30px 70px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.04);
     padding: 32px; width: min(760px, calc(100vw - 48px)); max-height: 85vh; overflow-y: auto;
     border: 1px solid rgba(255, 255, 255, 0.4);
-    animation: sheetIn 0.35s cubic-bezier(0.25, 1, 0.5, 1);
 }
-@keyframes sheetIn {
-    from { transform: scale(0.92) translateY(20px); opacity: 0; }
-    to { transform: scale(1) translateY(0); opacity: 1; }
+.modal-fade-enter-active,
+.modal-fade-leave-active {
+    transition: opacity 180ms ease, backdrop-filter 180ms ease;
+}
+.modal-fade-enter-active .modal-box,
+.modal-fade-leave-active .modal-box {
+    transition: opacity 180ms ease, transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.modal-fade-enter-from,
+.modal-fade-leave-to {
+    opacity: 0;
+    backdrop-filter: blur(0);
+}
+.modal-fade-enter-from .modal-box,
+.modal-fade-leave-to .modal-box {
+    opacity: 0;
+    transform: translateY(18px) scale(0.96);
 }
 .modal-box h3 { color: #1d1d1f; margin: 0 0 24px 0; font-size: 20px; font-weight: 600; }
 .modal-actions { display: flex; gap: 12px; justify-content: flex-end; margin-top: 32px; border-top: 1px solid rgba(0, 0, 0, 0.08); padding-top: 20px; }
@@ -9169,7 +9257,24 @@ const mainTabs = [
     border: 1px solid rgba(0, 0, 0, 0.08);
     border-radius: 14px;
     box-shadow: 0 24px 70px rgba(17, 24, 39, 0.22), 0 2px 6px rgba(17, 24, 39, 0.08);
-    animation: sheetIn 0.22s cubic-bezier(0.25, 1, 0.5, 1);
+}
+.dialog-fade-enter-active,
+.dialog-fade-leave-active {
+    transition: opacity 160ms ease, backdrop-filter 180ms ease;
+}
+.dialog-fade-enter-active .app-dialog,
+.dialog-fade-leave-active .app-dialog {
+    transition: opacity 160ms ease, transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.dialog-fade-enter-from,
+.dialog-fade-leave-to {
+    opacity: 0;
+    backdrop-filter: blur(0);
+}
+.dialog-fade-enter-from .app-dialog,
+.dialog-fade-leave-to .app-dialog {
+    opacity: 0;
+    transform: translateY(12px) scale(0.97);
 }
 .app-dialog-mark {
     grid-row: 1 / span 2;
@@ -9789,6 +9894,38 @@ const mainTabs = [
     .backup-validity {
         grid-column: 1 / -1;
         grid-row: 2;
+    }
+    .device-group {
+        overflow-x: auto;
+    }
+    .device-group .data-table {
+        min-width: 840px;
+    }
+    .device-group .data-table td:last-child {
+        white-space: nowrap;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .nav-item,
+    .nav-collapse-btn,
+    .nav-chevron,
+    .nav-submenu-enter-active,
+    .nav-submenu-leave-active,
+    .tab-switch-enter-active,
+    .tab-switch-leave-active,
+    .modal-fade-enter-active,
+    .modal-fade-leave-active,
+    .modal-fade-enter-active .modal-box,
+    .modal-fade-leave-active .modal-box,
+    .dialog-fade-enter-active,
+    .dialog-fade-leave-active,
+    .dialog-fade-enter-active .app-dialog,
+    .dialog-fade-leave-active .app-dialog,
+    .btn,
+    .input {
+        transition-duration: 1ms !important;
+        animation-duration: 1ms !important;
     }
 }
 </style>

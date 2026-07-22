@@ -1,13 +1,7 @@
-import { createApp, h, defineComponent } from 'vue'
+import { createApp } from 'vue'
 import './style.css'
 import router from './router/index.js'
-import { RouterView } from 'vue-router'
-
-const RootApp = defineComponent({
-    render() {
-        return h(RouterView)
-    }
-})
+import RootApp from './RootApp.vue'
 
 const app = createApp(RootApp)
 app.use(router)
