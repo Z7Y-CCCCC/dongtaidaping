@@ -17,6 +17,16 @@ const DEFAULT_MODEL_ASSET_SPEC = {
     notes: ''
 };
 
+const DEFAULT_MODEL_OPTIMIZATION = {
+    mode: 'auto',
+    mergeStatic: true,
+    instanceRepeated: true,
+    preserveAnimated: true,
+    materialEnhancement: 'auto',
+    contactShadow: true,
+    environmentIntensity: 0.85
+};
+
 function parseMetadata(input) {
     if (!input) return {};
     if (typeof input === 'object') return { ...input };
@@ -93,6 +103,31 @@ function normalizeRelease(release = {}, assetSpec, acceptanceStatus) {
     };
 }
 
+function booleanOr(value, fallback) {
+    if (value === undefined || value === null || value === '') return fallback;
+    if (typeof value === 'boolean') return value;
+    return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+}
+
+function normalizeOptimization(optimization = {}) {
+    const mode = ['auto', 'off'].includes(optimization.mode) ? optimization.mode : DEFAULT_MODEL_OPTIMIZATION.mode;
+    const materialEnhancement = ['auto', 'original'].includes(optimization.materialEnhancement || optimization.material_enhancement)
+        ? (optimization.materialEnhancement || optimization.material_enhancement)
+        : DEFAULT_MODEL_OPTIMIZATION.materialEnhancement;
+    return {
+        mode,
+        mergeStatic: booleanOr(optimization.mergeStatic ?? optimization.merge_static, DEFAULT_MODEL_OPTIMIZATION.mergeStatic),
+        instanceRepeated: booleanOr(optimization.instanceRepeated ?? optimization.instance_repeated, DEFAULT_MODEL_OPTIMIZATION.instanceRepeated),
+        preserveAnimated: true,
+        materialEnhancement,
+        contactShadow: booleanOr(optimization.contactShadow ?? optimization.contact_shadow, DEFAULT_MODEL_OPTIMIZATION.contactShadow),
+        environmentIntensity: Math.max(0, Math.min(2, numberOr(
+            optimization.environmentIntensity ?? optimization.environment_intensity,
+            DEFAULT_MODEL_OPTIMIZATION.environmentIntensity
+        )))
+    };
+}
+
 function normalizeModelMetadata(input, options = {}) {
     const raw = parseMetadata(input);
     const assetSpec = normalizeAssetSpec(raw.assetSpec || raw.asset_spec || {}, options.name);
@@ -101,11 +136,15 @@ function normalizeModelMetadata(input, options = {}) {
         : [];
     const acceptance = normalizeAcceptance(raw.acceptance || {}, assetSpec.delivery_status);
     const release = normalizeRelease(raw.release || {}, assetSpec, acceptance.status);
+    const optimization = normalizeOptimization(
+        raw.optimization || (raw.batchable === false ? { mode: 'off' } : {})
+    );
 
     return {
         ...raw,
         schema_version: 1,
         batchable: raw.batchable ?? true,
+        optimization,
         assetSpec,
         partBindings,
         acceptance,
@@ -123,6 +162,7 @@ function stringifyModelMetadata(input, options = {}) {
 
 module.exports = {
     DEFAULT_MODEL_ASSET_SPEC,
+    DEFAULT_MODEL_OPTIMIZATION,
     normalizeModelMetadata,
     stringifyModelMetadata
 };

@@ -1,7 +1,9 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { CSS2DObject, CSS2DRenderer } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
+import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 import gsap from 'gsap';
+import { getBackendOrigin } from '../runtime/backendEndpoint.js';
 
 function createConcreteTexture() {
     const size = 512;
@@ -200,6 +202,7 @@ export class SceneManager {
         this.initCSS2DRenderer();
         this.initControls();
         this.initLights();
+        this.initEnvironment();
         this.initRaycaster();
 
         this.updatables = [];
@@ -318,6 +321,28 @@ export class SceneManager {
         fillLight.position.set(-34, 28, -22);
         fillLight.castShadow = false;
         this.scene.add(fillLight);
+    }
+
+    initEnvironment() {
+        const generator = new THREE.PMREMGenerator(this.renderer);
+        generator.compileEquirectangularShader();
+        const url = `${getBackendOrigin()}/assets/textures/industrial/blocky_photo_studio_1k.hdr`;
+        new RGBELoader().load(url, (texture) => {
+            const renderTarget = generator.fromEquirectangular(texture);
+            texture.dispose();
+            generator.dispose();
+            if (this.disposed) {
+                renderTarget.dispose();
+                return;
+            }
+            this.environmentRenderTarget?.dispose?.();
+            this.environmentRenderTarget = renderTarget;
+            this.scene.environment = renderTarget.texture;
+            if ('environmentIntensity' in this.scene) this.scene.environmentIntensity = 0.82;
+        }, undefined, (error) => {
+            generator.dispose();
+            console.warn('[SceneManager] HDR 环境光加载失败，继续使用基础灯光:', error);
+        });
     }
 
     initRaycaster() {
@@ -1150,7 +1175,9 @@ export class SceneManager {
                 targetFps: this.targetFps,
                 renderProfile: this.renderOptions.profile || 'balanced',
                 antialias: this.antialiasEnabled,
-                labelTargetFps: this.labelTargetFps
+                labelTargetFps: this.labelTargetFps,
+                environmentReady: !!this.scene.environment,
+                optimizedModels: this.batchRenderers.map(renderer => renderer.userData.optimization).filter(Boolean)
             };
             this.lastStatsTime = now;
             this.lastStatsFrame = this.frameCount;
@@ -1215,6 +1242,9 @@ export class SceneManager {
             if (batchRenderer.dispose) batchRenderer.dispose();
         });
         this.clearFactoryGuides();
+        this.scene.environment = null;
+        this.environmentRenderTarget?.dispose?.();
+        this.environmentRenderTarget = null;
 
         // 销毁渲染器
         if (this.renderer) {

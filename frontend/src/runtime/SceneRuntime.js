@@ -1,6 +1,7 @@
 import { SceneManager } from '../three/SceneManager.js';
 import { applyRealtimeToDeviceModel, createConfiguredDeviceModel } from './DeviceRenderer.js';
 import { createBatchedDeviceRenderer, getBatchableModelInfo } from './BatchDeviceRenderer.js';
+import { shouldOptimizeModelGroup } from './modelOptimization.js';
 
 function parseInstanceConfig(raw) {
     if (!raw) return {};
@@ -252,20 +253,24 @@ export class SceneRuntime {
 
         const batchedIndexes = new Set();
         for (const group of batchGroups.values()) {
-            if (group.items.length < 2) continue;
-            const batch = await createBatchedDeviceRenderer(
-                group.modelInfo,
-                group.items.map(item => item.definition),
-                { labelConfig: this.options.deviceLabelConfig || {} }
-            );
-            this.sceneManager.addBatchRenderer(batch.batchRenderer);
-            group.items.forEach((item, localIndex) => {
-                results[item.index] = {
-                    ...item.definition,
-                    deviceModel: batch.deviceModels[localIndex]
-                };
-                batchedIndexes.add(item.index);
-            });
+            if (!shouldOptimizeModelGroup(group.modelInfo, group.items.length)) continue;
+            try {
+                const batch = await createBatchedDeviceRenderer(
+                    group.modelInfo,
+                    group.items.map(item => item.definition),
+                    { labelConfig: this.options.deviceLabelConfig || {} }
+                );
+                this.sceneManager.addBatchRenderer(batch.batchRenderer);
+                group.items.forEach((item, localIndex) => {
+                    results[item.index] = {
+                        ...item.definition,
+                        deviceModel: batch.deviceModels[localIndex]
+                    };
+                    batchedIndexes.add(item.index);
+                });
+            } catch (error) {
+                console.warn(`[SceneRuntime] 模型 ${group.modelInfo.id} 自动优化失败，使用原始渲染:`, error);
+            }
         }
 
         await Promise.all(definitions.map(async (definition, index) => {

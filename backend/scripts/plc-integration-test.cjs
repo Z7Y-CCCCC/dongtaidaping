@@ -20,9 +20,15 @@ const {
 } = require('./integration-test-utils.cjs');
 
 const SOURCE_DB = path.resolve(process.env.PLC_TEST_SOURCE_DB || path.join(BACKEND_DIR, 'data', 'factory.db'));
-const SIMULATOR_DIR = path.resolve(
-    process.env.PLC_SIMULATOR_DIR || path.join(REPO_DIR, '..', '排产', 'PLC仿真调试器')
-);
+const SIMULATOR_CANDIDATES = [
+    process.env.PLC_SIMULATOR_DIR,
+    path.join(REPO_DIR, '..', '排产', 'PLC仿真调试器'),
+    path.join(REPO_DIR, '..', 'PLC仿真调试器')
+].filter(Boolean).map(candidate => path.resolve(candidate));
+const SIMULATOR_DIR = SIMULATOR_CANDIDATES.find(candidate =>
+    fs.existsSync(path.join(candidate, 'snap7_engine.py'))
+    && fs.existsSync(path.join(candidate, 'runtime', 'snap7.dll'))
+) || SIMULATOR_CANDIDATES[0];
 const PYTHON = process.env.PYTHON || 'python';
 const STABILITY_MS = Math.max(10000, Number(process.env.PLC_STABILITY_MS || 45000));
 const LATENCY_SAMPLES = Math.max(5, Number(process.env.PLC_LATENCY_SAMPLES || 24));

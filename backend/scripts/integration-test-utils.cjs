@@ -33,15 +33,24 @@ async function copySqliteDatabase(source, destination) {
 }
 
 function findFreePort(preferred) {
-    return new Promise((resolve, reject) => {
+    const firstPort = Number(preferred) || 0;
+    const tryPort = port => new Promise((resolve, reject) => {
         const server = net.createServer();
         server.unref();
-        server.once('error', reject);
-        server.listen(preferred, '127.0.0.1', () => {
-            const port = server.address().port;
-            server.close(() => resolve(port));
+        server.once('error', error => {
+            if (error.code === 'EADDRINUSE' && port > 0 && port < firstPort + 100) {
+                resolve(tryPort(port + 1));
+                return;
+            }
+            reject(error);
+        });
+        // Production listeners bind all interfaces, so tests must validate the same address scope.
+        server.listen(port, '0.0.0.0', () => {
+            const selected = server.address().port;
+            server.close(() => resolve(selected));
         });
     });
+    return tryPort(firstPort);
 }
 
 function startLoggedProcess(command, args, options) {

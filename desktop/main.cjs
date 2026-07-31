@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, shell } = require('electron');
+const { app, BrowserWindow, dialog, Menu, shell, Tray } = require('electron');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -17,13 +17,19 @@ if (process.env.APP_USER_DATA_DIR) {
     app.setPath('userData', path.resolve(process.env.APP_USER_DATA_DIR));
 }
 let mainWindow = null;
+let tray = null;
 let backendProcess = null;
+let nativeProcess = null;
 let backendLogStream = null;
 let backendErrorLogStream = null;
+let nativeLogStream = null;
+let nativeErrorLogStream = null;
 let desktopErrorLogStream = null;
 let logCleanupTimer = null;
 let backendPort = null;
 let backendShutdownToken = null;
+let applicationOrigin = null;
+let writablePaths = null;
 let desktopSettingsTimer = null;
 let appliedAutoStartSetting = null;
 let isQuitting = false;
@@ -209,6 +215,125 @@ function guardLogStream(stream, label) {
     return stream;
 }
 
+function nativeClientDirectory() {
+    return app.isPackaged
+        ? path.join(process.resourcesPath, 'native-client')
+        : path.resolve(__dirname, '..', 'unity-client', 'Builds', 'Windows');
+}
+
+function closeNativeLogStreams() {
+    nativeLogStream?.end();
+    nativeErrorLogStream?.end();
+    nativeLogStream = null;
+    nativeErrorLogStream = null;
+}
+
+async function startNativeClient(origin, writable) {
+    if (nativeProcess) return;
+    const clientDir = nativeClientDirectory();
+    const executable = path.join(clientDir, 'HeatTreatmentDigitalTwin.exe');
+    if (!fs.existsSync(executable)) {
+        throw new Error(`原生大屏程序不存在：${executable}`);
+    }
+
+    const logStreams = await Promise.all([
+        createRotatingLogWriter(writable.logsDir, 'native-client.log'),
+        createRotatingLogWriter(writable.logsDir, 'native-client-error.log')
+    ]);
+    nativeLogStream = guardLogStream(logStreams[0], '原生客户端日志');
+    nativeErrorLogStream = guardLogStream(logStreams[1], '原生客户端错误日志');
+
+    const webSocketOrigin = origin.replace(/^http/i, 'ws');
+    const noProxy = [process.env.NO_PROXY, 'localhost', '127.0.0.1']
+        .filter(Boolean)
+        .join(',');
+    const nativeArgs = process.env.NATIVE_CLIENT_SMOKE_MODE === 'true'
+        ? [
+            '-batchmode',
+            '-force-d3d11',
+            '-screen-fullscreen', '0',
+            '-screen-width', '960',
+            '-screen-height', '540',
+            '-logFile', '-'
+        ]
+        : ['-screen-fullscreen', '1', '-logFile', '-'];
+    const child = spawn(executable, nativeArgs, {
+        cwd: clientDir,
+        windowsHide: false,
+        env: {
+            ...process.env,
+            NO_PROXY: noProxy,
+            DIGITAL_TWIN_BACKEND_HTTP_URL: origin,
+            DIGITAL_TWIN_BACKEND_WEBSOCKET_URL: `${webSocketOrigin}/ws`
+        },
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
+    nativeProcess = child;
+    child.stdout?.pipe(nativeLogStream, { end: false });
+    child.stderr?.pipe(nativeErrorLogStream, { end: false });
+    child.once('exit', code => {
+        const wasCurrent = nativeProcess === child;
+        if (wasCurrent) nativeProcess = null;
+        closeNativeLogStreams();
+        updateTrayMenu();
+        if (!isQuitting && wasCurrent) {
+            if (code !== 0) {
+                const error = new Error(`Unity 原生大屏异常退出（代码 ${code}）`);
+                logDesktopError('native-client-exit', error);
+                dialog.showErrorBox(
+                    APP_NAME,
+                    `${error.message}。\n错误日志：${path.join(writable.logsDir, 'native-client-error.log')}`
+                );
+            }
+            showAdminWindow();
+        }
+    });
+    await new Promise((resolve, reject) => {
+        child.once('spawn', resolve);
+        child.once('error', reject);
+    });
+    updateTrayMenu();
+}
+
+function stopNativeClient() {
+    const processToStop = nativeProcess;
+    nativeProcess = null;
+    updateTrayMenu();
+    if (!processToStop || processToStop.killed) {
+        closeNativeLogStreams();
+        return Promise.resolve();
+    }
+
+    return new Promise(resolve => {
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(forceTimer);
+            closeNativeLogStreams();
+            resolve();
+        };
+        const forceTimer = setTimeout(() => {
+            try { processToStop.kill(); } catch (error) { /* ignore */ }
+            finish();
+        }, 5000);
+        processToStop.once('exit', finish);
+        try { processToStop.kill(); } catch (error) { finish(); }
+    });
+}
+
+async function restartNativeClient() {
+    if (!applicationOrigin || !writablePaths) return;
+    try {
+        await stopNativeClient();
+        await startNativeClient(applicationOrigin, writablePaths);
+    } catch (error) {
+        logDesktopError('native-client-restart', error);
+        dialog.showErrorBox(APP_NAME, `原生大屏启动失败：${error.message}`);
+        showAdminWindow();
+    }
+}
+
 async function startBackend(port, writable) {
     const backendDir = path.join(process.resourcesPath, 'backend');
     const nodeBinary = path.join(process.resourcesPath, 'runtime', 'node.exe');
@@ -318,7 +443,60 @@ function stopBackend() {
     });
 }
 
-function createMainWindow(url) {
+function showAdminWindow() {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+        if (applicationOrigin) createMainWindow(applicationOrigin, true);
+        return;
+    }
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.maximize();
+    mainWindow.show();
+    mainWindow.focus();
+}
+
+function updateTrayMenu() {
+    if (!tray) return;
+    tray.setContextMenu(Menu.buildFromTemplate([
+        {
+            label: '打开后台管理',
+            click: showAdminWindow
+        },
+        {
+            label: nativeProcess ? '重启 Unity 原生大屏' : '启动 Unity 原生大屏',
+            click: restartNativeClient
+        },
+        {
+            label: '用默认浏览器打开后台',
+            click: () => {
+                if (applicationOrigin) shell.openExternal(`${applicationOrigin}/admin`);
+            }
+        },
+        {
+            label: '打开现场数据目录',
+            click: () => shell.openPath(app.getPath('userData'))
+        },
+        { type: 'separator' },
+        {
+            label: '退出整套软件',
+            click: () => app.quit()
+        }
+    ]));
+}
+
+function createTray() {
+    if (tray) return;
+    tray = new Tray(path.join(__dirname, 'assets', 'icon.ico'));
+    tray.setToolTip(APP_NAME);
+    tray.on('double-click', showAdminWindow);
+    updateTrayMenu();
+}
+
+function createMainWindow(origin, showInitially = false) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        if (showInitially) showAdminWindow();
+        return;
+    }
+    const adminUrl = `${origin}/admin`;
     mainWindow = new BrowserWindow({
         width: 1600,
         height: 960,
@@ -340,7 +518,7 @@ function createMainWindow(url) {
         return { action: 'deny' };
     });
     mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
-        if (!targetUrl.startsWith(url)) event.preventDefault();
+        if (!targetUrl.startsWith(origin)) event.preventDefault();
     });
     mainWindow.webContents.session.on('will-download', async (event, item, webContents) => {
         if (webContents !== mainWindow?.webContents) return;
@@ -366,15 +544,20 @@ function createMainWindow(url) {
         }
     });
     mainWindow.once('ready-to-show', () => {
-        mainWindow.maximize();
-        mainWindow.show();
+        if (showInitially) showAdminWindow();
+    });
+    mainWindow.on('close', event => {
+        if (isQuitting) return;
+        event.preventDefault();
+        mainWindow.hide();
     });
     mainWindow.on('closed', () => { mainWindow = null; });
-    mainWindow.loadURL(url);
+    mainWindow.loadURL(adminUrl);
 }
 
 async function launchApplication() {
     const writable = initializeWritableData();
+    writablePaths = writable;
     desktopErrorLogStream = guardLogStream(
         await createRotatingLogWriter(writable.logsDir, 'desktop-error.log'),
         '桌面错误日志'
@@ -382,20 +565,30 @@ async function launchApplication() {
     startLogMaintenance(writable.logsDir);
     const port = await findAvailablePort();
     const origin = `http://127.0.0.1:${port}`;
+    applicationOrigin = origin;
     await startBackend(port, writable);
     await waitForHealth(`${origin}/api/health`);
     startDesktopSettingsSync();
-    createMainWindow(origin);
+    createMainWindow(origin, process.argv.includes('--admin'));
+    createTray();
+    try {
+        await startNativeClient(origin, writable);
+    } catch (error) {
+        logDesktopError('native-client-start', error);
+        dialog.showErrorBox(APP_NAME, `原生大屏启动失败：${error.message}`);
+        showAdminWindow();
+    }
+    const smokeExitAfterMs = Number(process.env.DESKTOP_SMOKE_EXIT_AFTER_MS || 0);
+    if (Number.isFinite(smokeExitAfterMs) && smokeExitAfterMs > 0)
+    {
+        setTimeout(() => app.quit(), smokeExitAfterMs).unref?.();
+    }
 }
 
 if (!app.requestSingleInstanceLock()) {
     app.quit();
 } else {
-    app.on('second-instance', () => {
-        if (!mainWindow) return;
-        if (mainWindow.isMinimized()) mainWindow.restore();
-        mainWindow.focus();
-    });
+    app.on('second-instance', showAdminWindow);
 
     app.whenReady().then(() => {
         return launchApplication();
@@ -405,16 +598,19 @@ if (!app.requestSingleInstanceLock()) {
         app.quit();
     });
 
-    app.on('window-all-closed', () => app.quit());
+    // Windows 上关闭后台窗口只隐藏到托盘，Unity 大屏和后端继续运行。
+    app.on('window-all-closed', () => {});
     app.on('before-quit', (event) => {
         if (quitReady) return;
         event.preventDefault();
         isQuitting = true;
         if (desktopSettingsTimer) clearInterval(desktopSettingsTimer);
         desktopSettingsTimer = null;
-        stopBackend().finally(() => {
+        stopNativeClient().then(() => stopBackend()).finally(() => {
             if (logCleanupTimer) clearInterval(logCleanupTimer);
             logCleanupTimer = null;
+            tray?.destroy();
+            tray = null;
             desktopErrorLogStream?.end();
             desktopErrorLogStream = null;
             quitReady = true;

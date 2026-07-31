@@ -28,6 +28,7 @@ export function useSystemSettings({
         display_mode: 'industrial_twin',
         // 视角模式
         camera_mode: 'auto',
+        native_quality_profile: 'auto',
         render_profile: 'balanced',
         render_target_fps: 45,
         render_scale: 1,
@@ -512,6 +513,7 @@ export function useSystemSettings({
             realtime_stale_ms: settings.realtime_stale_ms,
             display_mode: settings.display_mode,
             camera_mode: settings.camera_mode,
+            native_quality_profile: settings.native_quality_profile,
             render_profile: settings.render_profile,
             render_target_fps: settings.render_target_fps,
             render_scale: settings.render_scale,
@@ -523,7 +525,7 @@ export function useSystemSettings({
         // 保存后自动重启数据引擎
         try {
             await fetch(`${API_BASE}/engine/restart`, { method: 'POST' })
-            alert('设置已保存。数据引擎正在重启；渲染性能设置将在大屏刷新后生效。', { title: '保存成功', type: 'success' })
+            alert('设置已保存。数据引擎正在重启；Unity 原生客户端按 F5 重载配置或重启后生效。', { title: '保存成功', type: 'success' })
         } catch (e) {
             alert('设置已保存，但数据引擎重启失败，请手动重启后端服务', { title: '保存成功', type: 'warning' })
         }

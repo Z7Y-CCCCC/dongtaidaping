@@ -1,3 +1,5 @@
+const multipurposeFurnaceV5Metadata = require('../assets/models/photo_multipurpose_furnace_v5_metadata.json');
+
 const BUILTIN_MODELS = [
     {
         id: 'builtin_furnace',
@@ -8,6 +10,17 @@ const BUILTIN_MODELS = [
         thumbnail: null,
         default_scale: 1.0,
         metadata: JSON.stringify({ source: 'procedural', batchable: false }),
+        is_builtin: true
+    },
+    {
+        id: 'photo_multipurpose_furnace_v5',
+        name: '箱式气氛多用炉 V5（PBR 原生端验证资产）',
+        file_path: '/assets/models/photo_multipurpose_furnace_v5.glb',
+        asset_type: 'model',
+        tags: JSON.stringify(['packaged', 'heat_treatment', 'pbr', 'unity']),
+        thumbnail: '/assets/models/photo_multipurpose_furnace_v5_preview.png',
+        default_scale: 1.0,
+        metadata: JSON.stringify(multipurposeFurnaceV5Metadata),
         is_builtin: true
     },
     {

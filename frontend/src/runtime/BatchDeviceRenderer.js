@@ -1,10 +1,15 @@
 import * as THREE from 'three';
 import { CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+import { clone as cloneObject3D } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { loadGltf, resolveBackendAssetUrl } from '../three/ModelFactory.js';
 import { resolveDeviceQuality } from './DeviceRenderer.js';
 import { ensureConnectionBadge3D, setConnectionBadge3D } from './ConnectionBadge3D.js';
 import { buildDeviceLabelMarkup, updateDeviceLabelElements, applyDeviceLabelStyle } from './uiConfig.js';
+import {
+    enhanceModelMaterial,
+    resolveModelOptimization
+} from './modelOptimization.js';
 
 const STATUS_COLORS = {
     bad: new THREE.Color(0xd96060),
@@ -62,18 +67,198 @@ function modelMetadata(modelInfo) {
     return parseJson(modelInfo?.metadata, {});
 }
 
-function createBatchMaterial(sourceMaterial) {
-    const material = new THREE.MeshLambertMaterial({
-        color: 0xffffff,
-        map: null,
-        vertexColors: true,
-        transparent: false,
-        opacity: 1,
-        depthWrite: true
+function objectPathSegment(object, index) {
+    const rawName = object.name || object.type || 'Object3D';
+    return `${String(rawName).replace(/\//g, '_')}#${index}`;
+}
+
+function buildObjectPathMap(root) {
+    const map = new Map();
+    const walk = (object, parentPath) => {
+        object.children.forEach((child, index) => {
+            const path = parentPath ? `${parentPath}/${objectPathSegment(child, index)}` : objectPathSegment(child, index);
+            map.set(path, child);
+            walk(child, path);
+        });
+    };
+    walk(root, '');
+    return map;
+}
+
+function bindingTarget(root, pathMap, binding) {
+    return pathMap.get(binding.node_path)
+        || root.getObjectByName(binding.node_name || binding.nodeName || '');
+}
+
+function collectBoundObjects(root, metadata) {
+    const pathMap = buildObjectPathMap(root);
+    const objects = new Set();
+    let resolvedCount = 0;
+    (Array.isArray(metadata.partBindings) ? metadata.partBindings : []).forEach((binding) => {
+        const target = bindingTarget(root, pathMap, binding);
+        if (!target) return;
+        resolvedCount += 1;
+        target.traverse(object => objects.add(object));
     });
+    return { objects, resolvedCount };
+}
+
+function readBindingValue(data, binding) {
+    const group = binding.source_group || binding.category;
+    const key = binding.source_key || binding.value_role || binding.key;
+    if (!key) return undefined;
+    if (group && data?.[group] && Object.prototype.hasOwnProperty.call(data[group], key)) {
+        return data[group][key];
+    }
+
+    const groups = ['analog', 'motors', 'doors', 'gas', 'mechanisms', 'status'];
+    for (const groupName of groups) {
+        if (Object.prototype.hasOwnProperty.call(data?.[groupName] || {}, key)) {
+            return data[groupName][key];
+        }
+    }
+    return undefined;
+}
+
+function toNumber(value, fallback = 0) {
+    if (typeof value === 'boolean') return value ? 1 : 0;
+    const next = Number(value);
+    return Number.isFinite(next) ? next : fallback;
+}
+
+function toBool(value) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value === 'string') {
+        return ['1', 'true', 'on', 'open', 'running', 'yes'].includes(value.toLowerCase());
+    }
+    return !!value;
+}
+
+function clamp01(value) {
+    return Math.max(0, Math.min(1, value));
+}
+
+function mapRange(value, inMin, inMax, outMin, outMax) {
+    const span = inMax - inMin;
+    const t = Math.abs(span) < 1e-6 ? 0 : clamp01((value - inMin) / span);
+    return outMin + (outMax - outMin) * t;
+}
+
+function normalizeAxis(axis) {
+    return ['x', 'y', 'z'].includes(axis) ? axis : 'y';
+}
+
+function applyColorToTarget(target, colorValue) {
+    const color = new THREE.Color(colorValue);
+    target.traverse((child) => {
+        if (!child.isMesh || !child.material) return;
+        const materials = Array.isArray(child.material) ? child.material : [child.material];
+        materials.forEach((material) => {
+            if (material.color) material.color.copy(color);
+            if (material.emissive) material.emissive.copy(color);
+            material.needsUpdate = true;
+        });
+    });
+}
+
+function createAnimatedRoot(sourceRoot, metadata, optimization, mirrorSafe = false) {
+    const root = cloneObject3D(sourceRoot);
+    const pathMap = buildObjectPathMap(root);
+    const keep = new Set([root]);
+    const bindings = Array.isArray(metadata.partBindings) ? metadata.partBindings : [];
+
+    bindings.forEach((binding) => {
+        const target = bindingTarget(root, pathMap, binding);
+        if (!target) return;
+        target.traverse(object => keep.add(object));
+        let parent = target.parent;
+        while (parent) {
+            keep.add(parent);
+            if (parent === root) break;
+            parent = parent.parent;
+        }
+    });
+
+    root.traverse((object) => {
+        [...object.children].forEach((child) => {
+            if (!keep.has(child)) object.remove(child);
+        });
+    });
+
+    const materials = new Set();
+    const materialClones = new Map();
+    root.traverse((child) => {
+        if (!child.isMesh || !child.material) return;
+        child.castShadow = false;
+        child.receiveShadow = false;
+        const cloneMaterial = (material) => {
+            if (!materialClones.has(material)) {
+                const cloned = material.clone();
+                if (mirrorSafe) cloned.side = THREE.DoubleSide;
+                enhanceModelMaterial(cloned, optimization);
+                materialClones.set(material, cloned);
+                materials.add(cloned);
+            }
+            return materialClones.get(material);
+        };
+        child.material = Array.isArray(child.material)
+            ? child.material.map(cloneMaterial)
+            : cloneMaterial(child.material);
+    });
+
+    return { root, pathMap, materials };
+}
+
+function createBatchMaterial(sourceMaterial, optimization) {
+    const material = sourceMaterial?.clone?.() || new THREE.MeshStandardMaterial({ color: 0xffffff });
     material.name = sourceMaterial?.name || sourceMaterial?.uuid || 'batch_material';
-    material.userData.baseColor = sourceMaterial?.color?.clone?.() || new THREE.Color(0xd8ddd8);
+    material.vertexColors = true;
+    material.userData = {
+        ...(material.userData || {}),
+        baseColor: sourceMaterial?.color?.clone?.() || new THREE.Color(0xd8ddd8)
+    };
+    if (material.color) material.color.set(0xffffff);
+    enhanceModelMaterial(material, optimization);
     return material;
+}
+
+function createContactShadow(rootBox, count, name) {
+    const size = rootBox.getSize(new THREE.Vector3());
+    const center = rootBox.getCenter(new THREE.Vector3());
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 128;
+    const context = canvas.getContext('2d');
+    const gradient = context.createRadialGradient(64, 64, 5, 64, 64, 62);
+    gradient.addColorStop(0, 'rgba(0, 0, 0, 0.62)');
+    gradient.addColorStop(0.52, 'rgba(0, 0, 0, 0.28)');
+    gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, 128, 128);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    const geometry = new THREE.PlaneGeometry(
+        Math.max(0.5, size.x * 0.9),
+        Math.max(0.5, size.z * 0.82)
+    );
+    geometry.rotateX(-Math.PI / 2);
+    geometry.translate(center.x, rootBox.min.y + 0.012, center.z);
+    const material = new THREE.MeshBasicMaterial({
+        map: texture,
+        color: 0x000000,
+        transparent: true,
+        opacity: 0.34,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        toneMapped: false
+    });
+    const mesh = new THREE.InstancedMesh(geometry, material, count);
+    mesh.name = name;
+    mesh.frustumCulled = false;
+    mesh.renderOrder = 1;
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    return { mesh, texture };
 }
 
 function createCompactMaterial(name, color) {
@@ -147,23 +332,42 @@ export function getBatchableModelInfo(deviceCfg, models = []) {
 
     if (!modelInfo || modelInfo.id === 'builtin_furnace' || !modelInfo.file_path) return null;
 
-    const metadata = modelMetadata(modelInfo);
-    if (metadata.batchable === false) return null;
-    if (Array.isArray(metadata.partBindings) && metadata.partBindings.length > 0) return null;
+    const optimization = resolveModelOptimization(modelInfo);
+    if (!optimization.enabled) return null;
     return modelInfo;
 }
 
-function collectMergedParts(root) {
+function geometrySignature(geometry) {
+    const attributes = Object.entries(geometry.attributes || {})
+        .map(([name, attribute]) => `${name}:${attribute.itemSize}:${attribute.normalized ? 1 : 0}`)
+        .sort()
+        .join('|');
+    return `${geometry.index ? 'indexed' : 'plain'}:${attributes}`;
+}
+
+function collectMergedParts(root, excludedObjects = new Set(), optimization) {
     root.updateMatrixWorld(true);
     const grouped = new Map();
     const rootBox = new THREE.Box3().setFromObject(root);
+    let sourceMeshCount = 0;
 
     root.traverse((child) => {
         if (!child.isMesh || !child.geometry || !child.material) return;
+        if (excludedObjects.has(child)) return;
+        if (child.isSkinnedMesh || child.morphTargetInfluences) {
+            throw new Error(`模型包含骨骼或 Morph 网格，自动合批已安全回退：${child.name || child.uuid}`);
+        }
+        if (Array.isArray(child.material) || child.geometry.groups?.length > 1) {
+            throw new Error(`模型包含单网格多材质，自动合批已安全回退：${child.name || child.uuid}`);
+        }
+        sourceMeshCount += 1;
         const material = Array.isArray(child.material) ? child.material[0] : child.material;
-        const key = material.name || material.uuid;
+        const signature = geometrySignature(child.geometry);
+        const key = optimization.mergeStatic
+            ? `${material.uuid}:${signature}`
+            : `${child.uuid}:${material.uuid}:${signature}`;
         if (!grouped.has(key)) {
-            grouped.set(key, { material: createBatchMaterial(material), geometries: [] });
+            grouped.set(key, { material: createBatchMaterial(material, optimization), geometries: [] });
         }
 
         const geometry = child.geometry.clone();
@@ -173,13 +377,30 @@ function collectMergedParts(root) {
 
     const parts = [];
     grouped.forEach(({ material, geometries }, key) => {
-        const geometry = geometries.length === 1 ? geometries[0] : mergeGeometries(geometries, false);
-        geometry.computeBoundingBox();
-        geometry.computeBoundingSphere();
-        parts.push({ key, geometry, material });
+        const mergedGeometry = geometries.length === 1 ? geometries[0] : mergeGeometries(geometries, false);
+        if (mergedGeometry) {
+            mergedGeometry.computeBoundingBox();
+            mergedGeometry.computeBoundingSphere();
+            parts.push({ key, geometry: mergedGeometry, material });
+            return;
+        }
+        geometries.forEach((geometry, index) => {
+            geometry.computeBoundingBox();
+            geometry.computeBoundingSphere();
+            const fallbackMaterial = index === 0 ? material : material.clone();
+            parts.push({ key: `${key}_${index}`, geometry, material: fallbackMaterial });
+        });
     });
 
-    return { parts, rootBox };
+    return {
+        parts,
+        rootBox,
+        diagnostics: {
+            sourceMeshCount,
+            staticPartCount: parts.length,
+            mergedMeshCount: Math.max(0, sourceMeshCount - parts.length)
+        }
+    };
 }
 
 function getDefinitionTransform(definition, modelInfo) {
@@ -209,6 +430,8 @@ class BatchedDeviceProxy extends THREE.Group {
 
         this.deviceConfig = deviceCfg;
         this.modelInfo = modelInfo;
+        this.metadata = modelMetadata(modelInfo);
+        this.optimization = resolveModelOptimization(modelInfo);
         this.batchRenderer = batchRenderer;
         this.instanceIndex = index;
         this.furnaceId = deviceCfg.id;
@@ -235,6 +458,9 @@ class BatchedDeviceProxy extends THREE.Group {
         this.labelElements = new Map();
         this.lastLabelValues = new Map();
         this.lastRealtimeData = null;
+        this.partBindings = Array.isArray(this.metadata.partBindings) ? this.metadata.partBindings : [];
+        this.bindingStates = [];
+        this.animatedMaterials = new Set();
 
         this.installVisibleTracker();
         this.createLabel();
@@ -288,6 +514,36 @@ class BatchedDeviceProxy extends THREE.Group {
         this.connectionBadge3D = ensureConnectionBadge3D(this, { box: rootBox });
     }
 
+    attachAnimatedRoot(sourceRoot) {
+        if (!this.partBindings.length) return;
+        const animated = createAnimatedRoot(
+            sourceRoot,
+            this.metadata,
+            this.optimization,
+            this.userData.mirrorX
+        );
+        this.animatedRoot = animated.root;
+        this.animatedPathMap = animated.pathMap;
+        this.animatedMaterials = animated.materials;
+        this.add(this.animatedRoot);
+        this.preparePartBindings();
+    }
+
+    preparePartBindings() {
+        this.bindingStates = this.partBindings.map((binding) => {
+            const target = bindingTarget(this.animatedRoot, this.animatedPathMap, binding);
+            if (!target) return null;
+            return {
+                binding,
+                target,
+                axis: normalizeAxis(binding.axis),
+                basePosition: target.position.clone(),
+                baseRotation: target.rotation.clone(),
+                speed: 0
+            };
+        }).filter(Boolean);
+    }
+
     setConnectionBadge(quality) {
         this.userData.quality = quality;
         setConnectionBadge3D(this, quality);
@@ -314,6 +570,12 @@ class BatchedDeviceProxy extends THREE.Group {
         const nextEnabled = !!enable;
         if (this.xRayEnabled === nextEnabled) return;
         this.xRayEnabled = nextEnabled;
+        this.animatedMaterials.forEach((material) => {
+            material.transparent = nextEnabled;
+            material.opacity = nextEnabled ? 0.25 : 1;
+            material.depthWrite = !nextEnabled;
+            material.needsUpdate = true;
+        });
         this.batchRenderer.markXRayDirty();
     }
 
@@ -322,6 +584,62 @@ class BatchedDeviceProxy extends THREE.Group {
         if (this.labelObj?.visible) this.renderLabelText();
         this.setConnectionBadge(resolveDeviceQuality(data));
         this.batchRenderer.updateInstanceState(this.instanceIndex, data);
+        this.applyPartBindings(data);
+    }
+
+    applyPartBindings(data) {
+        this.bindingStates.forEach((state) => {
+            const { binding, target, axis } = state;
+            const action = binding.action || 'rotate_speed';
+            const rawValue = readBindingValue(data, binding);
+            if (rawValue === undefined || rawValue === null) return;
+
+            if (action === 'rotate_speed') {
+                const rpm = toNumber(rawValue, 0);
+                const factor = Number.isFinite(Number(binding.speed_factor))
+                    ? Number(binding.speed_factor)
+                    : (Math.PI * 2 / 60);
+                state.speed = rpm * factor;
+                return;
+            }
+
+            if (action === 'rotate_angle') {
+                const angleDeg = mapRange(
+                    toNumber(rawValue, 0),
+                    toNumber(binding.input_min, 0),
+                    toNumber(binding.input_max, 100),
+                    toNumber(binding.output_min, 0),
+                    toNumber(binding.output_max, 90)
+                );
+                target.rotation[axis] = state.baseRotation[axis] + THREE.MathUtils.degToRad(angleDeg);
+                return;
+            }
+
+            if (action === 'translate') {
+                const offset = mapRange(
+                    toNumber(rawValue, 0),
+                    toNumber(binding.input_min, 0),
+                    toNumber(binding.input_max, 100),
+                    toNumber(binding.output_min, 0),
+                    toNumber(binding.output_max, 1)
+                );
+                target.position[axis] = state.basePosition[axis] + offset;
+                return;
+            }
+
+            if (action === 'visibility') {
+                const visible = toBool(rawValue);
+                target.visible = binding.invert ? !visible : visible;
+                return;
+            }
+
+            if (action === 'color') {
+                applyColorToTarget(
+                    target,
+                    toBool(rawValue) ? (binding.on_color || '#00ff88') : (binding.off_color || '#666666')
+                );
+            }
+        });
     }
 
     raycast(raycaster, intersects) {
@@ -340,7 +658,17 @@ class BatchedDeviceProxy extends THREE.Group {
         });
     }
 
-    dispose() {}
+    update(delta) {
+        this.bindingStates.forEach((state) => {
+            if (state.binding.action !== 'rotate_speed' || !state.speed) return;
+            state.target.rotation[state.axis] += delta * state.speed;
+        });
+    }
+
+    dispose() {
+        this.animatedMaterials.forEach(material => material.dispose());
+        this.animatedMaterials.clear();
+    }
 }
 
 class DeviceBatchRenderer extends THREE.Group {
@@ -374,6 +702,14 @@ class DeviceBatchRenderer extends THREE.Group {
         this.xRayDirty = true;
         this.options = options;
         const metadata = modelMetadata(modelInfo);
+        this.optimization = resolveModelOptimization(modelInfo);
+        this.userData.optimization = {
+            modelId: modelInfo.id,
+            instanceCount: definitions.length,
+            ...(options.diagnostics || {}),
+            mode: this.optimization.mode,
+            contactShadow: this.optimization.contactShadow
+        };
         this.hasMirroredInstances = definitions.some(definition => shouldMirrorX(parseJson(definition.deviceCfg.instance_config, {})));
         this.showStatusLight = options.showStatusLight === true || metadata.runtime?.showStatusLight === true;
         this.supportsXRay = options.supportsXRay === true || metadata.runtime?.allowXRay === true;
@@ -404,6 +740,16 @@ class DeviceBatchRenderer extends THREE.Group {
 
         if (this.showStatusLight) {
             this.createStatusLights(definitions.length);
+        }
+        if (this.optimization.contactShadow) {
+            const shadow = createContactShadow(
+                rootBox,
+                definitions.length,
+                `batch_${modelInfo.id}_contact_shadow`
+            );
+            this.contactShadowMesh = shadow.mesh;
+            this.contactShadowTexture = shadow.texture;
+            this.add(this.contactShadowMesh);
         }
     }
 
@@ -528,6 +874,9 @@ class DeviceBatchRenderer extends THREE.Group {
         this.instancedMeshes.forEach(mesh => {
             mesh.setMatrixAt(index, tempMatrix);
         });
+        if (this.contactShadowMesh) {
+            this.contactShadowMesh.setMatrixAt(index, tempMatrix);
+        }
 
         if (this.statusLightMesh) {
             tempPosition.set(0, this.statusLightOffsets[index], 0).applyMatrix4(tempMatrix);
@@ -556,6 +905,7 @@ class DeviceBatchRenderer extends THREE.Group {
         this.instancedMeshes.forEach(mesh => {
             mesh.instanceMatrix.needsUpdate = true;
         });
+        if (this.contactShadowMesh) this.contactShadowMesh.instanceMatrix.needsUpdate = true;
         if (this.statusLightMesh) this.statusLightMesh.instanceMatrix.needsUpdate = true;
     }
 
@@ -589,6 +939,11 @@ class DeviceBatchRenderer extends THREE.Group {
             this.statusLightMesh.geometry.dispose();
             this.statusLightMesh.material.dispose();
         }
+        if (this.contactShadowMesh) {
+            this.contactShadowMesh.geometry.dispose();
+            this.contactShadowMesh.material.dispose();
+            this.contactShadowTexture?.dispose?.();
+        }
         this.proxies.forEach(proxy => proxy?.dispose?.());
     }
 }
@@ -596,14 +951,40 @@ class DeviceBatchRenderer extends THREE.Group {
 export async function createBatchedDeviceRenderer(modelInfo, definitions, options = {}) {
     if (modelInfo.id === 'transfer_cart') {
         const { parts, rootBox } = createCompactTransferCartParts();
-        const batchRenderer = new DeviceBatchRenderer(modelInfo, parts, rootBox, definitions, { ...options, showStatusLight: true });
+        const batchRenderer = new DeviceBatchRenderer(modelInfo, parts, rootBox, definitions, {
+            ...options,
+            showStatusLight: true,
+            diagnostics: {
+                sourceMeshCount: parts.length,
+                staticPartCount: parts.length,
+                mergedMeshCount: 0,
+                animatedBindingCount: 0
+            }
+        });
         const deviceModels = definitions.map((definition, index) => batchRenderer.createProxy(definition, index));
         return { batchRenderer, deviceModels };
     }
 
     const root = await loadGltf(resolveBackendAssetUrl(modelInfo.file_path));
-    const { parts, rootBox } = collectMergedParts(root);
-    const batchRenderer = new DeviceBatchRenderer(modelInfo, parts, rootBox, definitions, options);
+    const metadata = modelMetadata(modelInfo);
+    const optimization = resolveModelOptimization(modelInfo);
+    const bindings = Array.isArray(metadata.partBindings) ? metadata.partBindings : [];
+    const bound = collectBoundObjects(root, metadata);
+    if (bound.resolvedCount !== bindings.length) {
+        throw new Error(`模型活动节点仅解析 ${bound.resolvedCount}/${bindings.length}，已回退到原始渲染`);
+    }
+    const { parts, rootBox, diagnostics } = collectMergedParts(root, bound.objects, optimization);
+    const batchRenderer = new DeviceBatchRenderer(modelInfo, parts, rootBox, definitions, {
+        ...options,
+        diagnostics: {
+            ...diagnostics,
+            animatedBindingCount: bindings.length,
+            animatedObjectCount: bound.objects.size
+        }
+    });
     const deviceModels = definitions.map((definition, index) => batchRenderer.createProxy(definition, index));
+    if (bindings.length) {
+        deviceModels.forEach(proxy => proxy.attachAnimatedRoot(root));
+    }
     return { batchRenderer, deviceModels };
 }

@@ -5,6 +5,7 @@ import { clone as cloneObject3D } from 'three/examples/jsm/utils/SkeletonUtils.j
 import { FurnaceModel } from './FurnaceModel.js';
 import { buildDeviceLabelMarkup, updateDeviceLabelElements, applyDeviceLabelStyle } from '../runtime/uiConfig.js';
 import { getBackendOrigin } from '../runtime/backendEndpoint.js';
+import { enhanceModelMaterial, resolveModelOptimization } from '../runtime/modelOptimization.js';
 
 const loader = new GLTFLoader();
 const modelCache = new Map();
@@ -45,7 +46,7 @@ function normalizeModelRoot(root) {
     root.position.z -= center.z;
 }
 
-function collectMaterials(object, targetSet) {
+function collectMaterials(object, targetSet, optimization) {
     object.traverse((child) => {
         if (!child.isMesh) return;
 
@@ -53,10 +54,10 @@ function collectMaterials(object, targetSet) {
         child.receiveShadow = false;
 
         if (Array.isArray(child.material)) {
-            child.material = child.material.map((mat) => mat.clone());
+            child.material = child.material.map((mat) => enhanceModelMaterial(mat.clone(), optimization));
             child.material.forEach((mat) => targetSet.add(mat));
         } else if (child.material) {
-            child.material = child.material.clone();
+            child.material = enhanceModelMaterial(child.material.clone(), optimization);
             targetSet.add(child.material);
         }
     });
@@ -324,6 +325,7 @@ class ImportedDeviceModel extends THREE.Group {
         this.deviceConfig = deviceConfig;
         this.modelInfo = modelInfo;
         this.metadata = modelMetadata(modelInfo);
+        this.optimization = resolveModelOptimization(modelInfo);
         this.furnaceId = deviceConfig.id;
         this.furnaceName = deviceConfig.name;
         this.userData.isDevice = true;
@@ -354,7 +356,7 @@ class ImportedDeviceModel extends THREE.Group {
         const cachedRoot = await loadGltf(url);
         const root = cloneObject3D(cachedRoot);
 
-        collectMaterials(root, this.materials);
+        collectMaterials(root, this.materials, this.optimization);
         this.modelRoot = root;
         this.nodePathMap = buildObjectPathMap(root);
         this.preparePartBindings();

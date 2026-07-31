@@ -1338,7 +1338,10 @@ async function seedDefaults() {
     await seedModelAssets(db);
     await seedFactoryDefaults(db);
     await seedPlatformDefaults(db);
+    await migrateDefaultFurnacesToNativeV5(db);
 }
+
+const NATIVE_FURNACE_MODEL_ID = 'photo_multipurpose_furnace_v5';
 
 async function seedFactoryDefaults(db) {
     const workshopsCount = await db.get('SELECT COUNT(*) AS cnt FROM workshops');
@@ -1370,7 +1373,7 @@ async function seedFactoryDefaults(db) {
                 id: `Furnace_${String(globalIdx + 1).padStart(2, '0')}`,
                 name: `${globalIdx + 1}# 多用炉`,
                 line_id: lineId,
-                model_type: 'box_atmosphere_furnace',
+                model_type: NATIVE_FURNACE_MODEL_ID,
                 model_file: null,
                 template_id: '',
                 instance_config: '{}',
@@ -1437,7 +1440,7 @@ async function seedPlatformDefaults(db) {
         await db.insertIgnore('device_templates', {
             id: 'tpl_multipurpose_furnace',
             name: '多用炉模板',
-            model_type: 'box_atmosphere_furnace',
+            model_type: NATIVE_FURNACE_MODEL_ID,
             default_config: JSON.stringify({ category: 'furnace', realtimeProfile: 'heat_treatment' })
         }, 'id');
     }
@@ -1503,6 +1506,24 @@ async function seedPlatformDefaults(db) {
             is_current: 1
         }, 'id');
     }
+}
+
+async function migrateDefaultFurnacesToNativeV5(db) {
+    const migrationKey = 'native_v5_default_furnace_migrated';
+    const migrated = await db.get('SELECT value FROM settings WHERE `key` = ?', [migrationKey]);
+    if (String(migrated?.value || '') === '1') return;
+
+    // Only replace the untouched factory seed devices. Uploaded models, renamed IDs and
+    // devices with instance-specific configuration remain exactly as the engineer set them.
+    await db.run(`UPDATE devices SET model_type = ?
+        WHERE model_type IN ('box_atmosphere_furnace', 'builtin_furnace')
+        AND id LIKE 'Furnace_%'
+        AND (model_file IS NULL OR model_file = '')
+        AND (instance_config IS NULL OR instance_config = '' OR instance_config = '{}')`, [NATIVE_FURNACE_MODEL_ID]);
+    await db.run(`UPDATE device_templates SET model_type = ?
+        WHERE id = 'tpl_multipurpose_furnace'
+        AND model_type IN ('box_atmosphere_furnace', 'builtin_furnace')`, [NATIVE_FURNACE_MODEL_ID]);
+    await db.upsert('settings', { key: migrationKey, value: '1' }, 'key');
 }
 
 async function mergeWidgetDefaultConfig(db, widgetId, defaults) {

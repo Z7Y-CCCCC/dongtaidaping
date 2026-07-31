@@ -1,0 +1,10 @@
+{
+  "backendHttpUrl": "http://127.0.0.1:3001",
+  "backendWebSocketUrl": "ws://127.0.0.1:3001/ws",
+  "qualityProfile": "auto",
+  "autoReconnectSeconds": 2.0,
+  "configurationRetrySeconds": 3.0,
+  "modelLoadTimeoutSeconds": 30.0,
+  "showDiagnostics": true,
+  "enableQualityHotkeys": true
+}

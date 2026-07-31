@@ -1,6 +1,6 @@
 {
   "name": "heat-treatment-digital-twin-desktop",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "热处理数字孪生大屏 Windows 桌面部署版",
   "main": "main.cjs",
   "author": "Digital Twin Team",
@@ -9,8 +9,9 @@
   "scripts": {
     "prepare:resources": "node scripts/prepare-resources.cjs && node scripts/generate-third-party-notices.cjs",
     "build:frontend": "npm --prefix ../frontend run build",
+    "build:unity": "node scripts/build-unity-client.cjs",
     "test:logs": "node scripts/log-manager-test.cjs",
-    "dist": "npm run build:frontend && npm run prepare:resources && electron-builder --win nsis --x64"
+    "dist": "npm run build:frontend && npm run build:unity && npm run prepare:resources && electron-builder --win nsis --x64"
   },
   "devDependencies": {
     "electron": "43.1.1",
@@ -42,6 +43,10 @@
           "**/*",
           "!data/**/*",
           "!uploads/**/*",
+          "!node_modules/**/*",
+          "!scripts/**/*",
+          "!assets/models/*.blend",
+          "!assets/models/*.blend1",
           "!*.log"
         ]
       },
@@ -53,6 +58,11 @@
       {
         "from": "resources/backend-dependencies",
         "to": "backend-dependencies",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "resources/native-client",
+        "to": "native-client",
         "filter": ["**/*"]
       },
       {

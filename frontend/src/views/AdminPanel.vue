@@ -505,6 +505,15 @@ const defaultModelAssetSpec = {
     owner: '',
     notes: ''
 }
+const defaultModelOptimization = {
+    mode: 'auto',
+    mergeStatic: true,
+    instanceRepeated: true,
+    preserveAnimated: true,
+    materialEnhancement: 'auto',
+    contactShadow: true,
+    environmentIntensity: 0.85
+}
 const modelWorkflowStepLabels = {
     imported: '导入',
     parsed: '解析',
@@ -517,6 +526,7 @@ const modelWorkflowStepLabels = {
 function createDefaultModelMetadata() {
     return {
         batchable: true,
+        optimization: { ...defaultModelOptimization },
         assetSpec: { ...defaultModelAssetSpec },
         partBindings: [],
         acceptance: {
@@ -582,6 +592,7 @@ const modelPreviewStats = reactive({
 })
 const modelPartBindings = ref([])
 const modelAssetSpec = reactive({ ...defaultModelAssetSpec })
+const modelOptimization = reactive({ ...defaultModelOptimization })
 const selectedModelNodePath = ref('')
 const modelNodeSearchText = ref('')
 const showOnlyBindableNodes = ref(true)
@@ -741,6 +752,17 @@ function countUnresolvedModelBindings() {
 
 const activePreviewModel = computed(() => getActivePreviewModel())
 const canEditModelBindings = computed(() => !!activePreviewModel.value?.file_path && !activePreviewModel.value?.is_builtin)
+const modelOptimizationEstimate = computed(() => {
+    if (modelOptimization.mode === 'off') return '已关闭：模型将按原始节点逐个渲染'
+    const meshes = Math.max(0, Number(modelPreviewStats.meshCount) || 0)
+    const materials = Math.max(1, Number(modelPreviewStats.materialCount) || 1)
+    const bindings = Math.max(0, modelPartBindings.value.length)
+    const estimatedStaticParts = modelOptimization.mergeStatic
+        ? Math.min(Math.max(0, meshes - bindings), materials)
+        : Math.max(0, meshes - bindings)
+    const estimatedCalls = estimatedStaticParts + bindings
+    return `预计单台从约 ${meshes || '-'} 个网格压到约 ${estimatedCalls || '-'} 个静态/活动渲染组；同型多台会进一步共享静态绘制`
+})
 const modelAcceptanceChecks = computed(() => {
     const model = activePreviewModel.value
     const maxTriangles = Number(modelAssetSpec.max_triangles || defaultModelAssetSpec.max_triangles)
@@ -1668,9 +1690,32 @@ function normalizeModelAssetSpec(spec = {}) {
     }
 }
 
+function normalizeModelOptimization(optimization = {}) {
+    return {
+        ...defaultModelOptimization,
+        ...(optimization || {}),
+        mode: ['auto', 'off'].includes(optimization?.mode) ? optimization.mode : defaultModelOptimization.mode,
+        mergeStatic: optimization?.mergeStatic ?? optimization?.merge_static ?? defaultModelOptimization.mergeStatic,
+        instanceRepeated: optimization?.instanceRepeated ?? optimization?.instance_repeated ?? defaultModelOptimization.instanceRepeated,
+        preserveAnimated: true,
+        materialEnhancement: ['auto', 'original'].includes(optimization?.materialEnhancement || optimization?.material_enhancement)
+            ? (optimization.materialEnhancement || optimization.material_enhancement)
+            : defaultModelOptimization.materialEnhancement,
+        contactShadow: optimization?.contactShadow ?? optimization?.contact_shadow ?? defaultModelOptimization.contactShadow,
+        environmentIntensity: Math.max(0, Math.min(2, Number(
+            optimization?.environmentIntensity
+            ?? optimization?.environment_intensity
+            ?? defaultModelOptimization.environmentIntensity
+        )))
+    }
+}
+
 function loadModelAssetSpec(model) {
     const metadata = parseModelMetadata(model)
     Object.assign(modelAssetSpec, normalizeModelAssetSpec(metadata.assetSpec || metadata.asset_spec || {}))
+    Object.assign(modelOptimization, normalizeModelOptimization(
+        metadata.optimization || (metadata.batchable === false ? { mode: 'off' } : {})
+    ))
 }
 
 function makeAcceptanceSnapshot(status = modelAssetSpec.delivery_status || 'draft') {
@@ -1722,6 +1767,7 @@ function buildCurrentModelMetadata(model, overrides = {}) {
         ...metadata,
         schema_version: 1,
         batchable: metadata.batchable ?? true,
+        optimization: normalizeModelOptimization(modelOptimization),
         assetSpec,
         partBindings: normalizedPartBindings,
         acceptance: overrides.acceptance || makeAcceptanceSnapshot(assetSpec.delivery_status),
@@ -2023,6 +2069,7 @@ async function publishModelAsset() {
             snapshot: {
                 schema_version: metadata.schema_version,
                 assetSpec: metadata.assetSpec,
+                optimization: metadata.optimization,
                 partBindings: metadata.partBindings,
                 acceptance: metadata.acceptance,
                 runtime: metadata.runtime
@@ -2055,10 +2102,12 @@ async function restoreModelRelease(record) {
             ...(snapshot.assetSpec || {}),
             delivery_status: 'released'
         })
+        const restoredOptimization = normalizeModelOptimization(snapshot.optimization || current.optimization || {})
         const metadata = {
             ...current,
             schema_version: snapshot.schema_version || 1,
             assetSpec: restoredSpec,
+            optimization: restoredOptimization,
             partBindings: restoredBindings,
             acceptance: snapshot.acceptance || makeAcceptanceSnapshot('released'),
             runtime: {
@@ -2086,6 +2135,7 @@ async function restoreModelRelease(record) {
             }
         }
         Object.assign(modelAssetSpec, restoredSpec)
+        Object.assign(modelOptimization, restoredOptimization)
         modelPartBindings.value = restoredBindings
         await persistModelMetadata(model, metadata, `已恢复发布版本：${metadata.release.version}`)
     } catch (e) {
@@ -2103,6 +2153,7 @@ function resetModelImportForm(file) {
     const metadata = createDefaultModelMetadata()
     metadata.assetSpec.device_family = modelImportForm.name
     Object.assign(modelAssetSpec, metadata.assetSpec)
+    Object.assign(modelOptimization, metadata.optimization)
     modelImportForm.metadata = JSON.stringify(metadata, null, 2)
 }
 
@@ -2129,6 +2180,7 @@ function clearSelectedModelFile() {
     modelPartBindings.value = []
     modelBindingStatus.value = ''
     Object.assign(modelAssetSpec, { ...defaultModelAssetSpec })
+    Object.assign(modelOptimization, { ...defaultModelOptimization })
     resetModelBindingForm()
     modelImportForm.id = ''
     modelImportForm.name = ''
@@ -5320,6 +5372,34 @@ const mainTabs = [
                                 </div>
 
                                 <template v-if="canEditModelBindings">
+                                    <div class="model-optimization-panel">
+                                        <div class="model-release-header">
+                                            <strong>通用模型优化</strong>
+                                            <span>保留三角面和点位动画，主要降低 draw call 并改善 PBR 观感</span>
+                                        </div>
+                                        <div class="model-spec-form model-optimization-form">
+                                            <label>优化策略
+                                                <select v-model="modelOptimization.mode" class="input">
+                                                    <option value="auto">自动优化（推荐）</option>
+                                                    <option value="off">关闭，使用模型原始结构</option>
+                                                </select>
+                                            </label>
+                                            <label>无贴图材质
+                                                <select v-model="modelOptimization.materialEnhancement" class="input" :disabled="modelOptimization.mode === 'off'">
+                                                    <option value="auto">自动识别金属 / 油漆 / 橡胶</option>
+                                                    <option value="original">保持原始材质参数</option>
+                                                </select>
+                                            </label>
+                                            <label>环境反射强度
+                                                <input v-model.number="modelOptimization.environmentIntensity" type="number" min="0" max="2" step="0.05" class="input" :disabled="modelOptimization.mode === 'off'" />
+                                            </label>
+                                            <label class="checkbox-line"><input v-model="modelOptimization.mergeStatic" type="checkbox" :disabled="modelOptimization.mode === 'off'" /> 静态网格按材质合并</label>
+                                            <label class="checkbox-line"><input v-model="modelOptimization.instanceRepeated" type="checkbox" :disabled="modelOptimization.mode === 'off'" /> 同型多台实例化</label>
+                                            <label class="checkbox-line"><input v-model="modelOptimization.contactShadow" type="checkbox" :disabled="modelOptimization.mode === 'off'" /> 低成本接触阴影</label>
+                                        </div>
+                                        <p class="model-optimization-estimate">{{ modelOptimizationEstimate }}。骨骼、Morph 或单网格多材质等不适合的模型会自动回退，不会强行破坏。</p>
+                                    </div>
+
                                     <div class="model-spec-form">
                                         <label>资产版本<input v-model="modelAssetSpec.version" class="input" /></label>
                                         <label>设备类型<input v-model="modelAssetSpec.device_family" class="input" placeholder="如 箱式气氛多用炉" /></label>
@@ -6447,9 +6527,42 @@ const mainTabs = [
                             </div>
                         </div>
 
+                        <!-- ===== Unity 原生客户端画质 ===== -->
+                        <div class="settings-section">
+                            <h3 class="section-title">Unity 原生客户端画质</h3>
+                            <div class="settings-grid">
+                                <label>现场电脑画质档位
+                                    <select v-model="settings.native_quality_profile" class="input">
+                                        <option value="auto">自动识别（推荐）</option>
+                                        <option value="integrated_gpu">核显稳定档</option>
+                                        <option value="balanced">均衡专业档</option>
+                                        <option value="showcase">展示高画质档</option>
+                                    </select>
+                                </label>
+                                <label>模型几何策略
+                                    <div class="input render-setting-readonly">始终保留导入模型完整几何</div>
+                                </label>
+                            </div>
+                            <div class="mode-hint render-profile-hint">
+                                <template v-if="settings.native_quality_profile === 'integrated_gpu'">
+                                    <p><strong>核显稳定档：</strong>降低内部渲染分辨率、附加灯阴影和反射开销，模型面数与贴图内容不变。</p>
+                                </template>
+                                <template v-else-if="settings.native_quality_profile === 'balanced'">
+                                    <p><strong>均衡专业档：</strong>完整 PBR、4× MSAA、专业后处理与中距离阴影，适合开发机和普通独显。</p>
+                                </template>
+                                <template v-else-if="settings.native_quality_profile === 'showcase'">
+                                    <p><strong>展示高画质档：</strong>更高内部渲染比例、远距离阴影与反射，适合展厅高性能电脑。</p>
+                                </template>
+                                <template v-else>
+                                    <p><strong>自动识别：</strong>按显卡名称和显存选择档位；工程师也可在客户端按 F1 / F2 / F3 临时切换。</p>
+                                </template>
+                                <p>保存后在 Unity 客户端按 F5 重载，或重新启动客户端。所有档位都不会自动减面。</p>
+                            </div>
+                        </div>
+
                         <!-- ===== 渲染性能 ===== -->
                         <div class="settings-section">
-                            <h3 class="section-title">大屏渲染性能</h3>
+                            <h3 class="section-title">旧 Web 大屏渲染性能（过渡保留）</h3>
                             <div class="settings-grid">
                                 <label>性能档位
                                     <select v-model="settings.render_profile" class="input">
@@ -9256,6 +9369,32 @@ button:enabled:active {
 }
 .model-spec-form .wide-form-section {
     grid-column: 1 / -1;
+}
+.model-optimization-panel {
+    margin-bottom: 16px;
+    padding: 14px;
+    border: 1px solid rgba(0, 113, 227, 0.18);
+    border-radius: 10px;
+    background: linear-gradient(135deg, rgba(0, 113, 227, 0.055), rgba(255, 255, 255, 0.96));
+}
+.model-optimization-form {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    margin-bottom: 8px;
+}
+.model-optimization-form .checkbox-line {
+    min-height: 38px;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.78);
+}
+.model-optimization-estimate {
+    margin: 0;
+    color: #5e5e63;
+    font-size: 12px;
+    line-height: 1.55;
 }
 .model-acceptance-summary {
     margin: 4px 0 10px;
