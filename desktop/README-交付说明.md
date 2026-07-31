@@ -16,6 +16,7 @@
 %APPDATA%\heat-treatment-digital-twin-desktop\data\backups\
 %APPDATA%\heat-treatment-digital-twin-desktop\data\recovery\
 %APPDATA%\heat-treatment-digital-twin-desktop\uploads\models\
+%APPDATA%\heat-treatment-digital-twin-desktop\uploads\audio\
 %APPDATA%\heat-treatment-digital-twin-desktop\logs\backend.log
 %APPDATA%\heat-treatment-digital-twin-desktop\logs\backend-error.log
 %APPDATA%\heat-treatment-digital-twin-desktop\logs\desktop-error.log
@@ -40,6 +41,7 @@
 
 - 一致性 SQLite 数据库，以及数据库中的车间、产线、设备、PLC 点位、性能设置和平台编排等全部现场配置。
 - 现场自行上传的 GLB/GLTF 模型文件。内置模型随安装包提供，不重复写入灾备包。
+- 点位语音播报所生成或上传的 WAV、MP3、OGG、M4A 文件。
 - 文件清单、大小和 SHA-256，用于导入前完整性校验。
 
 现场备份步骤：
@@ -53,7 +55,7 @@
 1. 在新电脑安装同版本或更新版本的软件并启动一次。
 2. 进入后台“数据库连接 → 整站灾备”，点击“从整站备份恢复”。
 3. 选择外置介质中的 ZIP，等待校验与恢复完成。
-4. 核对车间、设备、PLC 点位和上传模型，再进行现场 PLC 连通验收。
+4. 核对车间、设备、PLC 点位、上传模型和语音播报，再进行现场 PLC 连通验收。
 
 导入前软件会创建当前数据库回滚备份；导入失败时会恢复原上传文件。旧电脑的绝对数据库路径不会覆盖新电脑的数据目录。
 
@@ -65,6 +67,20 @@
 - 草稿保留仅覆盖软件当前运行会话；刷新页面或退出软件前，仍应点击对应的保存按钮写入数据库。
 - 无独显电脑建议在“系统设置 → 大屏渲染性能”选择“低配兼容”。
 - PLC 地址和点位需要由现场工程师按设备实际情况配置。
+
+## 点位语音播报配置
+
+1. 进入后台“设备与点位配置”，在目标点位行点击“语音播报”。
+2. 新增规则并选择触发方式：任意变化、BOOL 上升沿、BOOL 下降沿、等于阈值、向上跨越阈值或向下跨越阈值。
+3. 填写播报文字。可使用 `{设备}`、`{点位}`、`{值}`、`{单位}`，运行时会替换为实际内容。
+4. 设置冷却时间、音量和语速；PLC 信号容易抖动时应适当加长冷却时间。
+5. 选择播放方式：
+   - “系统文字转语音”适合实时播报动态数值。
+   - “固定音频文件”适合固定报警话术，可由软件生成 WAV，也可上传现有音频。
+   - “自动”会在有音频文件时播放文件，否则使用系统文字转语音。
+6. 先点击“测试播报”，确认声音、音量和话术，再保存点位配置。
+
+软件生成 WAV 时使用 Windows 自带的本地语音引擎，不需要外网或第三方账号。生成后的 WAV 内容固定；若话术包含实时温度、压力等变化值，请保留系统文字转语音模式。现场生成和上传的语音文件位于 `%APPDATA%\heat-treatment-digital-twin-desktop\uploads\audio\`，会和点位规则一起进入整站灾备包。
 
 ## 交付前实测结果
 

@@ -1089,6 +1089,7 @@ async function ensureSchemaColumns() {
     await ensureColumn('data_points', 'alarm_text', `${t.text}`);
     await ensureColumn('data_points', 'alarm_level', `${t.string(32)} DEFAULT 'WARNING'`);
     await ensureColumn('data_points', 'alarm_condition', `${t.string(64)} DEFAULT '=1'`);
+    await ensureColumn('data_points', 'voice_config', `${t.text}`);
 }
 
 async function rawQuery(sql) {
@@ -1165,6 +1166,7 @@ async function initTables() {
         alarm_text ${t.text},
         alarm_level ${t.string(32)} DEFAULT 'WARNING',
         alarm_condition ${t.string(64)} DEFAULT '=1',
+        voice_config ${t.text},
         alarm_high ${t.double} NULL,
         alarm_low ${t.double} NULL
     `);

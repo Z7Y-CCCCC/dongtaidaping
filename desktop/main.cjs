@@ -11,6 +11,8 @@ const {
 } = require('./logManager.cjs');
 
 const APP_NAME = '热处理数字孪生大屏';
+// 现场大屏需要在无人值守时自动播报，Electron 默认的 Chromium 音频自动播放限制会阻止这一点。
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 if (process.env.APP_USER_DATA_DIR) {
     app.setPath('userData', path.resolve(process.env.APP_USER_DATA_DIR));
 }
@@ -22,6 +24,8 @@ let desktopErrorLogStream = null;
 let logCleanupTimer = null;
 let backendPort = null;
 let backendShutdownToken = null;
+let desktopSettingsTimer = null;
+let appliedAutoStartSetting = null;
 let isQuitting = false;
 let quitReady = false;
 
@@ -49,6 +53,7 @@ function initializeWritableData() {
     }
     copyDirectoryIfMissing(path.join(templateRoot, 'uploads'), uploadsDir);
     ensureDirectory(path.join(uploadsDir, 'models'));
+    ensureDirectory(path.join(uploadsDir, 'audio'));
 
     if (!fs.existsSync(databaseConfigFile)) {
         fs.writeFileSync(databaseConfigFile, JSON.stringify({
@@ -60,14 +65,20 @@ function initializeWritableData() {
     return { dataDir, uploadsDir, logsDir };
 }
 
-function configureAutoStart() {
-    if (!app.isPackaged || process.platform !== 'win32' || process.env.DISABLE_AUTO_START === 'true') return;
-    app.setLoginItemSettings({
-        openAtLogin: true,
-        openAsHidden: false,
-        path: process.execPath,
-        args: ['--autostart']
-    });
+function configureAutoStart(enabled) {
+    if (!app.isPackaged || process.platform !== 'win32' || process.env.DISABLE_AUTO_START === 'true') return false;
+    try {
+        app.setLoginItemSettings({
+            openAtLogin: Boolean(enabled),
+            openAsHidden: false,
+            path: process.execPath,
+            args: ['--autostart']
+        });
+        return true;
+    } catch (error) {
+        logDesktopError('auto-start', error);
+        return false;
+    }
 }
 
 function findAvailablePort(startPort = 3001) {
@@ -115,6 +126,59 @@ function waitForHealth(url, timeoutMs = 30000) {
         };
         check();
     });
+}
+
+function readRuntimeSettings(port) {
+    return new Promise((resolve, reject) => {
+        const request = http.get({
+            host: '127.0.0.1',
+            port,
+            path: '/api/system/runtime',
+            headers: { Accept: 'application/json' }
+        }, response => {
+            let body = '';
+            response.setEncoding('utf8');
+            response.on('data', chunk => { body += chunk; });
+            response.on('end', () => {
+                if (response.statusCode !== 200) {
+                    reject(new Error(`读取运行配置失败: HTTP ${response.statusCode}`));
+                    return;
+                }
+                try {
+                    resolve(JSON.parse(body));
+                } catch (error) {
+                    reject(new Error(`运行配置响应格式错误: ${error.message}`));
+                }
+            });
+        });
+        request.setTimeout(2500, () => request.destroy(new Error('读取运行配置超时')));
+        request.on('error', reject);
+    });
+}
+
+async function syncDesktopSettings() {
+    if (!backendPort) return;
+    try {
+        const runtime = await readRuntimeSettings(backendPort);
+        if (runtime?.auto_start_supported) {
+            const enabled = runtime.auto_start_enabled === true;
+            if (appliedAutoStartSetting !== enabled && configureAutoStart(enabled)) {
+                appliedAutoStartSetting = enabled;
+            }
+        }
+    } catch (error) {
+        // 后端刚启动、正在重启或开发版不支持时，不打断桌面程序。
+        logDesktopError('runtime-settings-sync', error);
+    }
+}
+
+function startDesktopSettingsSync() {
+    if (desktopSettingsTimer) clearInterval(desktopSettingsTimer);
+    desktopSettingsTimer = setInterval(() => {
+        syncDesktopSettings();
+    }, 4000);
+    desktopSettingsTimer.unref?.();
+    syncDesktopSettings();
 }
 
 function logDesktopError(context, error) {
@@ -171,6 +235,8 @@ async function startBackend(port, writable) {
             UPLOADS_DIR: writable.uploadsDir,
             FRONTEND_DIST: frontendDir,
             ENABLE_CORS: 'false',
+            DESKTOP_PACKAGED: app.isPackaged ? 'true' : 'false',
+            DESKTOP_AUTO_START_SUPPORTED: app.isPackaged && process.platform === 'win32' && process.env.DISABLE_AUTO_START !== 'true' ? 'true' : 'false',
             SQLITE_RECOVERY_TEMPLATE: path.join(process.resourcesPath, 'templates', 'factory-template.db'),
             DESKTOP_SHUTDOWN_TOKEN: backendShutdownToken,
             NODE_PATH: path.join(process.resourcesPath, 'backend-dependencies')
@@ -318,6 +384,7 @@ async function launchApplication() {
     const origin = `http://127.0.0.1:${port}`;
     await startBackend(port, writable);
     await waitForHealth(`${origin}/api/health`);
+    startDesktopSettingsSync();
     createMainWindow(origin);
 }
 
@@ -331,7 +398,6 @@ if (!app.requestSingleInstanceLock()) {
     });
 
     app.whenReady().then(() => {
-        configureAutoStart();
         return launchApplication();
     }).catch((error) => {
         logDesktopError('application-start', error);
@@ -344,6 +410,8 @@ if (!app.requestSingleInstanceLock()) {
         if (quitReady) return;
         event.preventDefault();
         isQuitting = true;
+        if (desktopSettingsTimer) clearInterval(desktopSettingsTimer);
+        desktopSettingsTimer = null;
         stopBackend().finally(() => {
             if (logCleanupTimer) clearInterval(logCleanupTimer);
             logCleanupTimer = null;

@@ -22,6 +22,7 @@ const SITE_IMPORT_DIR = path.resolve(process.env.SITE_IMPORT_DIR || path.join(DA
 const SITE_BACKUP_RETENTION = positiveInteger(process.env.SITE_BACKUP_RETENTION, 5);
 const SITE_BACKUP_FORMAT = 'heat-treatment-digital-twin-site-backup';
 const SITE_BACKUP_VERSION = 1;
+const UPLOAD_GROUPS = ['models', 'audio'];
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 10000;
 const MAX_ARCHIVE_FILE_BYTES = 512 * 1024 * 1024;
@@ -158,13 +159,13 @@ async function createSiteBackupUnlocked(uploadsRootDir) {
     let temporary = null;
 
     try {
-        const uploadedFiles = listFiles(path.join(uploadsRoot, 'models')).map(source => {
+        const uploadedFiles = UPLOAD_GROUPS.flatMap(group => listFiles(path.join(uploadsRoot, group)).map(source => {
             const relative = path.relative(uploadsRoot, source).split(path.sep).join('/');
             const filename = path.join(exportStaging, ...relative.split('/'));
             ensureDirectory(path.dirname(filename));
             fs.copyFileSync(source, filename);
             return { filename, relative };
-        });
+        }));
         const manifestFiles = [];
         await addArchiveFile(manifestFiles, 'database/factory.db', databaseFilename);
 
@@ -178,6 +179,7 @@ async function createSiteBackupUnlocked(uploadsRootDir) {
             version: SITE_BACKUP_VERSION,
             createdAt: createdAt.toISOString(),
             databaseType: 'sqlite',
+            uploadGroups: UPLOAD_GROUPS,
             uploadedFileCount: uploadedFiles.length,
             files: manifestFiles
         };
@@ -236,6 +238,12 @@ function validateManifest(manifest) {
     if (manifest.databaseType !== 'sqlite' || !Array.isArray(manifest.files)) {
         throw new Error('整站备份清单不完整');
     }
+    if (manifest.uploadGroups !== undefined) {
+        if (!Array.isArray(manifest.uploadGroups)
+            || manifest.uploadGroups.some(group => !UPLOAD_GROUPS.includes(String(group)))) {
+            throw new Error('整站备份上传目录清单不合法');
+        }
+    }
     const declared = new Map();
     let totalSize = 0;
     for (const file of manifest.files) {
@@ -246,7 +254,7 @@ function validateManifest(manifest) {
         if (!Number.isSafeInteger(size) || size < 0 || size > MAX_ARCHIVE_FILE_BYTES || !/^[a-f0-9]{64}$/.test(sha256)) {
             throw new Error(`整站备份文件校验信息无效: ${archivePath}`);
         }
-        if (archivePath !== 'database/factory.db' && !archivePath.startsWith('uploads/models/')) {
+        if (archivePath !== 'database/factory.db' && !UPLOAD_GROUPS.some(group => archivePath.startsWith(`uploads/${group}/`))) {
             throw new Error(`整站备份包含不允许恢复的文件: ${archivePath}`);
         }
         totalSize += size;
@@ -351,20 +359,30 @@ async function restoreSiteBackupUnlocked(archiveFilename, uploadsRootDir) {
     ensureDirectory(SITE_IMPORT_DIR);
     const stagingDirectory = path.join(SITE_IMPORT_DIR, `restore-${timestampToken()}-${process.pid}`);
     const uploadsRoot = path.resolve(uploadsRootDir);
-    const modelsDirectory = path.join(uploadsRoot, 'models');
-    const rollbackModels = path.join(stagingDirectory, 'rollback-models');
+    const rollbackUploads = path.join(stagingDirectory, 'rollback-uploads');
     let uploadsMutationStarted = false;
+    let uploadGroupsToRestore = ['models'];
     ensureDirectory(stagingDirectory);
 
     try {
         const { manifest, databaseFilename } = await extractValidatedArchive(path.resolve(archiveFilename), stagingDirectory);
-        if (fs.existsSync(modelsDirectory)) fs.cpSync(modelsDirectory, rollbackModels, { recursive: true });
+        uploadGroupsToRestore = Array.isArray(manifest.uploadGroups)
+            ? [...new Set(manifest.uploadGroups.filter(group => UPLOAD_GROUPS.includes(group)))]
+            : ['models'];
+        for (const group of uploadGroupsToRestore) {
+            const currentDirectory = path.join(uploadsRoot, group);
+            const rollbackDirectory = path.join(rollbackUploads, group);
+            if (fs.existsSync(currentDirectory)) fs.cpSync(currentDirectory, rollbackDirectory, { recursive: true });
+        }
 
         uploadsMutationStarted = true;
-        fs.rmSync(modelsDirectory, { recursive: true, force: true });
-        const restoredModels = path.join(stagingDirectory, 'uploads', 'models');
-        if (fs.existsSync(restoredModels)) fs.cpSync(restoredModels, modelsDirectory, { recursive: true });
-        ensureDirectory(modelsDirectory);
+        for (const group of uploadGroupsToRestore) {
+            const currentDirectory = path.join(uploadsRoot, group);
+            const restoredDirectory = path.join(stagingDirectory, 'uploads', group);
+            fs.rmSync(currentDirectory, { recursive: true, force: true });
+            if (fs.existsSync(restoredDirectory)) fs.cpSync(restoredDirectory, currentDirectory, { recursive: true });
+            ensureDirectory(currentDirectory);
+        }
 
         const imported = await importDatabaseBackupFile(databaseFilename, 'site-import');
         const databaseRestore = await restoreDatabaseBackup(imported.filename);
@@ -378,9 +396,13 @@ async function restoreSiteBackupUnlocked(archiveFilename, uploadsRootDir) {
         };
     } catch (error) {
         if (uploadsMutationStarted) {
-            fs.rmSync(modelsDirectory, { recursive: true, force: true });
-            if (fs.existsSync(rollbackModels)) fs.cpSync(rollbackModels, modelsDirectory, { recursive: true });
-            ensureDirectory(modelsDirectory);
+            for (const group of uploadGroupsToRestore) {
+                const currentDirectory = path.join(uploadsRoot, group);
+                const rollbackDirectory = path.join(rollbackUploads, group);
+                fs.rmSync(currentDirectory, { recursive: true, force: true });
+                if (fs.existsSync(rollbackDirectory)) fs.cpSync(rollbackDirectory, currentDirectory, { recursive: true });
+                ensureDirectory(currentDirectory);
+            }
         }
         throw error;
     } finally {

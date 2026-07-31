@@ -180,9 +180,29 @@ export const adminApi = {
     },
     async deleteDataPoint(id) { return readApiJson(await fetch(`${API_BASE}/datapoints/${pathId(id)}`, { method: 'DELETE' }), '删除点位失败') },
 
+    // 点位语音
+    async getSystemVoices() {
+        return readApiJson(await fetch(`${API_BASE}/voice/voices`), '读取系统语音失败')
+    },
+    async generateVoiceFile(data) {
+        return readApiJson(await fetch(`${API_BASE}/voice/generate`, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(data)
+        }), '生成语音文件失败')
+    },
+    async uploadVoiceFile(file) {
+        const formData = new FormData()
+        formData.append('audioFile', file)
+        return readApiJson(await fetch(`${API_BASE}/voice/upload`, { method: 'POST', body: formData }), '上传语音文件失败')
+    },
+
     // 设置
     async getSettings() { return (await fetch(`${API_BASE}/settings`)).json() },
     async saveSettings(data) { return readApiJson(await fetch(`${API_BASE}/settings`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存设置失败') },
+    async getRuntimeSettings() { return readApiJson(await fetch(`${API_BASE}/system/runtime`), '读取运行配置失败') },
+    async saveRuntimeSettings(data) { return readApiJson(await fetch(`${API_BASE}/system/runtime`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存运行配置失败') },
+    async rotateCastPin() { return readApiJson(await fetch(`${API_BASE}/system/runtime/rotate-pin`, { method: 'POST' }), '重新生成投屏码失败') },
     async getDatabaseConfig() { return (await fetch(`${API_BASE}/database/config`)).json() },
     async testDatabaseConfig(data) { return readApiJson(await fetch(`${API_BASE}/database/test`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '测试数据库连接失败') },
     async saveDatabaseConfig(data) { return readApiJson(await fetch(`${API_BASE}/database/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存数据库配置失败') },

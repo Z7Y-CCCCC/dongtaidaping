@@ -16,6 +16,8 @@ function isBlank(value) {
 
 const ALLOWED_DATA_TYPES = new Set(['BOOL', 'BYTE', 'WORD', 'INT', 'DWORD', 'DINT', 'REAL', 'LREAL', 'STRING', 'CHAR', 'DT', 'DTZ', 'DTL', 'DTLZ']);
 const ALLOWED_ACCESS_TYPES = new Set(['READ', 'READ_WRITE', 'WRITE']);
+const ALLOWED_VOICE_TRIGGERS = new Set(['change', 'rising', 'falling', 'equals', 'above', 'below']);
+const ALLOWED_VOICE_MODES = new Set(['tts', 'file', 'auto']);
 
 function simpleHash(value) {
     let hash = 0;
@@ -60,6 +62,55 @@ function roleFromUsage(usage, internalName) {
     if (usage === 'alarm_number_record') return 'num_record';
     if (usage === 'alarm_state_record') return 'state_record';
     return internalName;
+}
+
+function parseVoiceConfig(value) {
+    if (value === undefined || value === null || value === '') return { enabled: false, rules: [] };
+    if (typeof value === 'object') return value || { enabled: false, rules: [] };
+    try {
+        return JSON.parse(String(value));
+    } catch (error) {
+        throw new Error('语音播报配置 JSON 格式不正确');
+    }
+}
+
+function normalizeVoiceConfig(value) {
+    const source = parseVoiceConfig(value);
+    const sourceRules = Array.isArray(source) ? source : (Array.isArray(source.rules) ? source.rules : []);
+    const rules = sourceRules.slice(0, 12).map((rule, index) => {
+        const trigger = ALLOWED_VOICE_TRIGGERS.has(String(rule?.trigger || 'change'))
+            ? String(rule.trigger || 'change')
+            : 'change';
+        const mode = ALLOWED_VOICE_MODES.has(String(rule?.mode || 'auto'))
+            ? String(rule.mode || 'auto')
+            : 'auto';
+        const threshold = rule?.threshold === '' || rule?.threshold === undefined || rule?.threshold === null
+            ? null
+            : Number(rule.threshold);
+        const normalizedThreshold = Number.isFinite(threshold) ? threshold : null;
+        const cooldown = Number(rule?.cooldown_ms);
+        const volume = Number(rule?.volume);
+        const rate = Number(rule?.rate);
+        const audioUrl = String(rule?.audio_url || '').trim();
+        if (audioUrl && !audioUrl.startsWith('/uploads/audio/')) {
+            throw new Error('语音文件只能使用系统语音目录中的文件');
+        }
+        return {
+            id: String(rule?.id || `voice_${index + 1}`).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64) || `voice_${index + 1}`,
+            enabled: rule?.enabled !== false,
+            trigger,
+            threshold: normalizedThreshold,
+            mode,
+            text: String(rule?.text || '').trim().slice(0, 500),
+            audio_url: audioUrl,
+            cooldown_ms: Number.isFinite(cooldown) ? Math.max(0, Math.min(3600000, Math.round(cooldown))) : 10000,
+            volume: Number.isFinite(volume) ? Math.max(0, Math.min(1, volume)) : 1,
+            rate: Number.isFinite(rate) ? Math.max(0.5, Math.min(2, rate)) : 1,
+            voice_name: String(rule?.voice_name || '').trim().slice(0, 200),
+            announce_on_start: rule?.announce_on_start === true
+        };
+    });
+    return JSON.stringify({ enabled: source.enabled !== false && rules.some(rule => rule.enabled), rules });
 }
 
 function inferCategory(point, usage) {
@@ -107,6 +158,7 @@ function normalizePointPayload(point, fallback = '') {
         alarm_text: String(point.alarm_text || '').trim(),
         alarm_level: point.alarm_level || 'WARNING',
         alarm_condition: point.alarm_condition || '=1',
+        voice_config: normalizeVoiceConfig(point.voice_config),
         alarm_high: nullableNumber(point.alarm_high),
         alarm_low: nullableNumber(point.alarm_low)
     };
@@ -114,7 +166,13 @@ function normalizePointPayload(point, fallback = '') {
 
 function validatePointPayload(point, rowLabel = '点位') {
     const errors = [];
-    const normalized = normalizePointPayload(point, rowLabel);
+    let normalized;
+    try {
+        normalized = normalizePointPayload(point, rowLabel);
+    } catch (error) {
+        errors.push(`${rowLabel}: ${error.message}`);
+        return errors;
+    }
 
     if (isBlank(normalized.label)) errors.push(`${rowLabel}: 点位名称不能为空`);
 
@@ -192,8 +250,8 @@ router.post('/', async (req, res) => {
             quality, scale, offset, expression, display_format, unit,
             sample_interval_ms, access_type, db_number, db_byte_offset, bit_offset,
             point_kind, alarm_record_role, alarm_text, alarm_level, alarm_condition,
-            alarm_high, alarm_low
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+            voice_config, alarm_high, alarm_low
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
             device_id,
             point.name,
             point.label,
@@ -217,6 +275,7 @@ router.post('/', async (req, res) => {
             point.alarm_text,
             point.alarm_level,
             point.alarm_condition,
+            point.voice_config,
             point.alarm_high,
             point.alarm_low
         ]);
@@ -243,7 +302,7 @@ router.put('/:id', async (req, res) => {
             scale=?, offset=?, expression=?, display_format=?, unit=?, sample_interval_ms=?,
             access_type=?, db_number=?, db_byte_offset=?, bit_offset=?,
             point_kind=?, alarm_record_role=?, alarm_text=?, alarm_level=?, alarm_condition=?,
-            alarm_high=?, alarm_low=?
+            voice_config=?, alarm_high=?, alarm_low=?
             WHERE id=?`, [
             point.name,
             point.label,
@@ -267,6 +326,7 @@ router.put('/:id', async (req, res) => {
             point.alarm_text,
             point.alarm_level,
             point.alarm_condition,
+            point.voice_config,
             point.alarm_high,
             point.alarm_low,
             req.params.id
@@ -319,9 +379,9 @@ router.post('/batch', async (req, res) => {
                     device_id, name, label, plc_tag, data_type, category, value_role,
                     quality, scale, offset, expression, display_format, unit,
                     sample_interval_ms, access_type, db_number, db_byte_offset, bit_offset,
-                    point_kind, alarm_record_role, alarm_text, alarm_level, alarm_condition,
-                    alarm_high, alarm_low
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                point_kind, alarm_record_role, alarm_text, alarm_level, alarm_condition,
+                    voice_config, alarm_high, alarm_low
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                     device_id,
                     p.name,
                     p.label,
@@ -345,6 +405,7 @@ router.post('/batch', async (req, res) => {
                     p.alarm_text,
                     p.alarm_level,
                     p.alarm_condition,
+                    p.voice_config,
                     p.alarm_high,
                     p.alarm_low
                 ]);

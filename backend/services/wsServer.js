@@ -15,6 +15,7 @@ const { WebSocketServer } = require('ws');
 class WsServer {
     constructor() {
         this.wss = null;
+        this.wssInstances = new Set();
         this.clients = new Set();
         this.sequence = 0;
     }
@@ -23,13 +24,20 @@ class WsServer {
      * 将 WebSocket 绑定到已有的 HTTP Server 上
      * @param {http.Server} httpServer
      */
-    attach(httpServer) {
-        this.wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+    attach(httpServer, options = {}) {
+        const wss = new WebSocketServer({
+            server: httpServer,
+            path: '/ws',
+            verifyClient: options.verifyClient
+        });
+        this.wss = this.wss || wss;
+        this.wssInstances.add(wss);
 
-        this.wss.on('connection', (ws, req) => {
+        wss.on('connection', (ws, req) => {
             const clientIp = req.socket.remoteAddress;
-            console.log(`[WebSocket] 客户端已连接: ${clientIp} (当前 ${this.wss.clients.size} 个连接)`);
+            console.log(`[WebSocket] 客户端已连接: ${clientIp} (当前 ${this.clients.size + 1} 个连接)`);
             this.clients.add(ws);
+            options.onConnection?.(ws, req);
 
             ws.on('message', (msg) => {
                 try {
@@ -42,7 +50,8 @@ class WsServer {
 
             ws.on('close', () => {
                 this.clients.delete(ws);
-                console.log(`[WebSocket] 客户端断开: ${clientIp} (剩余 ${this.wss.clients.size} 个连接)`);
+                options.onClose?.(ws, req);
+                console.log(`[WebSocket] 客户端断开: ${clientIp} (剩余 ${this.clients.size} 个连接)`);
             });
 
             ws.on('error', (err) => {
@@ -58,6 +67,14 @@ class WsServer {
         });
 
         console.log('[WebSocket] 服务已启动，等待客户端连接 (路径: /ws)');
+        return wss;
+    }
+
+    detach(wss) {
+        if (!wss) return;
+        this.wssInstances.delete(wss);
+        if (this.wss === wss) this.wss = this.wssInstances.values().next().value || null;
+        try { wss.close(); } catch (error) { /* ignore */ }
     }
 
     /**
@@ -65,7 +82,7 @@ class WsServer {
      * @param {Array} deviceDataArray - 所有设备的实时数据数组
      */
     broadcastDeviceData(deviceDataArray) {
-        if (!this.wss || this.wss.clients.size === 0) return;
+        if (this.clients.size === 0) return;
         if (!Array.isArray(deviceDataArray) || deviceDataArray.length === 0) return;
 
         const message = JSON.stringify({
@@ -77,7 +94,7 @@ class WsServer {
             }
         });
 
-        this.wss.clients.forEach(client => {
+        this.clients.forEach(client => {
             if (client.readyState === 1) { // WebSocket.OPEN
                 client.send(message);
             }
@@ -88,13 +105,13 @@ class WsServer {
      * 广播 PLC/数据源连接状态
      */
     broadcastStatus(statusInfo) {
-        if (!this.wss || this.wss.clients.size === 0) return;
+        if (this.clients.size === 0) return;
 
         const message = JSON.stringify({
             type: 'plc_status',
             payload: statusInfo
         });
-        this.wss.clients.forEach(client => {
+        this.clients.forEach(client => {
             if (client.readyState === 1) {
                 client.send(message);
             }
@@ -105,10 +122,13 @@ class WsServer {
      * 关闭 WebSocket 服务
      */
     close() {
-        if (this.wss) {
-            this.wss.close();
-            console.log('[WebSocket] 服务已关闭');
+        for (const wss of this.wssInstances) {
+            try { wss.close(); } catch (error) { /* ignore */ }
         }
+        this.wssInstances.clear();
+        this.wss = null;
+        this.clients.clear();
+        console.log('[WebSocket] 服务已关闭');
     }
 }
 

@@ -1,12 +1,14 @@
 <script setup>
 import { ref, reactive, onMounted, onUnmounted, onActivated, onDeactivated, computed, watch, nextTick } from 'vue'
 import * as THREE from 'three'
+import QRCode from 'qrcode'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { adminApi } from '../config/factoryConfig.js'
 import { API_BASE } from '../runtime/backendEndpoint.js'
 import { SceneRuntime } from '../runtime/SceneRuntime.js'
 import { RENDER_PROFILE_OPTIONS, normalizeRenderSettings } from '../runtime/renderConfig.js'
+import { createVoiceAnnouncer, normalizeVoiceRule, parseVoiceConfig } from '../runtime/VoiceAnnouncer.js'
 import WidgetRenderer from '../runtime/WidgetRenderer.vue'
 import { createDeviceModel, resolveBackendAssetUrl } from '../three/ModelFactory.js'
 import {
@@ -367,6 +369,24 @@ const showPointAdvancedFields = ref(!!storedAdminUiState.showPointAdvancedFields
 const loadedPointDeviceIds = ref([])
 const alarmTextImportRaw = ref('')
 const alarmTextFileInput = ref(null)
+const selectedVoicePointIndex = ref(-1)
+const voiceFileInput = ref(null)
+const voiceUploadTarget = reactive({ pointIndex: -1, ruleIndex: -1 })
+const systemVoices = ref([])
+const systemVoicesLoaded = ref(false)
+const systemVoicesLoading = ref(false)
+const voiceGeneratingRuleId = ref('')
+const voiceUploadingRuleId = ref('')
+const voicePreviewAnnouncer = createVoiceAnnouncer()
+const voiceTriggerOptions = [
+    { value: 'change', label: '数值发生变化' },
+    { value: 'rising', label: '由关变开 / 0→1' },
+    { value: 'falling', label: '由开变关 / 1→0' },
+    { value: 'equals', label: '变为指定数值' },
+    { value: 'above', label: '向上跨过阈值' },
+    { value: 'below', label: '向下跨过阈值' }
+]
+const selectedVoicePoint = computed(() => dataPoints.value[selectedVoicePointIndex.value] || null)
 const pointUsageOptions = [
     { value: 'normal', label: '常规监控' },
     { value: 'alarm_trigger', label: '报警触发' },
@@ -418,6 +438,7 @@ function pointDisplayName(point = {}) {
 function normalizeLoadedPoint(point) {
     const usage = normalizePointUsage(point)
     const displayName = pointDisplayName(point)
+    const voiceConfig = parseVoiceConfig(point.voice_config)
     return {
         ...point,
         __usage: usage,
@@ -444,7 +465,171 @@ function normalizeLoadedPoint(point) {
         alarm_record_role: point.alarm_record_role || '',
         alarm_text: point.alarm_text || '',
         alarm_level: point.alarm_level || 'WARNING',
-        alarm_condition: point.alarm_condition || '=1'
+        alarm_condition: point.alarm_condition || '=1',
+        voice_config: point.voice_config || '',
+        __voiceRules: voiceConfig.rules.map((rule, index) => normalizeVoiceRule(rule, index))
+    }
+}
+
+function pointVoiceRules(point) {
+    if (!Array.isArray(point?.__voiceRules)) {
+        const config = parseVoiceConfig(point?.voice_config)
+        point.__voiceRules = config.rules.map((rule, index) => normalizeVoiceRule(rule, index))
+    }
+    return point.__voiceRules
+}
+
+function enabledVoiceRuleCount(point) {
+    return pointVoiceRules(point).filter(rule => rule.enabled).length
+}
+
+function voiceRuleId() {
+    return `voice_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
+}
+
+function defaultVoiceText(point) {
+    if (normalizePointUsage(point) === 'alarm_trigger' && point.alarm_text) {
+        return `{设备}：${point.alarm_text}`
+    }
+    return `{设备} ${pointDisplayName(point) || '点位'} 发生变化，当前值 {值}{单位}`
+}
+
+function addVoiceRule(point = selectedVoicePoint.value) {
+    if (!point) return
+    const trigger = isBoolPoint(point) || normalizePointUsage(point) === 'alarm_trigger' ? 'rising' : 'change'
+    pointVoiceRules(point).push(normalizeVoiceRule({
+        id: voiceRuleId(),
+        enabled: true,
+        trigger,
+        threshold: null,
+        mode: 'auto',
+        text: defaultVoiceText(point),
+        audio_url: '',
+        cooldown_ms: 10000,
+        volume: 1,
+        rate: 1,
+        voice_name: '',
+        announce_on_start: false
+    }))
+    markPointsDirty()
+}
+
+function removeVoiceRule(point, ruleIndex) {
+    pointVoiceRules(point).splice(ruleIndex, 1)
+    markPointsDirty()
+}
+
+async function loadSystemVoices() {
+    if (systemVoicesLoaded.value || systemVoicesLoading.value) return
+    systemVoicesLoading.value = true
+    try {
+        const result = await adminApi.getSystemVoices()
+        if (!result?.error && Array.isArray(result?.voices)) systemVoices.value = result.voices
+    } finally {
+        systemVoicesLoaded.value = true
+        systemVoicesLoading.value = false
+    }
+}
+
+function openVoiceConfig(pointIndex) {
+    selectedVoicePointIndex.value = pointIndex
+    loadSystemVoices()
+}
+
+function closeVoiceConfig() {
+    selectedVoicePointIndex.value = -1
+}
+
+function updateVoiceCooldown(rule, seconds) {
+    const value = Number(seconds)
+    rule.cooldown_ms = Number.isFinite(value) ? Math.max(0, Math.min(3600, value)) * 1000 : 10000
+    markPointsDirty()
+}
+
+function voiceRuleNeedsThreshold(rule) {
+    return ['equals', 'above', 'below'].includes(rule?.trigger)
+}
+
+function voiceRuleDeviceName(point) {
+    return devices.value.find(device => device.id === point?.device_id)?.name || point?.device_id || '示例设备'
+}
+
+function fillVoiceTemplate(text, point, sampleValue) {
+    const replacements = {
+        '{设备}': voiceRuleDeviceName(point),
+        '{点位}': pointDisplayName(point) || '示例点位',
+        '{值}': sampleValue,
+        '{单位}': point?.unit || '',
+        '{device}': voiceRuleDeviceName(point),
+        '{point}': pointDisplayName(point) || '示例点位',
+        '{value}': sampleValue,
+        '{unit}': point?.unit || ''
+    }
+    return Object.entries(replacements).reduce((result, [token, value]) => result.split(token).join(String(value ?? '')), String(text || ''))
+}
+
+async function previewVoiceRule(rule, point = selectedVoicePoint.value) {
+    if (!point) return
+    try {
+        const sampleValue = rule.threshold ?? (rule.trigger === 'falling' ? 0 : 1)
+        await voicePreviewAnnouncer.preview(rule, {
+            deviceName: voiceRuleDeviceName(point),
+            label: pointDisplayName(point),
+            value: sampleValue,
+            unit: point.unit || ''
+        })
+    } catch (error) {
+        await alert(`测试播报失败：${error.message}`, { title: '语音测试失败', type: 'danger' })
+    }
+}
+
+async function generateVoiceFile(rule, point = selectedVoicePoint.value) {
+    if (!point) return
+    const sampleValue = rule.threshold ?? (rule.trigger === 'falling' ? 0 : 1)
+    const text = fillVoiceTemplate(rule.text || defaultVoiceText(point), point, sampleValue).trim()
+    if (!text) return alert('请先填写播报文字', { title: '无法生成语音', type: 'warning' })
+    voiceGeneratingRuleId.value = rule.id
+    try {
+        const result = await adminApi.generateVoiceFile({
+            text,
+            voice_name: rule.voice_name || '',
+            rate: rule.rate,
+            volume: rule.volume
+        })
+        if (result?.error) return alert(result.error, { title: '语音生成失败', type: 'danger' })
+        rule.audio_url = result.url
+        rule.mode = 'file'
+        markPointsDirty()
+        await alert('WAV 语音文件已经生成并关联到本条规则。请继续点击“保存点位配置”。', { title: '语音已生成', type: 'success' })
+    } finally {
+        voiceGeneratingRuleId.value = ''
+    }
+}
+
+function selectVoiceFile(pointIndex, ruleIndex) {
+    voiceUploadTarget.pointIndex = pointIndex
+    voiceUploadTarget.ruleIndex = ruleIndex
+    voiceFileInput.value?.click()
+}
+
+async function handleVoiceFileChange(event) {
+    const file = event?.target?.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    const point = dataPoints.value[voiceUploadTarget.pointIndex]
+    if (!point) return
+    const rule = pointVoiceRules(point)[voiceUploadTarget.ruleIndex]
+    if (!rule) return
+    voiceUploadingRuleId.value = rule.id
+    try {
+        const result = await adminApi.uploadVoiceFile(file)
+        if (result?.error) return alert(result.error, { title: '语音上传失败', type: 'danger' })
+        rule.audio_url = result.url
+        rule.mode = 'file'
+        markPointsDirty()
+        await alert('语音文件已经上传并关联到本条规则。请继续点击“保存点位配置”。', { title: '上传成功', type: 'success' })
+    } finally {
+        voiceUploadingRuleId.value = ''
     }
 }
 
@@ -504,6 +689,8 @@ function addAlarmTriggerPoint() {
 }
 
 function removeDataPoint(idx) {
+    if (selectedVoicePointIndex.value === idx) closeVoiceConfig()
+    else if (selectedVoicePointIndex.value > idx) selectedVoicePointIndex.value -= 1
     dataPoints.value.splice(idx, 1)
     isPointsDirty.value = true
 }
@@ -789,13 +976,27 @@ function validatePointRows(points) {
         if (!allowedAccessTypes.includes(String(point.access_type || '').toUpperCase())) {
             errors.push(`第 ${row} 行：读写类型不正确`)
         }
+        const rules = pointVoiceRules(point)
+        if (rules.length > 12) errors.push(`第 ${row} 行：单个点位最多配置 12 条语音规则`)
+        rules.forEach((rule, ruleIndex) => {
+            if (!rule.enabled) return
+            if (!String(rule.text || '').trim() && !String(rule.audio_url || '').trim()) {
+                errors.push(`第 ${row} 行语音 ${ruleIndex + 1}：播报文字和语音文件至少填写一个`)
+            }
+            if (voiceRuleNeedsThreshold(rule) && !Number.isFinite(Number(rule.threshold))) {
+                errors.push(`第 ${row} 行语音 ${ruleIndex + 1}：当前触发方式必须填写阈值`)
+            }
+            if (rule.mode === 'file' && !String(rule.audio_url || '').trim()) {
+                errors.push(`第 ${row} 行语音 ${ruleIndex + 1}：文件播放模式尚未生成或上传语音文件`)
+            }
+        })
     })
 
     return errors
 }
 
 function buildDataPointPayload(point) {
-    const { id, device_id, alarm_high, alarm_low, __usage, __originalName, ...payload } = point
+    const { id, device_id, alarm_high, alarm_low, __usage, __originalName, __voiceRules, ...payload } = point
     const usage = normalizePointUsage({ ...point, __usage })
     const displayName = pointDisplayName(point)
     const internalName = String(payload.name || '').trim() || toInternalPointName(displayName, id || displayName)
@@ -824,7 +1025,11 @@ function buildDataPointPayload(point) {
         alarm_record_role: usage === 'alarm_trigger' || usage === 'normal' ? '' : fieldName,
         alarm_text: String(payload.alarm_text || '').trim(),
         alarm_level: payload.alarm_level || 'WARNING',
-        alarm_condition: payload.alarm_condition || '=1'
+        alarm_condition: payload.alarm_condition || '=1',
+        voice_config: JSON.stringify({
+            enabled: pointVoiceRules(point).some(rule => rule.enabled),
+            rules: pointVoiceRules(point).map((rule, index) => normalizeVoiceRule(rule, index))
+        })
     }
 }
 
@@ -1060,6 +1265,154 @@ const selectedRenderProfile = computed(() => (
     || renderProfileOptions.find(item => item.value === 'balanced')
 ))
 
+// ============ 桌面运行与局域网投屏 ============
+const runtimeSettings = reactive({
+    auto_start_enabled: true,
+    auto_start_supported: false,
+    packaged: false,
+    lan_display_enabled: false,
+    lan_display_port: 8787,
+    lan_display_pin: ''
+})
+const runtimeStatus = reactive({
+    enabled: false,
+    running: false,
+    port: 8787,
+    pin: '',
+    urls: [],
+    pairingUrls: [],
+    clients: 0,
+    error: '',
+    note: ''
+})
+const runtimeSaving = ref(false)
+const runtimeMessage = ref('')
+const runtimeQrDataUrl = ref('')
+let runtimeRefreshTimer = null
+const firstCastPairingUrl = computed(() => runtimeStatus.pairingUrls?.[0] || '')
+
+async function refreshRuntimeQr() {
+    if (!firstCastPairingUrl.value) {
+        runtimeQrDataUrl.value = ''
+        return
+    }
+    try {
+        runtimeQrDataUrl.value = await QRCode.toDataURL(firstCastPairingUrl.value, {
+            width: 240,
+            margin: 1,
+            errorCorrectionLevel: 'M'
+        })
+    } catch (error) {
+        runtimeQrDataUrl.value = ''
+        runtimeMessage.value = `二维码生成失败：${error.message || error}`
+    }
+}
+
+async function loadRuntimeSettings({ silent = false } = {}) {
+    try {
+        const result = await adminApi.getRuntimeSettings()
+        if (result?.error) throw new Error(result.error)
+        Object.assign(runtimeSettings, {
+            auto_start_enabled: result.auto_start_enabled !== false,
+            auto_start_supported: result.auto_start_supported === true,
+            packaged: result.packaged === true,
+            lan_display_enabled: result.lan_display_enabled === true,
+            lan_display_port: Number(result.lan_display_port || result.lan_display?.port || 8787),
+            lan_display_pin: String(result.lan_display_pin || result.lan_display?.pin || '')
+        })
+        Object.assign(runtimeStatus, result.lan_display || {}, {
+            urls: result.lan_display?.urls || [],
+            pairingUrls: result.lan_display?.pairingUrls || []
+        })
+        await refreshRuntimeQr()
+        return result
+    } catch (error) {
+        if (!silent) runtimeMessage.value = `运行配置读取失败：${error.message || error}`
+        return null
+    }
+}
+
+async function saveRuntimeSettings() {
+    runtimeSaving.value = true
+    runtimeMessage.value = '正在保存运行配置...'
+    try {
+        const result = await adminApi.saveRuntimeSettings({
+            auto_start_enabled: runtimeSettings.auto_start_enabled,
+            lan_display_enabled: runtimeSettings.lan_display_enabled,
+            lan_display_port: runtimeSettings.lan_display_port,
+            lan_display_pin: runtimeSettings.lan_display_pin
+        })
+        if (result?.error) throw new Error(result.error)
+        Object.assign(runtimeSettings, {
+            auto_start_enabled: result.auto_start_enabled !== false,
+            auto_start_supported: result.auto_start_supported === true,
+            packaged: result.packaged === true,
+            lan_display_enabled: result.lan_display_enabled === true,
+            lan_display_port: Number(result.lan_display_port || 8787),
+            lan_display_pin: String(result.lan_display_pin || '')
+        })
+        Object.assign(runtimeStatus, result.lan_display || {})
+        await refreshRuntimeQr()
+        runtimeMessage.value = runtimeSettings.lan_display_enabled
+            ? '运行配置已保存，投屏服务已按新配置启动。'
+            : '运行配置已保存，局域网投屏当前已关闭。'
+    } catch (error) {
+        runtimeMessage.value = `运行配置保存失败：${error.message || error}`
+    } finally {
+        runtimeSaving.value = false
+    }
+}
+
+async function rotateCastPin() {
+    if (!(await confirm('重新生成后，之前分享的投屏二维码和地址会立即失效，确定继续吗？'))) return
+    runtimeSaving.value = true
+    runtimeMessage.value = '正在生成新的投屏码...'
+    try {
+        const result = await adminApi.rotateCastPin()
+        if (result?.error) throw new Error(result.error)
+        runtimeSettings.lan_display_pin = String(result.lan_display_pin || result.lan_display?.pin || '')
+        Object.assign(runtimeStatus, result.lan_display || {})
+        await refreshRuntimeQr()
+        runtimeMessage.value = '投屏码已更新，旧设备会被要求重新授权。'
+    } catch (error) {
+        runtimeMessage.value = `投屏码更新失败：${error.message || error}`
+    } finally {
+        runtimeSaving.value = false
+    }
+}
+
+async function copyCastUrl(url) {
+    if (!url) return
+    try {
+        if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(url)
+        } else {
+            const input = document.createElement('textarea')
+            input.value = url
+            input.style.position = 'fixed'
+            input.style.opacity = '0'
+            document.body.appendChild(input)
+            input.select()
+            document.execCommand('copy')
+            input.remove()
+        }
+        runtimeMessage.value = '投屏地址已复制。'
+    } catch (error) {
+        runtimeMessage.value = `复制失败，请手动选择地址：${url}`
+    }
+}
+
+function startRuntimeRefresh() {
+    if (runtimeRefreshTimer) clearInterval(runtimeRefreshTimer)
+    runtimeRefreshTimer = setInterval(() => loadRuntimeSettings({ silent: true }), 5000)
+    runtimeRefreshTimer.unref?.()
+}
+
+function stopRuntimeRefresh() {
+    if (runtimeRefreshTimer) clearInterval(runtimeRefreshTimer)
+    runtimeRefreshTimer = null
+}
+
 async function loadSettings() {
     const s = await adminApi.getSettings()
     if (s.data_mode !== 'simulation') s.data_mode = 'integrated_plc'
@@ -1069,6 +1422,7 @@ async function loadSettings() {
     settings.render_scale = Number(settings.render_scale || 1)
     settings.render_label_fps = Number(settings.render_label_fps || 12)
     settings.render_antialias = ['1', 'true', 'yes', 'on'].includes(String(settings.render_antialias).toLowerCase())
+    await loadRuntimeSettings({ silent: true })
     await loadDatabaseConfig()
     // 同时获取引擎状态
     loadEngineStatus()
@@ -4316,6 +4670,7 @@ watch([
 onMounted(async () => {
     await loadWorkshops()
     await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform()])
+    startRuntimeRefresh()
     if (!newLine.workshop_id && workshops.value.length > 0) {
         newLine.workshop_id = workshops.value[0].id
     }
@@ -4351,6 +4706,7 @@ onDeactivated(() => {
 })
 
 onUnmounted(() => {
+    stopRuntimeRefresh()
     finishLinePreviewDrag()
     cancelLineDeviceDrag()
     cancelLineDevicePoolMove()
@@ -6734,7 +7090,7 @@ const mainTabs = [
                                         <th v-if="showPointAdvancedFields" title="倍率换算后再加上的修正值，常用于传感器零点校准">偏移修正</th>
                                         <th v-if="showPointAdvancedFields" title="可选高级换算，x 代表倍率和偏移后的值，例如 x/10">自定义公式</th>
                                         <th v-if="showPointAdvancedFields" title="控制画面显示的小数位，例如 0、0.0、0.00">显示小数</th>
-                                        <th>单位</th><th>报警说明</th><th></th>
+                                        <th>单位</th><th>报警说明</th><th>语音播报</th><th></th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -6774,14 +7130,115 @@ const mainTabs = [
                                             <input v-if="normalizePointUsage(p) === 'alarm_trigger'" v-model="p.alarm_text" @input="markPointsDirty" class="input input-sm alarm-text-input" placeholder="报警说明" />
                                             <span v-else class="muted-cell">-</span>
                                         </td>
+                                        <td>
+                                            <button @click="openVoiceConfig(idx)" class="btn btn-sm voice-config-button" :class="{ configured: enabledVoiceRuleCount(p) > 0 }">
+                                                {{ enabledVoiceRuleCount(p) > 0 ? `${enabledVoiceRuleCount(p)} 条` : '配置' }}
+                                            </button>
+                                        </td>
                                         <td><button @click="removeDataPoint(idx)" class="btn btn-danger btn-sm">✕</button></td>
                                     </tr>
                                     <tr v-if="dataPoints.length === 0">
-                                        <td :colspan="(showPointAdvancedFields ? 12 : 8) + (isAllPointsMode ? 1 : 0)" style="text-align:center; padding: 20px; color: #86868b;">暂无点位配置，请手动添加或从其他设备复制。</td>
+                                        <td :colspan="(showPointAdvancedFields ? 14 : 10) + (isAllPointsMode ? 1 : 0)" style="text-align:center; padding: 20px; color: #86868b;">暂无点位配置，请手动添加或从其他设备复制。</td>
                                     </tr>
                                 </tbody>
                             </table>
                         </div>
+
+                        <Transition name="modal-fade">
+                            <div v-if="selectedVoicePoint" class="modal-overlay" @click.self="closeVoiceConfig">
+                                <div class="modal-box voice-config-modal">
+                                    <div class="voice-modal-header">
+                                        <div>
+                                            <h3>点位语音播报</h3>
+                                            <p>{{ voiceRuleDeviceName(selectedVoicePoint) }} / {{ pointDisplayName(selectedVoicePoint) || '未命名点位' }}</p>
+                                        </div>
+                                        <button @click="closeVoiceConfig" class="btn btn-sm">关闭</button>
+                                    </div>
+
+                                    <div class="voice-config-help">
+                                        <strong>推荐：</strong>普通报警点使用“0→1”，恢复提示使用“1→0”；温度、压力等模拟量使用“向上/向下跨过阈值”。
+                                        文字转语音可以带 <code>{设备}</code>、<code>{点位}</code>、<code>{值}</code>、<code>{单位}</code>；生成的 WAV 是固定内容，更适合要求声音完全一致的现场。
+                                    </div>
+
+                                    <div v-if="pointVoiceRules(selectedVoicePoint).length === 0" class="voice-empty-state">
+                                        当前点位还没有语音规则。
+                                    </div>
+
+                                    <div v-for="(rule, ruleIndex) in pointVoiceRules(selectedVoicePoint)" :key="rule.id" class="voice-rule-card">
+                                        <div class="voice-rule-card-header">
+                                            <label class="inline-check">
+                                                <input v-model="rule.enabled" type="checkbox" @change="markPointsDirty" />
+                                                启用第 {{ ruleIndex + 1 }} 条规则
+                                            </label>
+                                            <button @click="removeVoiceRule(selectedVoicePoint, ruleIndex)" class="btn btn-danger btn-sm">删除规则</button>
+                                        </div>
+
+                                        <div class="voice-rule-grid">
+                                            <label>触发方式
+                                                <select v-model="rule.trigger" @change="markPointsDirty" class="input">
+                                                    <option v-for="item in voiceTriggerOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
+                                                </select>
+                                            </label>
+                                            <label v-if="voiceRuleNeedsThreshold(rule)">触发阈值
+                                                <input v-model.number="rule.threshold" @input="markPointsDirty" type="number" step="0.001" class="input" placeholder="例如 850" />
+                                            </label>
+                                            <label>播放方式
+                                                <select v-model="rule.mode" @change="markPointsDirty" class="input">
+                                                    <option value="auto">自动（有文件播文件，否则文字转语音）</option>
+                                                    <option value="tts">系统文字转语音</option>
+                                                    <option value="file">固定语音文件</option>
+                                                </select>
+                                            </label>
+                                            <label>系统声音
+                                                <select v-model="rule.voice_name" @change="markPointsDirty" class="input">
+                                                    <option value="">系统默认声音</option>
+                                                    <option v-for="voice in systemVoices" :key="voice.name" :value="voice.name">{{ voice.name }}（{{ voice.culture || '系统' }}）</option>
+                                                </select>
+                                            </label>
+                                            <label>冷却时间（秒）
+                                                <input :value="Number(rule.cooldown_ms || 0) / 1000" @input="updateVoiceCooldown(rule, $event.target.value)" type="number" min="0" max="3600" step="1" class="input" />
+                                            </label>
+                                            <label>语速（0.5-2）
+                                                <input v-model.number="rule.rate" @input="markPointsDirty" type="number" min="0.5" max="2" step="0.1" class="input" />
+                                            </label>
+                                            <label>音量（0-1）
+                                                <input v-model.number="rule.volume" @input="markPointsDirty" type="number" min="0" max="1" step="0.1" class="input" />
+                                            </label>
+                                            <label class="inline-check voice-startup-check">
+                                                <input v-model="rule.announce_on_start" type="checkbox" @change="markPointsDirty" />
+                                                软件启动时若条件已经成立，也播报一次
+                                            </label>
+                                        </div>
+
+                                        <label class="voice-text-label">播报文字
+                                            <textarea v-model="rule.text" @input="markPointsDirty" class="input voice-rule-text" placeholder="例如：{设备} 循环风扇冷却水流量低，请检查。"></textarea>
+                                        </label>
+
+                                        <div class="voice-file-row">
+                                            <div class="voice-file-path">
+                                                <span>语音文件</span>
+                                                <code>{{ rule.audio_url || '未生成或上传（当前使用系统文字转语音）' }}</code>
+                                            </div>
+                                            <div class="voice-rule-actions">
+                                                <button @click="previewVoiceRule(rule, selectedVoicePoint)" class="btn">测试播报</button>
+                                                <button @click="generateVoiceFile(rule, selectedVoicePoint)" class="btn btn-primary" :disabled="voiceGeneratingRuleId === rule.id">
+                                                    {{ voiceGeneratingRuleId === rule.id ? '生成中...' : '生成 WAV' }}
+                                                </button>
+                                                <button @click="selectVoiceFile(selectedVoicePointIndex, ruleIndex)" class="btn" :disabled="voiceUploadingRuleId === rule.id">
+                                                    {{ voiceUploadingRuleId === rule.id ? '上传中...' : '上传语音文件' }}
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div class="modal-actions voice-modal-actions">
+                                        <button @click="addVoiceRule(selectedVoicePoint)" class="btn btn-primary">+ 添加播报规则</button>
+                                        <button @click="closeVoiceConfig" class="btn">完成配置</button>
+                                    </div>
+                                    <input ref="voiceFileInput" type="file" accept=".wav,.mp3,.ogg,.m4a,audio/*" style="display:none" @change="handleVoiceFileChange" />
+                                </div>
+                            </div>
+                        </Transition>
 
                         <div style="margin-top:15px;display:flex; justify-content: space-between; align-items: center;">
                             <div style="display:flex; gap:10px; flex-wrap:wrap;">
@@ -7053,6 +7510,86 @@ const mainTabs = [
                                         <small>{{ new Date(backup.createdAt).toLocaleString() }} · {{ formatBackupSize(backup.size) }} · 重新保存</small>
                                     </button>
                                 </div>
+                            </div>
+                        </div>
+
+                        <!-- ===== 运行与投屏 ===== -->
+                        <div class="settings-section runtime-settings-section">
+                            <h3 class="section-title">运行与投屏</h3>
+                            <div class="runtime-settings-grid">
+                                <section class="runtime-card">
+                                    <div class="runtime-card-heading">
+                                        <div>
+                                            <strong>Windows 登录后自动启动</strong>
+                                            <p>现场电脑登录 Windows 后自动打开大屏和本地数据服务。</p>
+                                        </div>
+                                        <span class="runtime-badge" :class="runtimeSettings.auto_start_supported ? 'is-supported' : 'is-muted'">
+                                            {{ runtimeSettings.auto_start_supported ? '安装版可用' : '开发版不注册' }}
+                                        </span>
+                                    </div>
+                                    <label class="runtime-toggle-row">
+                                        <input v-model="runtimeSettings.auto_start_enabled" type="checkbox" :disabled="!runtimeSettings.auto_start_supported" />
+                                        <span class="runtime-toggle-track"><span></span></span>
+                                        <span>{{ runtimeSettings.auto_start_enabled ? '已开启' : '已关闭' }}</span>
+                                    </label>
+                                    <p class="runtime-help">
+                                        安装版保存后由桌面程序立即同步到 Windows 登录项；开发环境只保存配置，不会修改当前电脑的自启动项。
+                                    </p>
+                                </section>
+
+                                <section class="runtime-card cast-runtime-card">
+                                    <div class="runtime-card-heading">
+                                        <div>
+                                            <strong>内置局域网投屏</strong>
+                                            <p>电视打开浏览器扫描二维码即可显示实时大屏，不需要额外安装投屏软件。</p>
+                                        </div>
+                                        <span class="runtime-badge" :class="runtimeStatus.running ? 'is-supported' : 'is-muted'">
+                                            {{ runtimeStatus.running ? `运行中 · ${runtimeStatus.clients || 0} 台` : '未运行' }}
+                                        </span>
+                                    </div>
+                                    <label class="runtime-toggle-row">
+                                        <input v-model="runtimeSettings.lan_display_enabled" type="checkbox" />
+                                        <span class="runtime-toggle-track"><span></span></span>
+                                        <span>{{ runtimeSettings.lan_display_enabled ? '已开启' : '已关闭' }}</span>
+                                    </label>
+                                    <div class="runtime-inline-fields">
+                                        <label>端口
+                                            <input v-model.number="runtimeSettings.lan_display_port" class="input" type="number" min="1024" max="65535" />
+                                        </label>
+                                        <label>投屏码
+                                            <input :value="runtimeSettings.lan_display_pin" class="input runtime-pin-input" readonly />
+                                        </label>
+                                        <button class="btn btn-small" type="button" @click="rotateCastPin" :disabled="runtimeSaving">重新生成</button>
+                                    </div>
+                                </section>
+                            </div>
+
+                            <div class="runtime-cast-panel">
+                                <div class="runtime-cast-header">
+                                    <div>
+                                        <strong>电视连接入口</strong>
+                                        <p v-if="runtimeStatus.running">用电视浏览器打开下方地址，或扫描二维码；首次连接输入 6 位投屏码。</p>
+                                        <p v-else>开启并保存后，这里会显示局域网地址和二维码。</p>
+                                    </div>
+                                    <button class="btn btn-primary" type="button" @click="saveRuntimeSettings" :disabled="runtimeSaving">
+                                        {{ runtimeSaving ? '保存中...' : '保存运行配置' }}
+                                    </button>
+                                </div>
+                                <div v-if="runtimeStatus.running" class="runtime-cast-content">
+                                    <div v-if="runtimeQrDataUrl" class="runtime-qr-block">
+                                        <img :src="runtimeQrDataUrl" alt="局域网投屏二维码" />
+                                        <small>扫码直达大屏</small>
+                                    </div>
+                                    <div class="runtime-url-block">
+                                        <div v-for="url in (runtimeStatus.pairingUrls.length ? runtimeStatus.pairingUrls : runtimeStatus.urls)" :key="url" class="runtime-url-row">
+                                            <code>{{ url }}</code>
+                                            <button class="btn btn-small" type="button" @click="copyCastUrl(url)">复制</button>
+                                        </div>
+                                        <p class="runtime-help">电脑与电视必须在同一局域网；电视需要现代浏览器和 WebGL。没有浏览器的普通电视仍需 HDMI、Miracast 接收器或电视盒子。</p>
+                                    </div>
+                                </div>
+                                <p v-if="runtimeStatus.error" class="runtime-error">{{ runtimeStatus.error }}</p>
+                                <p v-if="runtimeMessage" class="runtime-message">{{ runtimeMessage }}</p>
                             </div>
                         </div>
 
@@ -8669,8 +9206,8 @@ button:enabled:active {
     justify-content: flex-end;
     margin: 0 0 10px;
 }
-.points-table { min-width: 1080px; }
-.points-table.points-table-advanced { min-width: 1480px; }
+.points-table { min-width: 1180px; }
+.points-table.points-table-advanced { min-width: 1580px; }
 .points-table td { padding: 10px 6px; }
 .points-table .input-sm { width: 100%; }
 .points-table .number-input { width: 90px; }
@@ -8684,6 +9221,98 @@ button:enabled:active {
 .points-table .unit-input { width: 80px; }
 .points-table .alarm-text-input { min-width: 180px; }
 .points-table .device-point-select { min-width: 180px; }
+.voice-config-button { min-width: 70px; white-space: nowrap; }
+.voice-config-button.configured {
+    color: #116a38;
+    border-color: rgba(52, 199, 89, 0.34);
+    background: rgba(52, 199, 89, 0.10);
+}
+.voice-config-modal { width: min(1040px, calc(100vw - 48px)); }
+.voice-modal-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 20px;
+    margin-bottom: 16px;
+}
+.voice-modal-header h3 { margin-bottom: 6px; }
+.voice-modal-header p { margin: 0; color: #6e6e73; font-size: 13px; }
+.voice-config-help {
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    color: #515154;
+    background: #f5f7fa;
+    border: 1px solid rgba(0, 113, 227, 0.12);
+    border-radius: 10px;
+    font-size: 13px;
+    line-height: 1.7;
+}
+.voice-config-help code { color: #7d2358; }
+.voice-empty-state {
+    padding: 28px;
+    margin-bottom: 16px;
+    text-align: center;
+    color: #86868b;
+    border: 1px dashed rgba(0, 0, 0, 0.16);
+    border-radius: 12px;
+}
+.voice-rule-card {
+    padding: 18px;
+    margin-bottom: 16px;
+    background: #fbfbfd;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    border-radius: 14px;
+}
+.voice-rule-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 14px;
+}
+.voice-rule-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+}
+.voice-rule-grid > label,
+.voice-text-label {
+    display: grid;
+    gap: 6px;
+    color: #515154;
+    font-size: 12px;
+}
+.voice-startup-check { align-self: end; min-height: 38px; }
+.voice-rule-text {
+    width: 100%;
+    min-height: 74px;
+    margin-top: 6px;
+    resize: vertical;
+    line-height: 1.55;
+}
+.voice-file-row {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 14px;
+}
+.voice-file-path {
+    min-width: 0;
+    display: grid;
+    gap: 5px;
+    color: #6e6e73;
+    font-size: 12px;
+}
+.voice-file-path code {
+    max-width: 520px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #515154;
+}
+.voice-rule-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.voice-modal-actions { justify-content: space-between; }
 .muted-cell { color: #86868b; font-size: 12px; }
 .alarm-config-card {
     margin-top: 18px;
@@ -9984,6 +10613,38 @@ button:enabled:active {
 .site-backup-history-item:hover:not(:disabled) { background: #f5f5f7; border-color: #e2e2e5; }
 .site-backup-history-item strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .site-backup-history-item small { flex: 0 0 auto; color: #6e6e73; font-size: 11px; }
+.runtime-settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.runtime-card { min-width: 0; padding: 18px; background: #ffffff; border: 1px solid #e5e5e7; border-radius: 10px; }
+.runtime-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.runtime-card-heading strong { color: #1d1d1f; font-size: 14px; }
+.runtime-card-heading p { margin: 6px 0 0; color: #6e6e73; font-size: 12px; line-height: 1.55; }
+.runtime-badge { flex: 0 0 auto; padding: 4px 8px; border-radius: 999px; font-size: 11px; white-space: nowrap; }
+.runtime-badge.is-supported { color: #176b3a; background: #e8f7ee; }
+.runtime-badge.is-muted { color: #6e6e73; background: #f0f0f2; }
+.runtime-toggle-row { display: inline-flex !important; flex-direction: row !important; align-items: center; gap: 9px !important; margin-top: 16px; color: #1d1d1f !important; font-size: 13px !important; cursor: pointer; }
+.runtime-toggle-row input { position: absolute; opacity: 0; pointer-events: none; }
+.runtime-toggle-track { position: relative; width: 38px; height: 22px; flex: 0 0 auto; border-radius: 999px; background: #c7c7cc; transition: background-color 160ms ease; }
+.runtime-toggle-track span { position: absolute; left: 3px; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: #ffffff; box-shadow: 0 1px 3px #0003; transition: transform 160ms ease; }
+.runtime-toggle-row input:checked + .runtime-toggle-track { background: #24834f; }
+.runtime-toggle-row input:checked + .runtime-toggle-track span { transform: translateX(16px); }
+.runtime-toggle-row input:disabled + .runtime-toggle-track { opacity: .55; }
+.runtime-help { margin: 12px 0 0; color: #86868b; font-size: 12px; line-height: 1.55; }
+.runtime-inline-fields { display: grid; grid-template-columns: minmax(100px, .8fr) minmax(120px, 1fr) auto; align-items: end; gap: 10px; margin-top: 16px; }
+.runtime-inline-fields label { display: flex; flex-direction: column; gap: 6px; color: #515154; font-size: 12px; font-weight: 500; }
+.runtime-pin-input { letter-spacing: 3px; font-family: SFMono-Regular, Consolas, Monaco, monospace; font-weight: 700; }
+.runtime-cast-panel { margin-top: 16px; padding: 18px; background: #f5f9fb; border: 1px solid #dcebf1; border-radius: 10px; }
+.runtime-cast-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.runtime-cast-header strong { color: #1d1d1f; font-size: 14px; }
+.runtime-cast-header p { margin: 6px 0 0; color: #515154; font-size: 12px; line-height: 1.55; }
+.runtime-cast-content { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 18px; align-items: center; margin-top: 16px; }
+.runtime-qr-block { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 8px; background: #ffffff; border-radius: 8px; }
+.runtime-qr-block img { display: block; width: 180px; height: 180px; image-rendering: pixelated; }
+.runtime-qr-block small { color: #6e6e73; font-size: 11px; }
+.runtime-url-block { min-width: 0; }
+.runtime-url-row { display: flex; align-items: center; gap: 8px; min-width: 0; margin-bottom: 8px; }
+.runtime-url-row code { flex: 1 1 auto; min-width: 0; overflow: auto; padding: 8px 10px; color: #1d4c62; background: #ffffff; border: 1px solid #dcebf1; border-radius: 6px; font-size: 11px; white-space: nowrap; }
+.runtime-error { margin: 14px 0 0; padding: 9px 11px; color: #8a1c14; background: #fff0ee; border-left: 3px solid #c9372c; font-size: 12px; line-height: 1.5; }
+.runtime-message { margin: 14px 0 0; color: #176b3a; font-size: 12px; line-height: 1.5; }
 .mode-hint { margin-top: 16px; padding: 16px 20px; background: rgba(0, 102, 204, 0.03); border: 1px solid rgba(0, 102, 204, 0.1); border-radius: 8px; }
 .mode-hint p { margin: 6px 0; font-size: 13px; color: #434345; line-height: 1.6; }
 .mode-hint code { background: rgba(0, 0, 0, 0.04); padding: 2px 6px; border-radius: 4px; font-size: 12px; color: #1d1d1f; }
@@ -10008,6 +10669,9 @@ button:enabled:active {
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 @media (max-width: 1180px) {
+    .runtime-settings-grid { grid-template-columns: 1fr; }
+    .runtime-cast-content { grid-template-columns: 1fr; }
+    .runtime-qr-block { justify-self: start; }
     .model-library-layout {
         grid-template-columns: 1fr;
     }
@@ -10040,6 +10704,9 @@ button:enabled:active {
     .device-group .data-table td:last-child {
         white-space: nowrap;
     }
+    .voice-rule-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .voice-file-row { align-items: stretch; flex-direction: column; }
+    .voice-rule-actions { justify-content: flex-start; }
 }
 
 @media (prefers-reduced-motion: reduce) {

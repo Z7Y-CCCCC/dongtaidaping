@@ -343,11 +343,16 @@ class PlcReader {
             data[category][fieldName] = value;
             data.quality[category][fieldName] = quality;
             data.pointMeta[`${category}.${fieldName}`] = {
+                id: point.id || '',
+                name: point.name || fieldName,
                 label: point.label,
+                category,
+                field_name: fieldName,
                 unit: point.unit || '',
                 display_format: point.display_format || '',
                 sample_interval_ms: this._resolveSampleInterval(point),
-                plc_address: point.plc_address || point.plc_tag || ''
+                plc_address: point.plc_address || point.plc_tag || '',
+                voice_config: point.voice_config || ''
             };
         });
 
@@ -366,11 +371,16 @@ class PlcReader {
                 patch[category][fieldName] = previous[category]?.[fieldName] ?? null;
                 patch.quality[category][fieldName] = 'bad';
                 patch.pointMeta[`${category}.${fieldName}`] = {
+                    id: point.id || '',
+                    name: point.name || fieldName,
                     label: point.label,
+                    category,
+                    field_name: fieldName,
                     unit: point.unit || '',
                     display_format: point.display_format || '',
                     sample_interval_ms: this._resolveSampleInterval(point),
-                    plc_address: point.plc_address || point.plc_tag || ''
+                    plc_address: point.plc_address || point.plc_tag || '',
+                    voice_config: point.voice_config || ''
                 };
             });
             deviceDataArray.push(this._mergeDevicePatch(deviceId, patch));

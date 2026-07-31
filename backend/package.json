@@ -8,7 +8,9 @@
     "dev": "node server.js",
     "test:plc": "node scripts/plc-integration-test.cjs",
     "test:recovery": "node scripts/power-recovery-test.cjs",
-    "test:site-backup": "node scripts/site-backup-test.cjs"
+    "test:site-backup": "node scripts/site-backup-test.cjs",
+    "test:voice": "node scripts/voice-feature-test.cjs",
+    "test:runtime": "node scripts/runtime-display-test.cjs"
   },
   "dependencies": {
     "archiver": "^7.0.1",

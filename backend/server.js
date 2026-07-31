@@ -38,13 +38,14 @@ const uploadsRootDir = process.env.UPLOADS_DIR
     ? path.resolve(process.env.UPLOADS_DIR)
     : path.join(__dirname, 'uploads');
 const uploadsDir = path.join(uploadsRootDir, 'models');
+const audioUploadsDir = path.join(uploadsRootDir, 'audio');
 const assetsDir = path.join(__dirname, 'assets');
 const assetModelsDir = path.join(assetsDir, 'models');
 const frontendDistDir = process.env.FRONTEND_DIST
     ? path.resolve(process.env.FRONTEND_DIST)
     : null;
 
-for (const dir of [uploadsDir, assetModelsDir]) {
+for (const dir of [uploadsDir, audioUploadsDir, assetModelsDir]) {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
     }
@@ -60,8 +61,13 @@ app.use('/api/workshops', require('./routes/workshops'));
 app.use('/api/lines', require('./routes/lines'));
 app.use('/api/devices', require('./routes/devices'));
 app.use('/api/datapoints', require('./routes/datapoints'));
+app.use('/api/voice', require('./routes/voice'));
 app.use('/api/settings', require('./routes/settings'));
 app.use('/api/platform', require('./routes/platform'));
+
+// 仅供 Electron 本机管理“登录后自启”和局域网投屏，路由内部会拒绝非回环请求。
+const runtimeController = { lanDisplay: null };
+app.use('/api/system/runtime', require('./routes/runtime')(runtimeController));
 
 const storage = multer.diskStorage({
     destination: uploadsDir,
@@ -471,6 +477,10 @@ async function startServer() {
     const wsServer = new WsServer();
     wsServer.attach(httpServer);
 
+    const LanDisplayService = require('./services/lanDisplay');
+    const lanDisplay = new LanDisplayService({ app, wsServer, primaryPort: PORT });
+    runtimeController.lanDisplay = lanDisplay;
+
     const DataEngine = require('./services/dataEngine');
     const dataEngine = new DataEngine(wsServer);
     global.dataEngine = dataEngine;
@@ -482,6 +492,7 @@ async function startServer() {
         const forceExit = setTimeout(() => process.exit(1), 12000);
         forceExit.unref?.();
         try { dataEngine.stop(); } catch (e) { /* ignore */ }
+        try { await lanDisplay.stop(); } catch (e) { /* ignore */ }
         try { wsServer.close(); } catch (e) { /* ignore */ }
         httpServer.close();
         try {
@@ -525,6 +536,7 @@ async function startServer() {
         setTimeout(() => {
             getDb()
                 .then(() => startDatabaseMaintenance())
+                .then(() => lanDisplay.loadFromSettings())
                 .then(() => dataEngine.start())
                 .catch((error) => {
                     console.error('[DataEngine] 启动失败:', error.message);

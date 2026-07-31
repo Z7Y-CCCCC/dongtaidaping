@@ -6,6 +6,7 @@ import { createDashboardDataStore } from './runtime/DataStore.js'
 import { getSceneCamera } from './runtime/LayoutConfig.js'
 import WidgetRenderer from './runtime/WidgetRenderer.vue'
 import { normalizeRenderSettings } from './runtime/renderConfig.js'
+import { createVoiceAnnouncer } from './runtime/VoiceAnnouncer.js'
 import {
   DEFAULT_DEVICE_LABEL_CONFIG,
   DEFAULT_DIAGNOSTIC_CONFIG,
@@ -27,6 +28,7 @@ let sceneRuntime = null
 let clockTimer = null
 
 const dataStore = createDashboardDataStore()
+const voiceAnnouncer = createVoiceAnnouncer()
 const {
   config: factoryConfig,
   loadConfig,
@@ -217,6 +219,10 @@ function controlCamera(action) {
   sceneRuntime?.controlCamera(action)
 }
 
+function unlockVoicePlayback() {
+  voiceAnnouncer.unlock()
+}
+
 function exposeDevRuntime() {
   if (!import.meta.env.DEV || typeof window === 'undefined') return
   window.__DASHBOARD_RUNTIME__ = sceneRuntime
@@ -248,6 +254,7 @@ onMounted(async () => {
   updateTime()
   clockTimer = setInterval(updateTime, 1000)
   await loadConfig()
+  voiceAnnouncer.setFactoryPoints(factoryConfig.workshops)
 
   const sceneCamera = getSceneCamera(platform.value)
   dataStore.setStaleMs(getSetting('realtime_stale_ms', sceneCamera.staleMs || 6000))
@@ -272,7 +279,10 @@ onMounted(async () => {
   } else {
     selectGlobal()
   }
-  dataStore.setDeviceDataHandler(data => sceneRuntime.applyDeviceData(data))
+  dataStore.setDeviceDataHandler(data => {
+    sceneRuntime.applyDeviceData(data)
+    voiceAnnouncer.handleDeviceData(data)
+  })
   dataStore.connect()
   dataStore.refreshEvents(true)
   dataStore.refreshMetrics(true)
@@ -280,6 +290,7 @@ onMounted(async () => {
   window.addEventListener('workshop-selected', handleWorkshopSelected)
   window.addEventListener('line-selected', handleLineSelected)
   window.addEventListener('factory-selected', handleFactorySelected)
+  window.addEventListener('pointerdown', unlockVoicePlayback, { passive: true })
 })
 
 onUnmounted(() => {
@@ -291,6 +302,7 @@ onUnmounted(() => {
   window.removeEventListener('workshop-selected', handleWorkshopSelected)
   window.removeEventListener('line-selected', handleLineSelected)
   window.removeEventListener('factory-selected', handleFactorySelected)
+  window.removeEventListener('pointerdown', unlockVoicePlayback)
 })
 </script>
 
