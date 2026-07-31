@@ -21,23 +21,27 @@
     }
 }
 
-/* 自定义现代美观极简滚动条 */
+/* 自定义现代美观滚动条 - 加粗易拖动 */
 ::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+    width: 10px;
+    height: 10px;
 }
 
 ::-webkit-scrollbar-track {
-    background: transparent;
+    background: rgba(0, 0, 0, 0.03);
+    border-radius: 8px;
 }
 
 ::-webkit-scrollbar-thumb {
-    background: rgba(120, 120, 128, 0.3);
-    border-radius: 6px;
+    background: rgba(120, 120, 128, 0.4);
+    border-radius: 8px;
+    border: 2px solid transparent;
+    background-clip: content-box;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-    background: rgba(120, 120, 128, 0.55);
+    background: #007aff;
+    background-clip: content-box;
 }
 
 ::-webkit-scrollbar-corner {
@@ -45,6 +49,6 @@
 }
 
 * {
-    scrollbar-width: thin;
-    scrollbar-color: rgba(120, 120, 128, 0.3) transparent;
+    scrollbar-width: auto;
+    scrollbar-color: rgba(120, 120, 128, 0.4) rgba(0, 0, 0, 0.03);
 }

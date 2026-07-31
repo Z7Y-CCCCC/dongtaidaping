@@ -3717,6 +3717,7 @@ const widgetTypeOptions = [
     { value: 'diagnostics', label: '诊断面板配置' },
     { value: 'line_overview_cards', label: '产线设备卡片配置' }
 ]
+const showCreateWidgetModal = ref(false)
 const newWidget = reactive({
     id: '',
     widget_type: 'text',
@@ -3730,6 +3731,25 @@ const newWidget = reactive({
     configText: '{\n  "text": "现场提示 {value}",\n  "tone": "normal"\n}',
     bindingText: '{\n  "path": "metrics.current_output"\n}'
 })
+
+function openCreateWidgetModal() {
+    newWidget.widget_type = 'text'
+    newWidget.id = `widget_${Date.now().toString(36)}`
+    newWidget.title = '自定义组件'
+    newWidget.x = 8
+    newWidget.y = 1
+    newWidget.w = 6
+    newWidget.h = 2
+    newWidget.sort_order = (platform.value.widgets?.length || 0) + 1
+    newWidget.visible = true
+    applyNewWidgetDefaults()
+    showCreateWidgetModal.value = true
+}
+
+async function handleCreateWidgetSubmit() {
+    await createWidget()
+    showCreateWidgetModal.value = false
+}
 
 function formatJsonForEditor(value) {
     return JSON.stringify(value || {}, null, 2)
@@ -7085,7 +7105,10 @@ const mainTabs = [
                     </div>
 
                     <div class="settings-section" style="margin-top:24px;">
-                        <h3 class="section-title">组件布局</h3>
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                            <h3 class="section-title" style="margin: 0;">组件布局</h3>
+                            <button @click="openCreateWidgetModal" class="btn btn-primary">+ 添加新组件</button>
+                        </div>
                         <div class="widget-layout-editor">
                             <div class="widget-layout-form">
                                 <div class="table-scroll">
@@ -7218,21 +7241,58 @@ const mainTabs = [
                             </div>
                         </Teleport>
                         </div>
-                        <div class="widget-create-row">
-                            <input v-model="newWidget.id" class="input" placeholder="组件ID，如 widget_text_notice" />
-                            <select v-model="newWidget.widget_type" @change="applyNewWidgetDefaults" class="input">
-                                <option v-for="type in widgetTypeOptions.filter(item => item.value !== 'navigation')" :key="type.value" :value="type.value">{{ type.label }}</option>
-                            </select>
-                            <input v-model="newWidget.title" class="input" placeholder="标题" />
-                            <input v-model.number="newWidget.x" type="number" class="input coord-input" placeholder="左" />
-                            <input v-model.number="newWidget.y" type="number" class="input coord-input" placeholder="上" />
-                            <input v-model.number="newWidget.w" type="number" class="input coord-input" placeholder="宽" />
-                            <input v-model.number="newWidget.h" type="number" class="input coord-input" placeholder="高" />
-                            <textarea v-model="newWidget.configText" class="input widget-json widget-json-large" title="组件配置 JSON" spellcheck="false"></textarea>
-                            <textarea v-model="newWidget.bindingText" class="input widget-json widget-json-large" title="数据绑定 JSON" spellcheck="false"></textarea>
-                            <button @click="createWidget" class="btn btn-primary">+ 新增组件</button>
-                        </div>
                     </div>
+
+                    <!-- 新增组件弹窗 -->
+                    <Transition name="modal-fade">
+                        <div v-if="showCreateWidgetModal" class="modal-overlay" @click.self="showCreateWidgetModal = false">
+                            <div class="modal-box widget-create-modal" style="max-width: 620px;">
+                                <div class="modal-header">
+                                    <h3>新增画面组件</h3>
+                                    <button class="modal-close-icon-btn" @click="showCreateWidgetModal = false" title="关闭">
+                                        <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                                            <path d="M3 3l10 10M13 3l-10 10"/>
+                                        </svg>
+                                    </button>
+                                </div>
+                                <div class="form-grid" style="grid-template-columns: 1fr 1fr; gap: 14px;">
+                                    <label>组件 ID
+                                        <input v-model="newWidget.id" class="input" placeholder="如 widget_text_notice" />
+                                    </label>
+                                    <label>组件类型
+                                        <select v-model="newWidget.widget_type" @change="applyNewWidgetDefaults" class="input">
+                                            <option v-for="type in widgetTypeOptions.filter(item => item.value !== 'navigation')" :key="type.value" :value="type.value">{{ type.label }}</option>
+                                        </select>
+                                    </label>
+                                    <label style="grid-column: span 2;">组件标题
+                                        <input v-model="newWidget.title" class="input" placeholder="如 生产指标概览" />
+                                    </label>
+                                    <div class="form-section" style="grid-column: span 2; margin: 4px 0 0;">
+                                        <div class="form-section-header">
+                                            <strong>栅格位置与尺寸</strong>
+                                            <span>网格列数与行数配置</span>
+                                        </div>
+                                        <div class="form-grid compact-form-grid" style="grid-template-columns: repeat(4, 1fr); gap: 10px;">
+                                            <label>左 (X)<input v-model.number="newWidget.x" type="number" class="input" placeholder="0" /></label>
+                                            <label>上 (Y)<input v-model.number="newWidget.y" type="number" class="input" placeholder="0" /></label>
+                                            <label>宽 (W)<input v-model.number="newWidget.w" type="number" class="input" placeholder="6" /></label>
+                                            <label>高 (H)<input v-model.number="newWidget.h" type="number" class="input" placeholder="4" /></label>
+                                        </div>
+                                    </div>
+                                    <label style="grid-column: span 2;">组件配置 JSON
+                                        <textarea v-model="newWidget.configText" class="input widget-json-textarea" placeholder="配置 JSON" spellcheck="false" style="height: 90px; font-family: SFMono-Regular, Consolas, monospace; font-size: 12px;"></textarea>
+                                    </label>
+                                    <label style="grid-column: span 2;">数据绑定 JSON
+                                        <textarea v-model="newWidget.bindingText" class="input widget-json-textarea" placeholder="数据绑定 JSON" spellcheck="false" style="height: 70px; font-family: SFMono-Regular, Consolas, monospace; font-size: 12px;"></textarea>
+                                    </label>
+                                </div>
+                                <div class="modal-actions" style="margin-top: 20px; display: flex; justify-content: flex-end; gap: 12px;">
+                                    <button @click="showCreateWidgetModal = false" class="btn">取消</button>
+                                    <button @click="handleCreateWidgetSubmit" class="btn btn-primary">确定添加</button>
+                                </div>
+                            </div>
+                        </div>
+                    </Transition>
 
                     <div class="settings-section" style="margin-top:24px;">
                         <h3 class="section-title">发布版本</h3>
@@ -9469,6 +9529,24 @@ button:enabled:active {
     width: 100%; overflow-x: auto; border-radius: 12px;
     border: 1px solid rgba(0, 0, 0, 0.06); background: #ffffff; margin-bottom: 20px;
 }
+.table-scroll::-webkit-scrollbar {
+    height: 12px;
+    width: 12px;
+}
+.table-scroll::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.04);
+    border-radius: 8px;
+}
+.table-scroll::-webkit-scrollbar-thumb {
+    background: rgba(120, 120, 128, 0.45);
+    border-radius: 8px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+}
+.table-scroll::-webkit-scrollbar-thumb:hover {
+    background: #007aff;
+    background-clip: content-box;
+}
 .point-toolbar {
     display: flex;
     justify-content: flex-end;
@@ -9635,7 +9713,20 @@ button:enabled:active {
     gap: 16px;
     margin-bottom: 14px;
 }
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+    width: 100%;
+}
+.modal-header h3 {
+    margin: 0 !important;
+}
 .modal-close-icon-btn {
+    position: absolute;
+    top: 20px;
+    right: 20px;
     width: 32px;
     height: 32px;
     padding: 0;
@@ -9643,8 +9734,19 @@ button:enabled:active {
     align-items: center;
     justify-content: center;
     border-radius: 50%;
-    font-size: 15px;
-    line-height: 1;
+    border: none;
+    background: rgba(0, 0, 0, 0.05);
+    color: #86868b;
+    cursor: pointer;
+    transition: all 0.18s ease;
+}
+.modal-close-icon-btn:hover {
+    background: rgba(0, 0, 0, 0.12);
+    color: #1d1d1f;
+    transform: scale(1.08);
+}
+.modal-close-icon-btn:active {
+    transform: scale(0.95);
 }
 .rule-delete-icon-btn {
     width: 30px;
