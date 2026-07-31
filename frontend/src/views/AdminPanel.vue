@@ -788,6 +788,26 @@ function autoConvertPlcTagForDataType(point) {
     }
 }
 
+function getPlcDuplicateWarning(point) {
+    if (!point || !point.plc_tag || !String(point.plc_tag).trim()) return ''
+    const tag = String(point.plc_tag).trim().toUpperCase()
+
+    const currentDeviceId = point.device_id || selectedDeviceForPoints.value
+    if (currentDeviceId) {
+        const duplicatePoint = dataPoints.value.find(other => {
+            if (other === point) return false
+            const otherDeviceId = other.device_id || selectedDeviceForPoints.value
+            if (otherDeviceId !== currentDeviceId) return false
+            return String(other.plc_tag || '').trim().toUpperCase() === tag
+        })
+        if (duplicatePoint) {
+            const dupName = duplicatePoint.label || duplicatePoint.name || '其他点位'
+            return `地址与点位「${dupName}」重复（同一设备存在相同 PLC 地址）`
+        }
+    }
+    return ''
+}
+
 function getPlcAddressWarning(point) {
     if (!point || !point.plc_tag || !String(point.plc_tag).trim()) return ''
     const tag = String(point.plc_tag).trim().toUpperCase()
@@ -7259,7 +7279,6 @@ const mainTabs = [
                                         <th>采集周期(ms)</th><th>读写</th>
                                         <th v-if="showPointAdvancedFields" title="PLC 原始值乘以这个数，常用于把整数缩放成工程值">换算倍率</th>
                                         <th v-if="showPointAdvancedFields" title="倍率换算后再加上的修正值，常用于传感器零点校准">偏移修正</th>
-                                        <th v-if="showPointAdvancedFields" title="可选高级换算，x 代表倍率和偏移后的值，例如 x/10">自定义公式</th>
                                         <th v-if="showPointAdvancedFields" title="控制画面显示的小数位，例如 0、0.0、0.00">显示小数</th>
                                         <th>单位</th><th>报警说明</th><th>语音播报</th><th></th>
                                     </tr>
@@ -7287,10 +7306,16 @@ const mainTabs = [
                                             <div class="plc-address-wrap">
                                                 <input v-model="p.plc_tag" @input="markPointsDirty" 
                                                        class="input input-sm plc-address-input" 
-                                                       :class="{ 'has-warning': !!getPlcAddressWarning(p) }"
-                                                       :title="getPlcAddressWarning(p) || 'PLC 地址，如 DB1.DBW0 或 DB1.DBX0.0'" 
+                                                       :class="{ 'has-warning': !!getPlcAddressWarning(p), 'has-duplicate': !!getPlcDuplicateWarning(p) }"
+                                                       :title="getPlcDuplicateWarning(p) || getPlcAddressWarning(p) || 'PLC 地址，如 DB1.DBW0 或 DB1.DBX0.0'" 
                                                        placeholder="DB1.DBW0 / DB1.DBX6.0" />
-                                                <span v-if="getPlcAddressWarning(p)" class="plc-warning-icon" :title="getPlcAddressWarning(p)">
+                                                <span v-if="getPlcDuplicateWarning(p)" class="plc-warning-icon plc-duplicate-icon" :title="getPlcDuplicateWarning(p)">
+                                                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
+                                                        <rect x="1" y="1" width="10" height="10" rx="2" stroke="#ff3b30" stroke-width="1.3" fill="rgba(255, 59, 48, 0.1)"/>
+                                                        <rect x="5" y="5" width="10" height="10" rx="2" stroke="#ff3b30" stroke-width="1.3" fill="rgba(255, 59, 48, 0.1)"/>
+                                                    </svg>
+                                                </span>
+                                                <span v-else-if="getPlcAddressWarning(p)" class="plc-warning-icon" :title="getPlcAddressWarning(p)">
                                                     <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
                                                         <path d="M8 1.85L14.4 13.35C14.52 13.56 14.37 13.8 14.13 13.8H1.87C1.63 13.8 1.48 13.56 1.6 13.35L8 1.85Z" fill="rgba(255, 149, 0, 0.16)" stroke="#ff9500" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
                                                         <line x1="8" y1="6" x2="8" y2="9.3" stroke="#ff9500" stroke-width="1.5" stroke-linecap="round"/>
@@ -7309,7 +7334,6 @@ const mainTabs = [
                                         </td>
                                         <td v-if="showPointAdvancedFields"><input v-model.number="p.scale" @input="markPointsDirty" type="number" step="0.001" class="input input-sm number-input" placeholder="1" title="PLC 原始值乘以这个数，例如原始值 253、倍率 0.1，得到 25.3" /></td>
                                         <td v-if="showPointAdvancedFields"><input v-model.number="p.offset" @input="markPointsDirty" type="number" step="0.001" class="input input-sm number-input" placeholder="0" title="倍率换算后再加上的修正值，例如传感器整体偏低 2 度就填 2" /></td>
-                                        <td v-if="showPointAdvancedFields"><input v-model="p.expression" @input="markPointsDirty" class="input input-sm expression-input" placeholder="可空，如 x/10" title="可选高级换算，x 代表倍率和偏移后的值，例如 x/10、(x-32)*5/9" /></td>
                                         <td v-if="showPointAdvancedFields"><input v-model="p.display_format" @input="markPointsDirty" class="input input-sm unit-input" placeholder="如 0.0" title="控制画面显示的小数位，例如 0 表示整数，0.0 表示 1 位小数，0.00 表示 2 位小数" /></td>
                                         <td><input v-model="p.unit" @input="markPointsDirty" class="input input-sm unit-input" :disabled="isBoolPoint(p)" :placeholder="isBoolPoint(p) ? '无' : '°C'" /></td>
                                         <td>
@@ -7324,7 +7348,7 @@ const mainTabs = [
                                         <td><button @click="removeDataPoint(p)" class="btn btn-danger btn-sm">✕</button></td>
                                     </tr>
                                     <tr v-if="dataPoints.length === 0">
-                                        <td :colspan="(showPointAdvancedFields ? 14 : 10) + (isAllPointsMode ? 1 : 0)" style="text-align:center; padding: 20px; color: #86868b;">暂无点位配置，请手动添加或从其他设备复制。</td>
+                                        <td :colspan="(showPointAdvancedFields ? 13 : 10) + (isAllPointsMode ? 1 : 0)" style="text-align:center; padding: 20px; color: #86868b;">暂无点位配置，请手动添加或从其他设备复制。</td>
                                     </tr>
                                 </tbody>
                             </table>
@@ -9473,7 +9497,7 @@ button:enabled:active {
     margin: 0 0 10px;
 }
 .points-table { min-width: 960px; }
-.points-table.points-table-advanced { min-width: 1580px; }
+.points-table.points-table-advanced { min-width: 1420px; }
 .points-table td { padding: 10px 6px; }
 .points-table .input-sm { width: 100%; }
 .points-table .number-input { width: 90px; }
@@ -9493,6 +9517,11 @@ button:enabled:active {
 .plc-address-wrap .plc-address-input.has-warning {
     border-color: #ff9500 !important;
     background-color: rgba(255, 149, 0, 0.05) !important;
+    padding-right: 26px;
+}
+.plc-address-wrap .plc-address-input.has-duplicate {
+    border-color: #ff3b30 !important;
+    background-color: rgba(255, 59, 48, 0.05) !important;
     padding-right: 26px;
 }
 .plc-warning-icon {
