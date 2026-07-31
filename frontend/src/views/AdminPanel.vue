@@ -18,6 +18,30 @@ import {
     buildDiagnosticGroups,
     normalizeDeviceLabelConfig
 } from '../runtime/uiConfig.js'
+import {
+    sortByOrder,
+    numberOrDefault,
+    clampNumber,
+    isBlank,
+    optionalNumber,
+    parseInstanceConfig,
+    parseEditableInstanceConfig,
+    stringifyInstanceConfigForEdit,
+    isAuxiliaryDeviceConfig
+} from './admin/utils/common.js'
+import {
+    makeLineLayoutItem,
+    defaultLineLayout,
+    normalizeLineLayoutItems,
+    normalizeLineLayout,
+    serializeLineLayout,
+    normalizeLineRecord
+} from './admin/utils/lineLayout.js'
+import { useAppDialog } from './admin/composables/useAppDialog.js'
+import { useSystemSettings } from './admin/composables/useSystemSettings.js'
+import { usePointMonitor } from './admin/composables/usePointMonitor.js'
+import { useDataPoints } from './admin/composables/useDataPoints.js'
+import { formatPointValue, formatQualityLabel, formatPointTime } from './admin/utils/points.js'
 
 defineOptions({ name: 'AdminPanel' })
 
@@ -51,45 +75,81 @@ const navIconPaths = {
     settings: ['M12 8a4 4 0 1 0 0 8a4 4 0 0 0 0-8z', 'M12 2v3', 'M12 19v3', 'M4.93 4.93l2.12 2.12', 'M16.95 16.95l2.12 2.12', 'M2 12h3', 'M19 12h3', 'M4.93 19.07l2.12-2.12', 'M16.95 7.05l2.12-2.12']
 }
 
-const appDialog = reactive({
-    visible: false,
-    title: '提示',
-    message: '',
-    type: 'info',
-    showCancel: false,
-    confirmText: '确定',
-    cancelText: '取消'
+const { appDialog, openAppDialog, closeAppDialog, alert, confirm } = useAppDialog()
+
+const {
+    defaultSettings,
+    settings,
+    renderProfileOptions,
+    resolvedRenderSettings,
+    selectedRenderProfile,
+    runtimeSettings,
+    runtimeStatus,
+    runtimeSaving,
+    runtimeMessage,
+    runtimeQrDataUrl,
+    firstCastPairingUrl,
+    refreshRuntimeQr,
+    loadRuntimeSettings,
+    saveRuntimeSettings,
+    rotateCastPin,
+    copyCastUrl,
+    startRuntimeRefresh,
+    stopRuntimeRefresh,
+    loadSettings,
+    engineStatus,
+    plcStatusLabels,
+    plcStatusByDevice,
+    formatPlcDeviceStatus,
+    formatPlcEndpoint,
+    formatPlcIntervals,
+    formatPlcTime,
+    databaseConfig,
+    databaseTestStatus,
+    databaseSaving,
+    databaseBackupBusy,
+    databaseBackupMessage,
+    databaseBackupStatus,
+    siteBackupFileInput,
+    siteBackupBusy,
+    siteBackupMessage,
+    siteBackupStatus,
+    loadDatabaseConfig,
+    loadSiteBackups,
+    downloadSiteBackup,
+    exportSiteBackup,
+    chooseSiteBackupFile,
+    restoreSiteBackupFromFile,
+    loadDatabaseBackups,
+    createDatabaseBackup,
+    restoreDatabaseBackup,
+    downloadDatabaseBackup,
+    formatBackupSize,
+    formatBackupInterval,
+    testDatabaseConnection,
+    saveDatabaseConnection,
+    loadEngineStatus,
+    formatEngineMode,
+    saveSettings
+} = useSystemSettings({
+    alert,
+    confirm,
+    loadWorkshops: (...args) => loadWorkshops(...args),
+    loadLines: (...args) => loadLines(...args),
+    loadDevices: (...args) => loadDevices(...args),
+    loadModels: (...args) => loadModels(...args),
+    loadPlatform: (...args) => loadPlatform(...args),
+    ensureComposerSelection: (...args) => ensureComposerSelection(...args),
+    syncComposerDraftFromSelection: (...args) => syncComposerDraftFromSelection(...args),
+    scheduleComposerPreview: (...args) => scheduleComposerPreview(...args)
 })
-let appDialogResolve = null
 
-function openAppDialog(options = {}) {
-    return new Promise(resolve => {
-        appDialogResolve = resolve
-        Object.assign(appDialog, {
-            visible: true,
-            title: options.title || (options.showCancel ? '请确认操作' : '系统提示'),
-            message: String(options.message ?? ''),
-            type: options.type || 'info',
-            showCancel: !!options.showCancel,
-            confirmText: options.confirmText || '确定',
-            cancelText: options.cancelText || '取消'
-        })
-    })
-}
-
-function closeAppDialog(result) {
-    appDialog.visible = false
-    const resolve = appDialogResolve
-    appDialogResolve = null
-    if (resolve) resolve(result)
-}
-
-function alert(message, options = {}) {
-    return openAppDialog({ ...options, message, showCancel: false })
-}
-
-function confirm(message, options = {}) {
-    return openAppDialog({ ...options, message, showCancel: true, type: options.type || 'warning' })
+function getDbStatusBadgeClass(statusText) {
+    if (!statusText) return ''
+    if (statusText.includes('成功')) return 'status-success'
+    if (statusText.includes('失败')) return 'status-error'
+    if (statusText.includes('正在') || statusText.includes('中')) return 'status-loading'
+    return 'status-info'
 }
 
 // ============ 车间管理 ============
@@ -162,65 +222,6 @@ const lineDeviceDrag = reactive({
     canDrop: false,
     message: ''
 })
-
-function makeLineLayoutItem(type, index = 0) {
-    const isRail = type === 'rail'
-    const prefix = isRail ? 'rail' : 'lane'
-    const name = isRail ? '小车导轨' : '设备线'
-    return {
-        id: `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
-        name: `${name} ${index + 1}`,
-        type: isRail ? 'cart_rail' : 'device_lane',
-        offsetZ: isRail ? 4 + index * 6 : index * 6,
-        length: 60,
-        sort_order: index
-    }
-}
-
-function defaultLineLayout() {
-    return {
-        version: 1,
-        flowDirection: 'right',
-        lanes: [{ ...makeLineLayoutItem('lane', 0), id: 'lane_1' }],
-        rails: []
-    }
-}
-
-function normalizeLineLayoutItems(items, type) {
-    const isRail = type === 'rail'
-    return (Array.isArray(items) ? items : [])
-        .map((item, index) => ({
-            id: String(item?.id || `${isRail ? 'rail' : 'lane'}_${index + 1}`),
-            name: String(item?.name || `${isRail ? '小车导轨' : '设备线'} ${index + 1}`),
-            type: isRail ? 'cart_rail' : 'device_lane',
-            offsetZ: numberOrDefault(item?.offsetZ ?? item?.offset_z ?? item?.z, isRail ? 4 : 0),
-            length: Math.max(1, numberOrDefault(item?.length, 60)),
-            sort_order: numberOrDefault(item?.sort_order, index)
-        }))
-        .sort((a, b) => a.sort_order - b.sort_order)
-}
-
-function normalizeLineLayout(value) {
-    const source = parseInstanceConfig(value) || {}
-    const lanes = normalizeLineLayoutItems(source.lanes, 'lane')
-    const rails = normalizeLineLayoutItems(source.rails, 'rail')
-    const flowDirection = ['right', 'left', 'none'].includes(source.flowDirection) ? source.flowDirection : 'right'
-    if (!lanes.length) lanes.push(defaultLineLayout().lanes[0])
-    return { version: 1, flowDirection, lanes, rails }
-}
-
-function serializeLineLayout(layout) {
-    return JSON.stringify(normalizeLineLayout(layout), null, 2)
-}
-
-function normalizeLineRecord(line) {
-    const layout = normalizeLineLayout(line?.layout || line?.layout_json)
-    return {
-        ...line,
-        layout,
-        layout_json: JSON.stringify(layout)
-    }
-}
 
 function ensureSelectedLineEditor() {
     if (!lines.value.length) {
@@ -361,1601 +362,123 @@ async function deleteDevice(id) {
     await alert(`设备「${id}」已删除`, { title: '删除成功', type: 'success' })
 }
 
-// ============ 点位映射 ============
-const selectedDeviceForPoints = ref(storedAdminUiState.selectedDeviceForPoints || 'all')
-const dataPoints = ref([])
-const isPointsDirty = ref(false)
-const showPointAdvancedFields = ref(!!storedAdminUiState.showPointAdvancedFields)
-const loadedPointDeviceIds = ref([])
-const alarmTextImportRaw = ref('')
-const alarmTextFileInput = ref(null)
-const selectedVoicePointIndex = ref(-1)
-const voiceFileInput = ref(null)
-const voiceUploadTarget = reactive({ pointIndex: -1, ruleIndex: -1 })
-const systemVoices = ref([])
-const systemVoicesLoaded = ref(false)
-const systemVoicesLoading = ref(false)
-const voiceGeneratingRuleId = ref('')
-const voiceUploadingRuleId = ref('')
-const voicePreviewAnnouncer = createVoiceAnnouncer()
-const voiceTriggerOptions = [
-    { value: 'change', label: '数值发生变化' },
-    { value: 'rising', label: '由关变开 / 0→1' },
-    { value: 'falling', label: '由开变关 / 1→0' },
-    { value: 'equals', label: '变为指定数值' },
-    { value: 'above', label: '向上跨过阈值' },
-    { value: 'below', label: '向下跨过阈值' }
-]
-const selectedVoicePoint = computed(() => dataPoints.value[selectedVoicePointIndex.value] || null)
-const pointUsageOptions = [
-    { value: 'normal', label: '常规监控' },
-    { value: 'alarm_trigger', label: '报警触发' }
-]
+const {
+    selectedDeviceForMonitor,
+    realtimePointRows,
+    realtimePointDeviceStatus,
+    monitorCurrentPage,
+    monitorPageSize,
+    totalMonitorPages,
+    paginatedRealtimePointRows,
+    displayedMonitorPageNumbers,
+    realtimePointDeviceStatuses,
+    realtimePointSnapshotAt,
+    realtimePointLoading,
+    realtimePointError,
+    pointMonitorAutoRefresh,
+    pointMonitorRefreshIntervalMs,
+    selectedMonitorDevice,
+    isAllPointMonitorMode,
+    pointMonitorStatusSummary,
+    ensurePointMonitorDevice,
+    loadRealtimePointValues,
+    startPointMonitor,
+    stopPointMonitor
+} = usePointMonitor({ devices, storedAdminUiState })
 
-// ============ 点位表格分页状态 ============
-const pointsCurrentPage = ref(1)
-const pointsPageSize = ref(20)
-
-const totalPointPages = computed(() => {
-    if (pointsPageSize.value <= 0) return 1
-    return Math.max(1, Math.ceil(dataPoints.value.length / pointsPageSize.value))
+const {
+    selectedDeviceForPoints,
+    dataPoints,
+    isPointsDirty,
+    showPointAdvancedFields,
+    loadedPointDeviceIds,
+    alarmTextImportRaw,
+    alarmTextFileInput,
+    selectedVoicePointIndex,
+    voiceFileInput,
+    voiceUploadTarget,
+    systemVoices,
+    systemVoicesLoaded,
+    systemVoicesLoading,
+    voiceGeneratingRuleId,
+    voiceUploadingRuleId,
+    voiceTriggerOptions,
+    selectedVoicePoint,
+    pointUsageOptions,
+    pointsCurrentPage,
+    pointsPageSize,
+    totalPointPages,
+    paginatedDataPoints,
+    displayedPageNumbers,
+    pointDataTypes,
+    alarmRecordRoleMeta,
+    isAllPointsMode,
+    normalizePointUsage,
+    pointDisplayName,
+    normalizeLoadedPoint,
+    pointVoiceRules,
+    enabledVoiceRuleCount,
+    voiceRuleId,
+    defaultVoiceText,
+    addVoiceRule,
+    removeVoiceRule,
+    loadSystemVoices,
+    openVoiceConfig,
+    closeVoiceConfig,
+    updateVoiceCooldown,
+    voiceRuleNeedsThreshold,
+    voiceRuleDeviceName,
+    fillVoiceTemplate,
+    previewVoiceRule,
+    generateVoiceFile,
+    selectVoiceFile,
+    handleVoiceFileChange,
+    loadDataPoints,
+    addDataPoint,
+    addAlarmTriggerPoint,
+    removeDataPoint,
+    markPointsDirty,
+    isBoolPoint,
+    autoConvertPlcTagForDataType,
+    getPlcDuplicateWarning,
+    getPlcAddressWarning,
+    handlePointDataTypeChange,
+    composePlcAddressFromParts,
+    toInternalPointName,
+    inferPointCategory,
+    setPointUsage,
+    formatPointUsage,
+    isTextPointType,
+    getAlarmPointNumber,
+    currentAlarmTriggerPoints,
+    alarmRecordPointStatus,
+    getNextAlarmPointIndex,
+    parseAlarmText,
+    parsedAlarmTextEntries,
+    alarmTextImportSummary,
+    fillAlarmTextTemplate,
+    triggerAlarmTextFileSelect,
+    handleAlarmTextFileChange,
+    applyAlarmTextImport,
+    ensureAlarmRecordPoints,
+    validatePointRows,
+    buildDataPointPayload,
+    saveAllPoints,
+    copyPointsFrom,
+    syncToLine
+} = useDataPoints({
+    devices,
+    alert,
+    confirm,
+    storedAdminUiState,
+    loadEngineStatus,
+    selectedDeviceForMonitor,
+    loadRealtimePointValues
 })
-
-const paginatedDataPoints = computed(() => {
-    if (pointsPageSize.value <= 0) {
-        return dataPoints.value
-    }
-    const start = (pointsCurrentPage.value - 1) * pointsPageSize.value
-    return dataPoints.value.slice(start, start + pointsPageSize.value)
-})
-
-const displayedPageNumbers = computed(() => {
-    const total = totalPointPages.value
-    const current = pointsCurrentPage.value
-    if (total <= 7) {
-        return Array.from({ length: total }, (_, i) => i + 1)
-    }
-    const pages = []
-    let start = Math.max(1, current - 2)
-    let end = Math.min(total, current + 2)
-    if (current <= 3) {
-        end = 5
-    } else if (current >= total - 2) {
-        start = total - 4
-    }
-    for (let i = start; i <= end; i++) {
-        pages.push(i)
-    }
-    return pages
-})
-
-watch(totalPointPages, (maxPages) => {
-    if (pointsCurrentPage.value > maxPages) {
-        pointsCurrentPage.value = maxPages
-    }
-})
-
-watch([selectedDeviceForPoints, pointsPageSize], () => {
-    pointsCurrentPage.value = 1
-})
-const pointDataTypes = [
-    { value: 'BOOL', label: 'BOOL 开关量' },
-    { value: 'BYTE', label: 'BYTE 字节' },
-    { value: 'WORD', label: 'WORD 无符号整数' },
-    { value: 'INT', label: 'INT 有符号整数' },
-    { value: 'DWORD', label: 'DWORD 双字' },
-    { value: 'DINT', label: 'DINT 有符号双字' },
-    { value: 'REAL', label: 'REAL 浮点数' },
-    { value: 'LREAL', label: 'LREAL 双精度浮点' },
-    { value: 'STRING', label: 'STRING 文本' },
-    { value: 'CHAR', label: 'CHAR 字符数组' },
-    { value: 'DT', label: 'DT 日期时间' },
-    { value: 'DTL', label: 'DTL 新版日期时间' }
-]
-const alarmRecordRoleMeta = {
-    txt_record: { usage: 'alarm_text_record', label: '报警内容', dataType: 'STRING', pointName: 'txt_record' },
-    date1_record: { usage: 'alarm_start_record', label: '报警开始时间', dataType: 'DT', pointName: 'date1_record' },
-    date2_record: { usage: 'alarm_end_record', label: '报警结束时间', dataType: 'DT', pointName: 'date2_record' },
-    num_record: { usage: 'alarm_number_record', label: '报警编号', dataType: 'WORD', pointName: 'num_record' },
-    state_record: { usage: 'alarm_state_record', label: '报警状态', dataType: 'WORD', pointName: 'state_record' }
-}
-const isAllPointsMode = computed(() => selectedDeviceForPoints.value === 'all')
-
-function normalizePointUsage(point = {}) {
-    if (point.__usage) return point.__usage
-    const role = String(point.alarm_record_role || point.value_role || point.name || '').trim().toLowerCase()
-    if (role === 'txt_record' || role === 'alarm_text_record') return 'alarm_text_record'
-    if (role === 'date1_record' || role === 'alarm_start_record') return 'alarm_start_record'
-    if (role === 'date2_record' || role === 'alarm_end_record') return 'alarm_end_record'
-    if (role === 'num_record' || role === 'alarm_number_record') return 'alarm_number_record'
-    if (role === 'state_record' || role === 'alarm_state_record') return 'alarm_state_record'
-    if (point.point_kind === 'alarm' || point.is_alarm || /^bj\d+$/i.test(String(point.name || point.label || '').trim())) return 'alarm_trigger'
-    return 'normal'
-}
-
-function pointDisplayName(point = {}) {
-    return String(point.label || point.name || '').trim()
-}
-
-function normalizeLoadedPoint(point) {
-    const usage = normalizePointUsage(point)
-    const displayName = pointDisplayName(point)
-    const voiceConfig = parseVoiceConfig(point.voice_config)
-    return {
-        ...point,
-        __usage: usage,
-        __originalName: point.name || '',
-        device_id: point.device_id || (isAllPointsMode.value ? devices.value[0]?.id || '' : selectedDeviceForPoints.value),
-        name: point.name || '',
-        label: displayName,
-        plc_tag: point.plc_tag || composePlcAddressFromParts(point),
-        data_type: point.data_type || 'WORD',
-        category: point.category || '',
-        value_role: point.value_role || '',
-        quality: point.quality || 'good',
-        scale: point.scale ?? 1,
-        offset: point.offset ?? 0,
-        expression: point.expression || '',
-        display_format: point.display_format || '',
-        unit: String(point.data_type || '').toUpperCase() === 'BOOL' ? '' : (point.unit || ''),
-        sample_interval_ms: point.sample_interval_ms ?? 1000,
-        access_type: point.access_type || 'READ',
-        db_number: point.db_number ?? null,
-        db_byte_offset: point.db_byte_offset ?? null,
-        bit_offset: point.bit_offset ?? null,
-        point_kind: point.point_kind || (usage === 'normal' ? 'normal' : 'alarm'),
-        alarm_record_role: point.alarm_record_role || '',
-        alarm_text: point.alarm_text || '',
-        alarm_level: point.alarm_level || 'WARNING',
-        alarm_condition: point.alarm_condition || '=1',
-        voice_config: point.voice_config || '',
-        __voiceRules: voiceConfig.rules.map((rule, index) => normalizeVoiceRule(rule, index))
-    }
-}
-
-function pointVoiceRules(point) {
-    if (!Array.isArray(point?.__voiceRules)) {
-        const config = parseVoiceConfig(point?.voice_config)
-        point.__voiceRules = config.rules.map((rule, index) => normalizeVoiceRule(rule, index))
-    }
-    return point.__voiceRules
-}
-
-function enabledVoiceRuleCount(point) {
-    return pointVoiceRules(point).filter(rule => rule.enabled).length
-}
-
-function voiceRuleId() {
-    return `voice_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
-}
-
-function defaultVoiceText(point) {
-    if (normalizePointUsage(point) === 'alarm_trigger' && point.alarm_text) {
-        return `{设备}：${point.alarm_text}`
-    }
-    return `{设备} ${pointDisplayName(point) || '点位'} 发生变化，当前值 {值}{单位}`
-}
-
-function addVoiceRule(point = selectedVoicePoint.value) {
-    if (!point) return
-    const trigger = isBoolPoint(point) || normalizePointUsage(point) === 'alarm_trigger' ? 'rising' : 'change'
-    pointVoiceRules(point).push(normalizeVoiceRule({
-        id: voiceRuleId(),
-        enabled: true,
-        trigger,
-        threshold: null,
-        mode: 'auto',
-        text: defaultVoiceText(point),
-        audio_url: '',
-        cooldown_ms: 10000,
-        volume: 1,
-        rate: 1,
-        voice_name: '',
-        announce_on_start: false
-    }))
-    markPointsDirty()
-}
-
-function removeVoiceRule(point, ruleIndex) {
-    pointVoiceRules(point).splice(ruleIndex, 1)
-    markPointsDirty()
-}
-
-async function loadSystemVoices() {
-    if (systemVoicesLoaded.value || systemVoicesLoading.value) return
-    systemVoicesLoading.value = true
-    try {
-        const result = await adminApi.getSystemVoices()
-        if (!result?.error && Array.isArray(result?.voices)) systemVoices.value = result.voices
-    } finally {
-        systemVoicesLoaded.value = true
-        systemVoicesLoading.value = false
-    }
-}
-
-function openVoiceConfig(target) {
-    const idx = typeof target === 'number' ? target : dataPoints.value.indexOf(target)
-    selectedVoicePointIndex.value = idx
-    loadSystemVoices()
-}
-
-function closeVoiceConfig() {
-    selectedVoicePointIndex.value = -1
-}
-
-function updateVoiceCooldown(rule, seconds) {
-    const value = Number(seconds)
-    rule.cooldown_ms = Number.isFinite(value) ? Math.max(0, Math.min(3600, value)) * 1000 : 10000
-    markPointsDirty()
-}
-
-function voiceRuleNeedsThreshold(rule) {
-    return ['equals', 'above', 'below'].includes(rule?.trigger)
-}
-
-function voiceRuleDeviceName(point) {
-    return devices.value.find(device => device.id === point?.device_id)?.name || point?.device_id || '示例设备'
-}
-
-function fillVoiceTemplate(text, point, sampleValue) {
-    const replacements = {
-        '{设备}': voiceRuleDeviceName(point),
-        '{点位}': pointDisplayName(point) || '示例点位',
-        '{值}': sampleValue,
-        '{单位}': point?.unit || '',
-        '{device}': voiceRuleDeviceName(point),
-        '{point}': pointDisplayName(point) || '示例点位',
-        '{value}': sampleValue,
-        '{unit}': point?.unit || ''
-    }
-    return Object.entries(replacements).reduce((result, [token, value]) => result.split(token).join(String(value ?? '')), String(text || ''))
-}
-
-async function previewVoiceRule(rule, point = selectedVoicePoint.value) {
-    if (!point) return
-    try {
-        const sampleValue = rule.threshold ?? (rule.trigger === 'falling' ? 0 : 1)
-        await voicePreviewAnnouncer.preview(rule, {
-            deviceName: voiceRuleDeviceName(point),
-            label: pointDisplayName(point),
-            value: sampleValue,
-            unit: point.unit || ''
-        })
-    } catch (error) {
-        await alert(`测试播报失败：${error.message}`, { title: '语音测试失败', type: 'danger' })
-    }
-}
-
-async function generateVoiceFile(rule, point = selectedVoicePoint.value) {
-    if (!point) return
-    const sampleValue = rule.threshold ?? (rule.trigger === 'falling' ? 0 : 1)
-    const text = fillVoiceTemplate(rule.text || defaultVoiceText(point), point, sampleValue).trim()
-    if (!text) return alert('请先填写播报文字', { title: '无法生成语音', type: 'warning' })
-    voiceGeneratingRuleId.value = rule.id
-    try {
-        const result = await adminApi.generateVoiceFile({
-            text,
-            voice_name: rule.voice_name || '',
-            rate: rule.rate,
-            volume: rule.volume
-        })
-        if (result?.error) return alert(result.error, { title: '语音生成失败', type: 'danger' })
-        rule.audio_url = result.url
-        rule.mode = 'file'
-        markPointsDirty()
-        await alert('WAV 语音文件已经生成并关联到本条规则。请继续点击“保存点位配置”。', { title: '语音已生成', type: 'success' })
-    } finally {
-        voiceGeneratingRuleId.value = ''
-    }
-}
-
-function selectVoiceFile(pointIndex, ruleIndex) {
-    voiceUploadTarget.pointIndex = pointIndex
-    voiceUploadTarget.ruleIndex = ruleIndex
-    voiceFileInput.value?.click()
-}
-
-async function handleVoiceFileChange(event) {
-    const file = event?.target?.files?.[0]
-    event.target.value = ''
-    if (!file) return
-    const point = dataPoints.value[voiceUploadTarget.pointIndex]
-    if (!point) return
-    const rule = pointVoiceRules(point)[voiceUploadTarget.ruleIndex]
-    if (!rule) return
-    voiceUploadingRuleId.value = rule.id
-    try {
-        const result = await adminApi.uploadVoiceFile(file)
-        if (result?.error) return alert(result.error, { title: '语音上传失败', type: 'danger' })
-        rule.audio_url = result.url
-        rule.mode = 'file'
-        markPointsDirty()
-        await alert('语音文件已经上传并关联到本条规则。请继续点击“保存点位配置”。', { title: '上传成功', type: 'success' })
-    } finally {
-        voiceUploadingRuleId.value = ''
-    }
-}
-
-async function loadDataPoints() {
-    if (!selectedDeviceForPoints.value) { dataPoints.value = []; return }
-    const points = await adminApi.getDataPoints(selectedDeviceForPoints.value)
-    loadedPointDeviceIds.value = [...new Set(points.map(point => point.device_id).filter(Boolean))]
-    dataPoints.value = points.map(normalizeLoadedPoint)
-    isPointsDirty.value = false
-}
-
-function addDataPoint(usage = 'normal') {
-    const deviceId = isAllPointsMode.value ? devices.value[0]?.id || '' : selectedDeviceForPoints.value
-    const point = normalizeLoadedPoint({
-        device_id: deviceId,
-        name: '',
-        label: '',
-        plc_tag: '',
-        data_type: 'WORD',
-        category: '',
-        value_role: '',
-        quality: 'good',
-        scale: 1,
-        offset: 0,
-        expression: '',
-        display_format: '',
-        unit: '',
-        sample_interval_ms: 1000,
-        access_type: 'READ',
-        db_number: null,
-        db_byte_offset: null,
-        bit_offset: null
-    })
-    setPointUsage(point, usage, { markDirty: false })
-    dataPoints.value.push(point)
-    isPointsDirty.value = true
-
-    nextTick(() => {
-        if (pointsPageSize.value > 0) {
-            pointsCurrentPage.value = totalPointPages.value
-        }
-        const tableContainer = document.querySelector('.table-scroll')
-        if (tableContainer) {
-            tableContainer.scrollTo({ top: tableContainer.scrollHeight, behavior: 'smooth' })
-        }
-    })
-}
-
-function addAlarmTriggerPoint() {
-    const nextIndex = getNextAlarmPointIndex()
-    const deviceId = isAllPointsMode.value ? devices.value[0]?.id || '' : selectedDeviceForPoints.value
-    const point = normalizeLoadedPoint({
-        device_id: deviceId,
-        name: `bj${nextIndex}`,
-        label: `bj${nextIndex}`,
-        plc_tag: '',
-        data_type: 'BOOL',
-        sample_interval_ms: 500,
-        access_type: 'READ',
-        point_kind: 'alarm',
-        alarm_condition: '=1',
-        alarm_level: 'WARNING'
-    })
-    setPointUsage(point, 'alarm_trigger', { markDirty: false })
-    dataPoints.value.push(point)
-    isPointsDirty.value = true
-}
-
-function removeDataPoint(target) {
-    const idx = typeof target === 'number' ? target : dataPoints.value.indexOf(target)
-    if (idx < 0) return
-    if (selectedVoicePointIndex.value === idx) closeVoiceConfig()
-    else if (selectedVoicePointIndex.value > idx) selectedVoicePointIndex.value -= 1
-    dataPoints.value.splice(idx, 1)
-    isPointsDirty.value = true
-}
-
-function markPointsDirty() {
-    isPointsDirty.value = true
-}
-
-function isBoolPoint(point) {
-    return String(point?.data_type || '').toUpperCase() === 'BOOL'
-}
-
-function autoConvertPlcTagForDataType(point) {
-    if (!point || !point.plc_tag || typeof point.plc_tag !== 'string') return
-    const tag = point.plc_tag.trim()
-    if (!tag) return
-
-    const dataType = String(point.data_type || 'WORD').toUpperCase()
-
-    const dbMatch = tag.match(/^(DB\d+)\.(DBX|DBB|DBW|DBD)(\d+)(?:\.(\d+))?$/i)
-    if (!dbMatch) return
-
-    const dbPrefix = dbMatch[1].toUpperCase()
-    const byteOffset = dbMatch[3]
-    const bitOffset = dbMatch[4] !== undefined ? dbMatch[4] : '0'
-
-    let targetArea = ''
-    let isBit = false
-
-    if (dataType === 'BOOL') {
-        targetArea = 'DBX'
-        isBit = true
-    } else if (['BYTE', 'CHAR'].includes(dataType)) {
-        targetArea = 'DBB'
-    } else if (['WORD', 'INT'].includes(dataType)) {
-        targetArea = 'DBW'
-    } else if (['DWORD', 'DINT', 'REAL', 'LREAL'].includes(dataType)) {
-        targetArea = 'DBD'
-    } else {
-        return
-    }
-
-    let newTag = `${dbPrefix}.${targetArea}${byteOffset}`
-    if (isBit) {
-        newTag += `.${bitOffset}`
-    }
-
-    if (newTag !== point.plc_tag) {
-        point.plc_tag = newTag
-    }
-}
-
-function getPlcDuplicateWarning(point) {
-    if (!point || !point.plc_tag || !String(point.plc_tag).trim()) return ''
-    const tag = String(point.plc_tag).trim().toUpperCase()
-
-    const currentDeviceId = point.device_id || selectedDeviceForPoints.value
-    if (currentDeviceId) {
-        const duplicatePoint = dataPoints.value.find(other => {
-            if (other === point) return false
-            const otherDeviceId = other.device_id || selectedDeviceForPoints.value
-            if (otherDeviceId !== currentDeviceId) return false
-            return String(other.plc_tag || '').trim().toUpperCase() === tag
-        })
-        if (duplicatePoint) {
-            const dupName = duplicatePoint.label || duplicatePoint.name || '其他点位'
-            return `地址与点位「${dupName}」重复（同一设备存在相同 PLC 地址）`
-        }
-    }
-    return ''
-}
-
-function getPlcAddressWarning(point) {
-    if (!point || !point.plc_tag || !String(point.plc_tag).trim()) return ''
-    const tag = String(point.plc_tag).trim().toUpperCase()
-    const dataType = String(point.data_type || 'WORD').toUpperCase()
-
-    const dbMatch = tag.match(/^DB(\d+)\.(DBX|DBB|DBW|DBD)(\d+)(?:\.(\d+))?$/i)
-    if (dbMatch) {
-        const area = dbMatch[2].toUpperCase()
-        const bit = dbMatch[4]
-
-        if (dataType === 'BOOL') {
-            if (area !== 'DBX' || bit === undefined) {
-                return 'BOOL 类型推荐使用 DBX 位地址，如 DB1.DBX0.0'
-            }
-        } else if (['BYTE', 'CHAR'].includes(dataType)) {
-            if (area !== 'DBB') {
-                return `${dataType} 类型推荐使用 DBB 字节地址，如 DB1.DBB0`
-            }
-        } else if (['WORD', 'INT'].includes(dataType)) {
-            if (area !== 'DBW') {
-                return `${dataType} 类型推荐使用 DBW 字地址，如 DB1.DBW0`
-            }
-        } else if (['DWORD', 'DINT', 'REAL', 'LREAL'].includes(dataType)) {
-            if (area !== 'DBD') {
-                return `${dataType} 类型推荐使用 DBD 双字地址，如 DB1.DBD0`
-            }
-        }
-        return ''
-    }
-
-    const generalMatch = tag.match(/^(?:DB\d+\.(?:DBX|DBB|DBW|DBD)\d+(?:\.\d+)?|[IQM](?:X|B|W|D)?\d+(?:\.\d+)?)$/i)
-    if (!generalMatch) {
-        return '地址格式可能有误，请检查（如 DB1.DBW0 或 DB1.DBX0.0）'
-    }
-
-    return ''
-}
-
-function handlePointDataTypeChange(point) {
-    if (isBoolPoint(point)) point.unit = ''
-    autoConvertPlcTagForDataType(point)
-    markPointsDirty()
-}
-
-function isBlank(value) {
-    return value === undefined || value === null || String(value).trim() === ''
-}
-
-function optionalNumber(value) {
-    return isBlank(value) ? null : Number(value)
-}
-
-function composePlcAddressFromParts(point = {}) {
-    const dbNumber = Number(point.db_number)
-    const byteOffset = Number(point.db_byte_offset)
-    if (!Number.isInteger(dbNumber) || dbNumber < 0 || !Number.isInteger(byteOffset) || byteOffset < 0) return ''
-
-    const type = String(point.data_type || 'WORD').trim().toUpperCase()
-    if (type === 'BOOL') {
-        const bit = Number.isInteger(Number(point.bit_offset)) ? Math.max(0, Math.min(7, Number(point.bit_offset))) : 0
-        return `DB${dbNumber}.DBX${byteOffset}.${bit}`
-    }
-    if (type === 'BYTE' || type === 'CHAR') return `DB${dbNumber}.DBB${byteOffset}`
-    if (type === 'REAL' || type === 'DWORD' || type === 'DINT' || type === 'DT' || type === 'DTL') return `DB${dbNumber}.DBD${byteOffset}`
-    return `DB${dbNumber}.DBW${byteOffset}`
-}
-
-function simpleHash(text) {
-    let hash = 0
-    const value = String(text || '')
-    for (let i = 0; i < value.length; i += 1) {
-        hash = ((hash << 5) - hash) + value.charCodeAt(i)
-        hash |= 0
-    }
-    return Math.abs(hash).toString(36)
-}
-
-function toInternalPointName(label, fallbackIndex = 0) {
-    const raw = String(label || '').trim()
-    const ascii = raw
-        .replace(/[\u4e00-\u9fa5]+/g, '')
-        .replace(/[^a-zA-Z0-9_]+/g, '_')
-        .replace(/^_+|_+$/g, '')
-        .toLowerCase()
-    if (ascii) return ascii.slice(0, 96)
-    return `point_${simpleHash(raw || fallbackIndex)}`
-}
-
-function inferPointCategory(point, usage) {
-    if (usage !== 'normal') return 'status'
-    const name = pointDisplayName(point).toLowerCase()
-    const type = String(point.data_type || '').toUpperCase()
-    if (type === 'BOOL' || name.includes('报警') || name.includes('故障') || name.includes('状态') || name.includes('运行')) return 'status'
-    if (name.includes('气') || name.includes('阀') || name.includes('流量')) return 'gas'
-    if (name.includes('门')) return 'doors'
-    if (name.includes('风机') || name.includes('风扇') || name.includes('搅拌') || name.includes('泵') || name.includes('电机')) return 'motors'
-    if (name.includes('链') || name.includes('推') || name.includes('拉') || name.includes('机构')) return 'mechanisms'
-    return 'analog'
-}
-
-function roleFromUsage(usage, internalName) {
-    if (usage === 'alarm_text_record') return 'txt_record'
-    if (usage === 'alarm_start_record') return 'date1_record'
-    if (usage === 'alarm_end_record') return 'date2_record'
-    if (usage === 'alarm_number_record') return 'num_record'
-    if (usage === 'alarm_state_record') return 'state_record'
-    return internalName
-}
-
-function setPointUsage(point, usage, options = {}) {
-    const nextUsage = usage || 'normal'
-    const currentType = String(point.data_type || '').toUpperCase()
-    point.__usage = nextUsage
-    point.point_kind = nextUsage === 'normal' ? 'normal' : 'alarm'
-    point.alarm_record_role = ''
-    if (nextUsage === 'alarm_trigger') {
-        if (!currentType || currentType === 'WORD') point.data_type = 'BOOL'
-        point.unit = ''
-        point.sample_interval_ms = point.sample_interval_ms || 500
-        point.alarm_condition = point.alarm_condition || '=1'
-        point.alarm_level = point.alarm_level || 'WARNING'
-    } else {
-        const recordMeta = Object.entries(alarmRecordRoleMeta).find(([, meta]) => meta.usage === nextUsage)?.[1]
-        if (recordMeta) {
-            point.alarm_record_role = recordMeta.pointName
-            if (!point.name) point.name = recordMeta.pointName
-            if (!point.label) point.label = recordMeta.label
-            if (!currentType || currentType === 'WORD') point.data_type = recordMeta.dataType
-            point.sample_interval_ms = point.sample_interval_ms || 1000
-        }
-    }
-    if (options.markDirty !== false) markPointsDirty()
-}
-
-function formatPointUsage(point) {
-    const usage = typeof point === 'string' ? point : normalizePointUsage(point)
-    return pointUsageOptions.find(item => item.value === usage)?.label || '常规监控'
-}
-
-function isTextPointType(point) {
-    return ['STRING', 'CHAR'].includes(String(point.data_type || '').toUpperCase())
-}
-
-function getAlarmPointNumber(point, fallbackIndex = 0) {
-    const text = String(point.name || point.label || '').trim()
-    const match = text.match(/^bj(\d+)$/i)
-    return match ? Number(match[1]) : fallbackIndex + 1
-}
-
-const currentAlarmTriggerPoints = computed(() => dataPoints.value
-    .filter(point => normalizePointUsage(point) === 'alarm_trigger')
-    .map((point, index) => ({ point, number: getAlarmPointNumber(point, index) }))
-    .sort((a, b) => a.number - b.number))
-
-const alarmRecordPointStatus = computed(() => Object.entries(alarmRecordRoleMeta).map(([role, meta]) => ({
-    role,
-    label: meta.label,
-    configured: dataPoints.value.some(point => normalizePointUsage(point) === meta.usage),
-    point: dataPoints.value.find(point => normalizePointUsage(point) === meta.usage)
-})))
-
-function getNextAlarmPointIndex() {
-    const used = currentAlarmTriggerPoints.value.map(item => item.number).filter(Number.isFinite)
-    return used.length ? Math.max(...used) + 1 : 1
-}
-
-function parseAlarmText(text) {
-    const raw = String(text || '')
-    const lines = raw.split(/\r?\n/)
-    const map = new Map()
-    const hasArrowFormat = /=>/.test(raw)
-    let sequence = 1
-
-    lines.forEach((line) => {
-        const source = String(line || '').trim()
-        if (!source) return
-        if (hasArrowFormat) {
-            const match = source.match(/(\d+)\s*=>\s*["'“”‘’（(]?(.*?)["'“”‘’）)]?\s*[,，;；]?$/)
-            if (!match) return
-            const number = Number(match[1])
-            const message = String(match[2] || '').trim()
-            if (Number.isFinite(number) && message) map.set(number, message)
-            return
-        }
-
-        const message = source
-            .replace(/^\d+[\s.、:：-]+/, '')
-            .replace(/^["'“”‘’（(,\s]+|["'“”‘’）),\s;，；]+$/g, '')
-            .trim()
-        if (message && !/^[\]\};,.\s]+$/.test(message)) {
-            map.set(sequence, message)
-            sequence += 1
-        }
-    })
-
-    return map
-}
-
-const parsedAlarmTextEntries = computed(() => Array.from(parseAlarmText(alarmTextImportRaw.value).entries())
-    .map(([number, text]) => ({ number, text }))
-    .sort((a, b) => a.number - b.number))
-
-const alarmTextImportSummary = computed(() => {
-    const alarmCount = currentAlarmTriggerPoints.value.length
-    const textCount = parsedAlarmTextEntries.value.length
-    if (!alarmTextImportRaw.value.trim()) return `当前设备已配置 ${alarmCount} 个报警触发点位`
-    if (alarmCount === textCount) return `数量匹配：${alarmCount} 个报警点位，${textCount} 条报警说明`
-    return `数量不一致：当前 ${alarmCount} 个报警点位，导入文本 ${textCount} 条，请核对`
-})
-
-function fillAlarmTextTemplate() {
-    if (isAllPointsMode.value) {
-        return alert('请先筛选到某一台设备，再生成该设备的报警文本模板。', { title: '需要选择设备', type: 'warning' })
-    }
-    alarmTextImportRaw.value = currentAlarmTriggerPoints.value
-        .map(({ point, number }) => `    ${number} => "${point.alarm_text || point.label || ''}",`)
-        .join('\n')
-}
-
-function triggerAlarmTextFileSelect() {
-    alarmTextFileInput.value?.click()
-}
-
-async function handleAlarmTextFileChange(event) {
-    const file = event?.target?.files?.[0]
-    if (!file) return
-    alarmTextImportRaw.value = await file.text()
-    event.target.value = ''
-}
-
-async function applyAlarmTextImport() {
-    if (isAllPointsMode.value) {
-        return alert('请先筛选到某一台设备，再导入该设备的报警文本。', { title: '需要选择设备', type: 'warning' })
-    }
-    const textMap = parseAlarmText(alarmTextImportRaw.value)
-    if (textMap.size === 0) {
-        return alert('没有解析到报警文本。可以粘贴 1 => "报警内容" 这种格式，也可以一行一条按顺序粘贴。', { title: '报警文本为空', type: 'warning' })
-    }
-    const triggers = currentAlarmTriggerPoints.value
-    if (triggers.length === 0) {
-        return alert('当前设备还没有报警触发点位，请先添加 bj1、bj2 这类报警点位并填写 PLC 地址。', { title: '没有报警点位', type: 'warning' })
-    }
-
-    let updated = 0
-    triggers.forEach(({ point, number }) => {
-        const text = textMap.get(number)
-        if (!text) return
-        point.alarm_text = text
-        updated += 1
-    })
-    markPointsDirty()
-    await alert(`已匹配 ${updated} 条报警说明。请点击“保存点位配置”写入数据库。`, { title: '报警文本已导入', type: 'success' })
-}
-
-function ensureAlarmRecordPoints() {
-    if (isAllPointsMode.value) {
-        return alert('请先筛选到某一台设备，再补齐报警记录字段。', { title: '需要选择设备', type: 'warning' })
-    }
-    let added = 0
-    Object.entries(alarmRecordRoleMeta).forEach(([role, meta]) => {
-        if (role === 'num_record' || role === 'state_record') return
-        if (dataPoints.value.some(point => normalizePointUsage(point) === meta.usage)) return
-        const point = normalizeLoadedPoint({
-            device_id: selectedDeviceForPoints.value,
-            name: meta.pointName,
-            label: meta.label,
-            plc_tag: '',
-            data_type: meta.dataType,
-            sample_interval_ms: 1000,
-            access_type: 'READ',
-            point_kind: 'alarm',
-            alarm_record_role: role
-        })
-        setPointUsage(point, meta.usage, { markDirty: false })
-        dataPoints.value.push(point)
-        added += 1
-    })
-    if (added > 0) markPointsDirty()
-    alert(added > 0 ? `已添加 ${added} 个报警记录字段，请补 PLC 地址后保存。` : '报警内容、开始时间、结束时间字段已经存在。', {
-        title: added > 0 ? '已补齐字段' : '无需重复添加',
-        type: added > 0 ? 'success' : 'info'
-    })
-}
-
-function validatePointRows(points) {
-    const errors = []
-    const allowedTypes = pointDataTypes.map(item => item.value)
-    const allowedAccessTypes = ['READ', 'READ_WRITE', 'WRITE']
-
-    points.forEach((point, index) => {
-        const row = index + 1
-        if (isAllPointsMode.value && isBlank(point.device_id)) errors.push(`第 ${row} 行：必须选择设备`)
-        if (isBlank(pointDisplayName(point))) errors.push(`第 ${row} 行：点位名称不能为空`)
-
-        const hasPlcTag = !isBlank(point.plc_tag)
-        if (!hasPlcTag) {
-            errors.push(`第 ${row} 行：必须填写 PLC 地址`)
-        }
-        if (isTextPointType(point) && !hasPlcTag) {
-            errors.push(`第 ${row} 行：文本点位请直接填写完整 PLC 地址，例如 DB10,S20.30`)
-        }
-
-        if (!allowedTypes.includes(String(point.data_type || '').toUpperCase())) {
-            errors.push(`第 ${row} 行：数据类型不正确`)
-        }
-        const interval = Number(point.sample_interval_ms)
-        if (!Number.isFinite(interval) || interval < 100 || interval > 60000) {
-            errors.push(`第 ${row} 行：采集周期必须在 100-60000ms 之间`)
-        }
-        if (!allowedAccessTypes.includes(String(point.access_type || '').toUpperCase())) {
-            errors.push(`第 ${row} 行：读写类型不正确`)
-        }
-        const rules = pointVoiceRules(point)
-        if (rules.length > 12) errors.push(`第 ${row} 行：单个点位最多配置 12 条语音规则`)
-        rules.forEach((rule, ruleIndex) => {
-            if (!rule.enabled) return
-            if (!String(rule.text || '').trim() && !String(rule.audio_url || '').trim()) {
-                errors.push(`第 ${row} 行语音 ${ruleIndex + 1}：播报文字和语音文件至少填写一个`)
-            }
-            if (voiceRuleNeedsThreshold(rule) && !Number.isFinite(Number(rule.threshold))) {
-                errors.push(`第 ${row} 行语音 ${ruleIndex + 1}：当前触发方式必须填写阈值`)
-            }
-            if (rule.mode === 'file' && !String(rule.audio_url || '').trim()) {
-                errors.push(`第 ${row} 行语音 ${ruleIndex + 1}：文件播放模式尚未生成或上传语音文件`)
-            }
-        })
-    })
-
-    return errors
-}
-
-function buildDataPointPayload(point) {
-    const { id, device_id, alarm_high, alarm_low, __usage, __originalName, __voiceRules, ...payload } = point
-    const usage = normalizePointUsage({ ...point, __usage })
-    const displayName = pointDisplayName(point)
-    const internalName = String(payload.name || '').trim() || toInternalPointName(displayName, id || displayName)
-    const fieldName = roleFromUsage(usage, internalName)
-    const plcTag = String(payload.plc_tag || '').trim()
-    const dataType = String(payload.data_type || 'WORD').toUpperCase()
-    return {
-        ...payload,
-        name: internalName,
-        label: displayName,
-        plc_tag: plcTag,
-        data_type: dataType,
-        access_type: String(payload.access_type || 'READ').toUpperCase(),
-        category: inferPointCategory(point, usage),
-        value_role: fieldName,
-        quality: 'good',
-        scale: payload.scale ?? 1,
-        offset: payload.offset ?? 0,
-        expression: payload.expression || '',
-        display_format: payload.display_format || '',
-        unit: dataType === 'BOOL' ? '' : (payload.unit || ''),
-        db_number: plcTag ? null : optionalNumber(payload.db_number),
-        db_byte_offset: plcTag ? null : optionalNumber(payload.db_byte_offset),
-        bit_offset: plcTag ? null : optionalNumber(payload.bit_offset),
-        point_kind: usage === 'normal' ? 'normal' : 'alarm',
-        alarm_record_role: usage === 'alarm_trigger' || usage === 'normal' ? '' : fieldName,
-        alarm_text: String(payload.alarm_text || '').trim(),
-        alarm_level: payload.alarm_level || 'WARNING',
-        alarm_condition: payload.alarm_condition || '=1',
-        voice_config: JSON.stringify({
-            enabled: pointVoiceRules(point).some(rule => rule.enabled),
-            rules: pointVoiceRules(point).map((rule, index) => normalizeVoiceRule(rule, index))
-        })
-    }
-}
-
-async function saveAllPoints() {
-    if (!selectedDeviceForPoints.value) return alert('请先选择设备')
-    const errors = validatePointRows(dataPoints.value)
-    if (errors.length) {
-        return alert(errors.slice(0, 8).join('\n'), { title: '点位配置未保存', type: 'warning' })
-    }
-
-    const points = dataPoints.value.map(buildDataPointPayload)
-    let savedCount = 0
-    if (isAllPointsMode.value) {
-        const deviceIds = new Set([...loadedPointDeviceIds.value, ...dataPoints.value.map(point => point.device_id).filter(Boolean)])
-        for (const deviceId of deviceIds) {
-            const rows = dataPoints.value
-                .filter(point => point.device_id === deviceId)
-                .map(buildDataPointPayload)
-            const result = await adminApi.saveDataPointsBatch(deviceId, rows)
-            if (result?.error) return alert(result.error)
-            if (!result?.success) return alert('保存失败：后端没有返回成功状态', { title: '保存失败', type: 'danger' })
-            savedCount += result.count ?? rows.length
-        }
-    } else {
-        const result = await adminApi.saveDataPointsBatch(selectedDeviceForPoints.value, points)
-        if (result?.error) return alert(result.error)
-        if (!result?.success) return alert('保存失败：后端没有返回成功状态', { title: '保存失败', type: 'danger' })
-        savedCount = result.count ?? points.length
-    }
-    await alert(`保存成功，已写入 ${savedCount} 个点位。`, { title: '点位配置已保存', type: 'success' })
-    isPointsDirty.value = false
-    await loadDataPoints()
-    selectedDeviceForMonitor.value = selectedDeviceForPoints.value
-    await loadRealtimePointValues()
-    setTimeout(() => loadEngineStatus(), 800)
-}
-
-const selectedDeviceForMonitor = ref(storedAdminUiState.selectedDeviceForMonitor || 'all')
-const realtimePointRows = ref([])
-const realtimePointDeviceStatus = ref(null)
-
-// ============ 点位实时监视表格分页状态 ============
-const monitorCurrentPage = ref(1)
-const monitorPageSize = ref(20)
-
-const totalMonitorPages = computed(() => {
-    if (monitorPageSize.value <= 0) return 1
-    return Math.max(1, Math.ceil(realtimePointRows.value.length / monitorPageSize.value))
-})
-
-const paginatedRealtimePointRows = computed(() => {
-    if (monitorPageSize.value <= 0) {
-        return realtimePointRows.value
-    }
-    const start = (monitorCurrentPage.value - 1) * monitorPageSize.value
-    return realtimePointRows.value.slice(start, start + monitorPageSize.value)
-})
-
-const displayedMonitorPageNumbers = computed(() => {
-    const total = totalMonitorPages.value
-    const current = monitorCurrentPage.value
-    if (total <= 7) {
-        return Array.from({ length: total }, (_, i) => i + 1)
-    }
-    const pages = []
-    let start = Math.max(1, current - 2)
-    let end = Math.min(total, current + 2)
-    if (current <= 3) {
-        end = 5
-    } else if (current >= total - 2) {
-        start = total - 4
-    }
-    for (let i = start; i <= end; i++) {
-        pages.push(i)
-    }
-    return pages
-})
-
-watch(totalMonitorPages, (maxPages) => {
-    if (monitorCurrentPage.value > maxPages) {
-        monitorCurrentPage.value = maxPages
-    }
-})
-
-watch([selectedDeviceForMonitor, monitorPageSize], () => {
-    monitorCurrentPage.value = 1
-})
-const realtimePointDeviceStatuses = ref([])
-const realtimePointSnapshotAt = ref(null)
-const realtimePointLoading = ref(false)
-const realtimePointError = ref('')
-const pointMonitorAutoRefresh = ref(storedAdminUiState.pointMonitorAutoRefresh !== false)
-const pointMonitorRefreshIntervalMs = 1000
-let pointMonitorTimer = null
-let realtimePointRequestSeq = 0
-let realtimePointInFlight = false
-const selectedMonitorDevice = computed(() => devices.value.find(d => d.id === selectedDeviceForMonitor.value) || null)
-const isAllPointMonitorMode = computed(() => selectedDeviceForMonitor.value === 'all')
-const pointMonitorStatusSummary = computed(() => {
-    if (!isAllPointMonitorMode.value) return realtimePointDeviceStatus.value
-    const statuses = realtimePointDeviceStatuses.value || []
-    const total = devices.value.length
-    const online = statuses.filter(status => status.quality === 'good' || status.status === 'connected').length
-    const bad = statuses.filter(status => status.quality === 'bad' || ['error', 'unconfigured', 'unsupported', 'disabled'].includes(status.status)).length
-    return {
-        status: online === total && total > 0 ? 'connected' : bad > 0 ? 'error' : 'idle',
-        message: `全部设备：${online}/${total} 在线`,
-        endpoint: '全部设备',
-        lastError: bad > 0 ? `${bad} 台设备离线或未配置` : ''
-    }
-})
-
-function ensurePointMonitorDevice() {
-    if (selectedDeviceForMonitor.value) return
-    selectedDeviceForMonitor.value = 'all'
-}
-
-function pointRuntimeKey(point) {
-    return `${point.device_id || ''}:${point.id || point.name || ''}`
-}
-
-function mergeRealtimePointRows(nextRows = []) {
-    const existing = new Map(realtimePointRows.value.map(row => [row.__runtimeKey || pointRuntimeKey(row), row]))
-    const merged = nextRows.map((row) => {
-        const key = pointRuntimeKey(row)
-        const current = existing.get(key)
-        if (current) {
-            Object.assign(current, row, { __runtimeKey: key })
-            return current
-        }
-        return { ...row, __runtimeKey: key }
-    })
-    realtimePointRows.value = merged
-}
-
-async function loadRealtimePointValues(options = {}) {
-    const silent = !!options.silent
-    ensurePointMonitorDevice()
-    if (!selectedDeviceForMonitor.value) {
-        realtimePointRows.value = []
-        realtimePointDeviceStatus.value = null
-        realtimePointSnapshotAt.value = null
-        return
-    }
-    if (realtimePointInFlight && silent) return
-
-    const requestSeq = ++realtimePointRequestSeq
-    realtimePointInFlight = true
-    if (!silent) {
-        realtimePointLoading.value = true
-        realtimePointError.value = ''
-    }
-    try {
-        const result = await adminApi.getRealtimePointValues(selectedDeviceForMonitor.value)
-        if (requestSeq !== realtimePointRequestSeq) return
-        if (result?.error) {
-            if (!silent || !realtimePointRows.value.length) realtimePointError.value = result.error
-            return
-        }
-        mergeRealtimePointRows(result.points || [])
-        realtimePointDeviceStatus.value = result.deviceStatus || null
-        realtimePointDeviceStatuses.value = result.deviceStatuses || []
-        realtimePointSnapshotAt.value = result.snapshotTimestamp || null
-        if (!silent) realtimePointError.value = ''
-    } catch (e) {
-        if (!silent || !realtimePointRows.value.length) realtimePointError.value = e.message || '读取实时点位失败'
-    } finally {
-        if (requestSeq === realtimePointRequestSeq) realtimePointInFlight = false
-        if (!silent) realtimePointLoading.value = false
-    }
-}
-
-function startPointMonitor() {
-    stopPointMonitor()
-    ensurePointMonitorDevice()
-    loadRealtimePointValues({ silent: realtimePointRows.value.length > 0 })
-    if (pointMonitorAutoRefresh.value) {
-        pointMonitorTimer = setInterval(() => loadRealtimePointValues({ silent: true }), pointMonitorRefreshIntervalMs)
-    }
-}
-
-function stopPointMonitor() {
-    if (pointMonitorTimer) {
-        clearInterval(pointMonitorTimer)
-        pointMonitorTimer = null
-    }
-}
-
-function formatPointValue(point) {
-    if (point.value === undefined || point.value === null) return '-'
-    if (typeof point.value === 'boolean') return point.value ? 'ON / true' : 'OFF / false'
-    if (typeof point.value === 'number') {
-        const format = String(point.display_format || '').trim()
-        const decimals = format.includes('.') ? Math.min(6, format.split('.')[1].length) : null
-        const text = decimals === null ? String(point.value) : point.value.toFixed(decimals)
-        return point.unit ? `${text} ${point.unit}` : text
-    }
-    return String(point.value)
-}
-
-function formatQualityLabel(quality) {
-    const labels = { good: '正常', stale: '过期', bad: '异常' }
-    return labels[quality] || quality || '-'
-}
-
-function formatPointTime(value) {
-    const timestamp = Number(value)
-    if (!Number.isFinite(timestamp) || timestamp <= 0) return '-'
-    return new Date(timestamp).toLocaleTimeString()
-}
-
-// 扩展功能：从其他设备复制
-async function copyPointsFrom(sourceDeviceId) {
-    if (isAllPointsMode.value) return alert('请先筛选到某一台设备，再从其他设备复制点位配置。')
-    if (!sourceDeviceId || sourceDeviceId === selectedDeviceForPoints.value) return
-    if (isPointsDirty.value && !(await confirm('当前有未保存的修改，复制将覆盖这些修改，确定继续？'))) return
-    
-    const sourcePoints = await adminApi.getDataPoints(sourceDeviceId)
-    if (sourcePoints.length === 0) {
-        return alert('源设备没有点位配置')
-    }
-    
-    // 复制时去掉 id 相关的字段（如果后端有的话），保持干净的映射
-    dataPoints.value = sourcePoints.map(p => normalizeLoadedPoint({ ...p, id: undefined }))
-    isPointsDirty.value = true
-    alert(`已成功复制 ${sourcePoints.length} 个点位配置，请检查后点击保存。`)
-}
-
-// 扩展功能：同步到同产线其他设备
-async function syncToLine() {
-    if (isAllPointsMode.value) return alert('请先筛选到某一台设备，再同步到同产线设备。')
-    if (isPointsDirty.value) {
-        return alert('请先保存当前设备的点位配置，再执行同步操作！')
-    }
-    const currentDevice = devices.value.find(d => d.id === selectedDeviceForPoints.value)
-    if (!currentDevice) return
-    
-    const targetDevices = devices.value.filter(d => d.line_id === currentDevice.line_id && d.id !== currentDevice.id)
-    if (targetDevices.length === 0) return alert('该产线下没有其他设备。')
-    
-    if (!(await confirm(`确定将当前点位配置同步到同产线的 ${targetDevices.length} 台设备吗？\n（目标设备的原有配置将被覆盖）`))) return
-    
-    const errors = validatePointRows(dataPoints.value)
-    if (errors.length) return alert(errors.slice(0, 8).join('\n'), { title: '点位配置未保存', type: 'warning' })
-    const validPoints = dataPoints.value.map(buildDataPointPayload)
-    
-    try {
-        for (const d of targetDevices) {
-            const result = await adminApi.saveDataPointsBatch(d.id, validPoints)
-            if (result?.error || !result?.success) {
-                throw new Error(`${d.name || d.id}: ${result?.error || '后端没有返回成功状态'}`)
-            }
-        }
-        alert('批量同步成功！现在同产线的所有设备都使用了相同的点位结构。', { title: '同步成功', type: 'success' })
-    } catch (e) {
-        alert(`同步过程中发生错误：${e.message || e}`, { title: '同步失败', type: 'danger' })
-    }
-}
-
-// ============ 连接设置 ============
-const defaultSettings = {
-    factory_name: '',
-    data_mode: 'integrated_plc',
-    realtime_stale_ms: '6000',
-    display_mode: 'industrial_twin',
-    // 视角模式
-    camera_mode: 'auto',
-    render_profile: 'balanced',
-    render_target_fps: 45,
-    render_scale: 1,
-    render_antialias: false,
-    render_label_fps: 12
-}
-const settings = reactive({ ...defaultSettings })
-
-const renderProfileOptions = RENDER_PROFILE_OPTIONS
-const resolvedRenderSettings = computed(() => normalizeRenderSettings(settings))
-const selectedRenderProfile = computed(() => (
-    renderProfileOptions.find(item => item.value === settings.render_profile)
-    || renderProfileOptions.find(item => item.value === 'balanced')
-))
-
-// ============ 桌面运行与局域网投屏 ============
-const runtimeSettings = reactive({
-    auto_start_enabled: true,
-    auto_start_supported: false,
-    packaged: false,
-    lan_display_enabled: false,
-    lan_display_port: 8787,
-    lan_display_pin: ''
-})
-const runtimeStatus = reactive({
-    enabled: false,
-    running: false,
-    port: 8787,
-    pin: '',
-    urls: [],
-    pairingUrls: [],
-    clients: 0,
-    error: '',
-    note: ''
-})
-const runtimeSaving = ref(false)
-const runtimeMessage = ref('')
-const runtimeQrDataUrl = ref('')
-let runtimeRefreshTimer = null
-const firstCastPairingUrl = computed(() => runtimeStatus.pairingUrls?.[0] || '')
-
-async function refreshRuntimeQr() {
-    if (!firstCastPairingUrl.value) {
-        runtimeQrDataUrl.value = ''
-        return
-    }
-    try {
-        runtimeQrDataUrl.value = await QRCode.toDataURL(firstCastPairingUrl.value, {
-            width: 240,
-            margin: 1,
-            errorCorrectionLevel: 'M'
-        })
-    } catch (error) {
-        runtimeQrDataUrl.value = ''
-        runtimeMessage.value = `二维码生成失败：${error.message || error}`
-    }
-}
-
-async function loadRuntimeSettings({ silent = false } = {}) {
-    try {
-        const result = await adminApi.getRuntimeSettings()
-        if (result?.error) throw new Error(result.error)
-        Object.assign(runtimeSettings, {
-            auto_start_enabled: result.auto_start_enabled !== false,
-            auto_start_supported: result.auto_start_supported === true,
-            packaged: result.packaged === true,
-            lan_display_enabled: result.lan_display_enabled === true,
-            lan_display_port: Number(result.lan_display_port || result.lan_display?.port || 8787),
-            lan_display_pin: String(result.lan_display_pin || result.lan_display?.pin || '')
-        })
-        Object.assign(runtimeStatus, result.lan_display || {}, {
-            urls: result.lan_display?.urls || [],
-            pairingUrls: result.lan_display?.pairingUrls || []
-        })
-        await refreshRuntimeQr()
-        return result
-    } catch (error) {
-        if (!silent) runtimeMessage.value = `运行配置读取失败：${error.message || error}`
-        return null
-    }
-}
-
-async function saveRuntimeSettings() {
-    runtimeSaving.value = true
-    runtimeMessage.value = '正在保存运行配置...'
-    try {
-        const result = await adminApi.saveRuntimeSettings({
-            auto_start_enabled: runtimeSettings.auto_start_enabled,
-            lan_display_enabled: runtimeSettings.lan_display_enabled,
-            lan_display_port: runtimeSettings.lan_display_port,
-            lan_display_pin: runtimeSettings.lan_display_pin
-        })
-        if (result?.error) throw new Error(result.error)
-        Object.assign(runtimeSettings, {
-            auto_start_enabled: result.auto_start_enabled !== false,
-            auto_start_supported: result.auto_start_supported === true,
-            packaged: result.packaged === true,
-            lan_display_enabled: result.lan_display_enabled === true,
-            lan_display_port: Number(result.lan_display_port || 8787),
-            lan_display_pin: String(result.lan_display_pin || '')
-        })
-        Object.assign(runtimeStatus, result.lan_display || {})
-        await refreshRuntimeQr()
-        runtimeMessage.value = runtimeSettings.lan_display_enabled
-            ? '运行配置已保存，投屏服务已按新配置启动。'
-            : '运行配置已保存，局域网投屏当前已关闭。'
-    } catch (error) {
-        runtimeMessage.value = `运行配置保存失败：${error.message || error}`
-    } finally {
-        runtimeSaving.value = false
-    }
-}
-
-async function rotateCastPin() {
-    if (!(await confirm('重新生成后，之前分享的投屏二维码和地址会立即失效，确定继续吗？'))) return
-    runtimeSaving.value = true
-    runtimeMessage.value = '正在生成新的投屏码...'
-    try {
-        const result = await adminApi.rotateCastPin()
-        if (result?.error) throw new Error(result.error)
-        runtimeSettings.lan_display_pin = String(result.lan_display_pin || result.lan_display?.pin || '')
-        Object.assign(runtimeStatus, result.lan_display || {})
-        await refreshRuntimeQr()
-        runtimeMessage.value = '投屏码已更新，旧设备会被要求重新授权。'
-    } catch (error) {
-        runtimeMessage.value = `投屏码更新失败：${error.message || error}`
-    } finally {
-        runtimeSaving.value = false
-    }
-}
-
-async function copyCastUrl(url) {
-    if (!url) return
-    try {
-        if (navigator.clipboard?.writeText) {
-            await navigator.clipboard.writeText(url)
-        } else {
-            const input = document.createElement('textarea')
-            input.value = url
-            input.style.position = 'fixed'
-            input.style.opacity = '0'
-            document.body.appendChild(input)
-            input.select()
-            document.execCommand('copy')
-            input.remove()
-        }
-        runtimeMessage.value = '投屏地址已复制。'
-    } catch (error) {
-        runtimeMessage.value = `复制失败，请手动选择地址：${url}`
-    }
-}
-
-function startRuntimeRefresh() {
-    if (runtimeRefreshTimer) clearInterval(runtimeRefreshTimer)
-    runtimeRefreshTimer = setInterval(() => loadRuntimeSettings({ silent: true }), 5000)
-    runtimeRefreshTimer.unref?.()
-}
-
-function stopRuntimeRefresh() {
-    if (runtimeRefreshTimer) clearInterval(runtimeRefreshTimer)
-    runtimeRefreshTimer = null
-}
-
-async function loadSettings() {
-    const s = await adminApi.getSettings()
-    if (s.data_mode !== 'simulation') s.data_mode = 'integrated_plc'
-    for (const key of Object.keys(settings)) delete settings[key]
-    Object.assign(settings, defaultSettings, s)
-    settings.render_target_fps = Number(settings.render_target_fps || 45)
-    settings.render_scale = Number(settings.render_scale || 1)
-    settings.render_label_fps = Number(settings.render_label_fps || 12)
-    settings.render_antialias = ['1', 'true', 'yes', 'on'].includes(String(settings.render_antialias).toLowerCase())
-    await loadRuntimeSettings({ silent: true })
-    await loadDatabaseConfig()
-    // 同时获取引擎状态
-    loadEngineStatus()
-}
-
-const engineStatus = reactive({
-    mode: null,
-    plcStatus: { status: 'unknown', message: '未知' },
-    collectorStatus: { status: 'unknown', message: '未知' }
-})
-const plcStatusLabels = {
-    connected: '已连接',
-    connecting: '连接中',
-    retrying: '重连中',
-    error: '异常',
-    disabled: '未启用',
-    no_points: '无点位',
-    unconfigured: '未配置',
-    unsupported: '暂不支持',
-    stopped: '已停止',
-    idle: '等待'
-}
-const plcStatusByDevice = computed(() => {
-    const map = {}
-    const statuses = engineStatus.plcStatus?.devices || []
-    statuses.forEach(status => {
-        map[status.deviceId] = status
-    })
-    return map
-})
-
-function formatPlcDeviceStatus(device) {
-    if (!Number(device.plc_enabled || 0)) return '未启用'
-    const status = plcStatusByDevice.value[device.id]
-    if (!status) return device.plc_ip ? '等待采集' : '未配置'
-    if (status.status === 'unconfigured' && device.plc_ip && !status.plc_ip) return '配置已更新'
-    return plcStatusLabels[status.status] || status.status || '未知'
-}
-
-function formatPlcEndpoint(device) {
-    if (!Number(device.plc_enabled || 0)) return '未启用'
-    const status = plcStatusByDevice.value[device.id]
-    if (status?.endpoint) return status.endpoint
-    if (!device.plc_ip) return '未填写 IP'
-    return `${device.plc_protocol || 'S7'} ${device.plc_ip}:${device.plc_port || 102} (Rack=${device.plc_rack ?? 0}, Slot=${device.plc_slot ?? 1})`
-}
-
-function formatPlcIntervals(status) {
-    const intervals = status?.intervals || []
-    return intervals.length ? intervals.map(ms => `${ms}ms`).join(' / ') : '-'
-}
-
-function formatPlcTime(value) {
-    const timestamp = Number(value)
-    if (!Number.isFinite(timestamp) || timestamp <= 0) return '-'
-    return new Date(timestamp).toLocaleTimeString()
-}
 
 function formatModelName(modelType) {
     const model = availableModelOptions.value.find(item => item.id === modelType)
     return model?.name || modelType || '未设置'
-}
-const databaseConfig = reactive({
-    type: 'mysql',
-    host: '127.0.0.1',
-    port: 3307,
-    user: 'root',
-    password: '******',
-    database: 'dongtai_daping',
-    filename: '',
-    encrypt: false,
-    trustServerCertificate: true
-})
-const databaseTestStatus = ref('')
-const databaseSaving = ref(false)
-const databaseBackupBusy = ref(false)
-const databaseBackupMessage = ref('')
-const databaseBackupStatus = reactive({
-    supported: false,
-    automatic: false,
-    intervalMs: 0,
-    retention: 0,
-    directory: '',
-    lastBackup: null,
-    lastRecovery: null,
-    backups: []
-})
-const siteBackupFileInput = ref(null)
-const siteBackupBusy = ref(false)
-const siteBackupMessage = ref('')
-const siteBackupStatus = reactive({
-    supported: false,
-    retention: 0,
-    externalCopyRequired: true,
-    backups: []
-})
-const databaseDefaultPorts = {
-    mysql: 3307,
-    postgres: 5432,
-    sqlserver: 1433
-}
-
-async function loadDatabaseConfig() {
-    try {
-        const config = await adminApi.getDatabaseConfig()
-        Object.assign(databaseConfig, config)
-        await Promise.all([loadDatabaseBackups(), loadSiteBackups()])
-    } catch (e) {
-        databaseTestStatus.value = '数据库配置读取失败'
-    }
-}
-
-async function loadSiteBackups() {
-    try {
-        const status = await adminApi.getSiteBackups()
-        if (status?.error) throw new Error(status.error)
-        Object.assign(siteBackupStatus, status, { backups: status.backups || [] })
-    } catch (e) {
-        siteBackupMessage.value = `整站灾备状态读取失败：${e.message || e}`
-    }
-}
-
-function downloadSiteBackup(backup) {
-    const link = document.createElement('a')
-    link.href = adminApi.siteBackupDownloadUrl(backup.filename)
-    link.download = backup.filename
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-}
-
-async function exportSiteBackup() {
-    siteBackupBusy.value = true
-    siteBackupMessage.value = '正在生成整站灾备包并校验文件，请稍候...'
-    try {
-        const result = await adminApi.createSiteBackup()
-        if (result?.error || !result?.success || !result.backup?.filename) {
-            throw new Error(result?.error || '后端没有返回灾备文件')
-        }
-        Object.assign(siteBackupStatus, result.status || {}, { backups: result.status?.backups || [] })
-        siteBackupMessage.value = `灾备包已生成：${result.backup.filename}。请选择 U 盘、移动硬盘或 NAS 保存。`
-        downloadSiteBackup(result.backup)
-    } catch (e) {
-        siteBackupMessage.value = `整站灾备导出失败：${e.message || e}`
-    } finally {
-        siteBackupBusy.value = false
-    }
-}
-
-function chooseSiteBackupFile() {
-    if (!siteBackupFileInput.value) return
-    siteBackupFileInput.value.value = ''
-    siteBackupFileInput.value.click()
-}
-
-async function restoreSiteBackupFromFile(event) {
-    const file = event.target.files?.[0]
-    if (!file) return
-    if (!(await confirm(
-        `确定从“${file.name}”恢复整套现场？\n\n当前数据库和上传模型会先创建回滚副本，恢复后将以灾备包中的配置为准。`,
-        { title: '恢复整站灾备', type: 'warning', confirmText: '校验并恢复' }
-    ))) return
-
-    siteBackupBusy.value = true
-    siteBackupMessage.value = '正在校验灾备包并恢复数据库、现场配置和上传模型...'
-    try {
-        const result = await adminApi.restoreSiteBackup(file)
-        if (result?.error || !result?.success) throw new Error(result?.error || '后端没有返回成功状态')
-        Object.assign(siteBackupStatus, result.status || {}, { backups: result.status?.backups || [] })
-        Object.assign(databaseBackupStatus, result.databaseStatus || {}, { backups: result.databaseStatus?.backups || [] })
-        await loadWorkshops()
-        await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform()])
-        ensureComposerSelection()
-        syncComposerDraftFromSelection()
-        await nextTick()
-        scheduleComposerPreview()
-        siteBackupMessage.value = `整站恢复完成：灾备时间 ${new Date(result.manifestCreatedAt).toLocaleString()}，上传模型 ${result.uploadedFileCount || 0} 个。`
-        await alert('现场配置、数据库和上传模型已恢复完成。', { title: '整站恢复成功', type: 'success' })
-    } catch (e) {
-        siteBackupMessage.value = `整站恢复失败：${e.message || e}`
-        await alert(siteBackupMessage.value, { title: '整站恢复失败', type: 'danger' })
-    } finally {
-        siteBackupBusy.value = false
-        event.target.value = ''
-    }
-}
-
-async function loadDatabaseBackups() {
-    try {
-        const status = await adminApi.getDatabaseBackups()
-        Object.assign(databaseBackupStatus, status, { backups: status.backups || [] })
-    } catch (e) {
-        databaseBackupMessage.value = `备份状态读取失败：${e.message || e}`
-    }
-}
-
-async function createDatabaseBackup() {
-    databaseBackupBusy.value = true
-    databaseBackupMessage.value = '正在创建一致性备份...'
-    try {
-        const result = await adminApi.createDatabaseBackup()
-        Object.assign(databaseBackupStatus, result.status || {})
-        databaseBackupMessage.value = `备份完成：${result.backup?.filename || ''}`
-    } catch (e) {
-        databaseBackupMessage.value = `备份失败：${e.message || e}`
-    } finally {
-        databaseBackupBusy.value = false
-    }
-}
-
-async function restoreDatabaseBackup(backup) {
-    if (!(await confirm(`恢复备份 ${backup.filename}？当前数据库会先自动备份，然后数据引擎将重新启动。`))) return
-    databaseBackupBusy.value = true
-    databaseBackupMessage.value = '正在校验并恢复备份...'
-    try {
-        const result = await adminApi.restoreDatabaseBackup(backup.filename)
-        Object.assign(databaseBackupStatus, result.status || {})
-        databaseBackupMessage.value = `已恢复：${backup.filename}`
-        await Promise.all([loadSettings(), loadWorkshops(), loadLines(), loadDevices(), loadModels(), loadPlatform()])
-    } catch (e) {
-        databaseBackupMessage.value = `恢复失败：${e.message || e}`
-    } finally {
-        databaseBackupBusy.value = false
-    }
-}
-
-function downloadDatabaseBackup(backup) {
-    const link = document.createElement('a')
-    link.href = adminApi.databaseBackupDownloadUrl(backup.filename)
-    link.download = backup.filename
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-}
-
-function formatBackupSize(bytes) {
-    const value = Number(bytes || 0)
-    if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`
-    return `${(value / 1024 / 1024).toFixed(1)} MB`
-}
-
-function formatBackupInterval(milliseconds) {
-    const hours = Number(milliseconds || 0) / 3600000
-    return hours >= 1 ? `${Number(hours.toFixed(1))} 小时` : `${Math.round(milliseconds / 60000)} 分钟`
-}
-
-async function testDatabaseConnection() {
-    databaseTestStatus.value = '正在测试连接...'
-    try {
-        const result = await adminApi.testDatabaseConfig({ ...databaseConfig })
-        databaseTestStatus.value = result.success ? '连接成功' : `连接失败：${result.error || '未知错误'}`
-    } catch (e) {
-        databaseTestStatus.value = `连接失败：${e.message || '后端服务不可用'}`
-    }
-}
-
-async function saveDatabaseConnection() {
-    if (!(await confirm('保存数据库连接后，后端会重新初始化数据库并重启数据引擎，确定继续吗？'))) return
-    databaseSaving.value = true
-    databaseTestStatus.value = '正在保存并重新连接...'
-    try {
-        const result = await adminApi.saveDatabaseConfig({ ...databaseConfig })
-        if (!result.success) {
-            databaseTestStatus.value = `保存失败：${result.error || '未知错误'}`
-            return
-        }
-        Object.assign(databaseConfig, result.config || databaseConfig)
-        databaseTestStatus.value = '保存成功，数据库已重新连接'
-        await loadDatabaseBackups()
-        await Promise.all([loadSettings(), loadWorkshops(), loadLines(), loadDevices(), loadModels(), loadPlatform()])
-    } catch (e) {
-        databaseTestStatus.value = `保存失败：${e.message || e}`
-    } finally {
-        databaseSaving.value = false
-    }
-}
-
-watch(() => databaseConfig.type, (type, oldType) => {
-    if (type === oldType) return
-    if (type === 'sqlite') {
-        databaseConfig.filename ||= 'backend/data/factory.db'
-        return
-    }
-    if (!databaseConfig.port || databaseConfig.port === databaseDefaultPorts[oldType]) {
-        databaseConfig.port = databaseDefaultPorts[type] || databaseConfig.port
-    }
-    databaseConfig.database ||= 'dongtai_daping'
-})
-
-async function loadEngineStatus() {
-    try {
-        const res = await fetch(`${API_BASE}/engine/status`)
-        const data = await res.json()
-        Object.assign(engineStatus, data)
-    } catch (e) {
-        engineStatus.mode = null
-        engineStatus.plcStatus = { status: 'error', message: '无法连接后端' }
-    }
-}
-
-function formatEngineMode(mode) {
-    const labels = {
-        integrated_plc: '内置低延迟采集模式',
-        simulation: '模拟模式'
-    }
-    return labels[mode] || '未启动'
-}
-
-async function saveSettings() {
-    const result = await adminApi.saveSettings({
-        factory_name: settings.factory_name,
-        data_mode: settings.data_mode,
-        realtime_stale_ms: settings.realtime_stale_ms,
-        display_mode: settings.display_mode,
-        camera_mode: settings.camera_mode,
-        render_profile: settings.render_profile,
-        render_target_fps: settings.render_target_fps,
-        render_scale: settings.render_scale,
-        render_antialias: settings.render_antialias,
-        render_label_fps: settings.render_label_fps
-    })
-    if (result?.error) return alert(result.error, { title: '设置保存失败', type: 'danger' })
-    if (!result?.success) return alert('设置保存失败：后端没有返回成功状态', { title: '设置保存失败', type: 'danger' })
-    // 保存后自动重启数据引擎
-    try {
-        await fetch(`${API_BASE}/engine/restart`, { method: 'POST' })
-        alert('设置已保存。数据引擎正在重启；渲染性能设置将在大屏刷新后生效。', { title: '保存成功', type: 'success' })
-    } catch (e) {
-        alert('设置已保存，但数据引擎重启失败，请手动重启后端服务', { title: '保存成功', type: 'warning' })
-    }
-    // 刷新引擎状态
-    setTimeout(() => loadEngineStatus(), 2000)
 }
 
 // ============ 模型管理 ============
@@ -4006,10 +2529,6 @@ function isDashboardGridPreview(widget) {
     return !!widget && !standalonePreviewWidgetTypes.has(widget.widget_type)
 }
 
-function clampNumber(value, min, max) {
-    return Math.max(min, Math.min(max, value))
-}
-
 function getWidgetFocusCanvasStyle(widget) {
     const columns = widgetPreviewGrid.value.columns || 24
     const rows = widgetPreviewGrid.value.rows || 12
@@ -4224,25 +2743,6 @@ let composerPreviewSeq = 0
 let composerResizeObserver = null
 let composerDragActive = false
 
-function sortByOrder(list) {
-    return [...list].sort((a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0))
-}
-
-function numberOrDefault(value, fallback = 0) {
-    const next = Number(value)
-    return Number.isFinite(next) ? next : fallback
-}
-
-function parseInstanceConfig(value) {
-    if (!value) return {}
-    if (typeof value === 'object') return value
-    try {
-        return JSON.parse(value)
-    } catch (e) {
-        return {}
-    }
-}
-
 function getDeviceDefaultInstanceConfig(device = {}) {
     const config = parseInstanceConfig(device.instance_config)
     const modelType = device.model_type || 'builtin_furnace'
@@ -4274,36 +2774,6 @@ function getDeviceDefaultInstanceConfig(device = {}) {
         animationProfile: 'static',
         scaleMultiplier: 1
     }
-}
-
-function stringifyInstanceConfigForEdit(value, defaultConfig = {}) {
-    if (!value) return JSON.stringify(defaultConfig, null, 2)
-    if (typeof value === 'string') {
-        try {
-            return JSON.stringify({ ...defaultConfig, ...JSON.parse(value) }, null, 2)
-        } catch (e) {
-            return value
-        }
-    }
-    try {
-        return JSON.stringify({ ...defaultConfig, ...value }, null, 2)
-    } catch (e) {
-        return JSON.stringify(defaultConfig, null, 2)
-    }
-}
-
-function parseEditableInstanceConfig(value) {
-    if (!value) return {}
-    if (typeof value === 'object') return value
-    return JSON.parse(value)
-}
-
-function isAuxiliaryDeviceConfig(device) {
-    const config = parseInstanceConfig(device?.instance_config)
-    return device?.model_type === 'transfer_cart'
-        || config.role === 'transfer_cart'
-        || config.role === 'auxiliary'
-        || config.sceneObject === true
 }
 
 function getDeviceWorkshopId(device) {
@@ -7794,10 +6264,13 @@ const mainTabs = [
                                     <span><input v-model="databaseConfig.trustServerCertificate" type="checkbox" /> 信任服务器证书</span>
                                 </label>
                             </div>
-                            <div class="form-row" style="margin-top:16px; margin-bottom:0">
+                            <div class="form-row" style="margin-top:16px; margin-bottom:0; display:flex; align-items:center; gap:12px;">
                                 <button @click="testDatabaseConnection" class="btn">测试连接</button>
                                 <button @click="saveDatabaseConnection" class="btn btn-primary" :disabled="databaseSaving">保存数据库连接</button>
-                                <span style="font-size:13px; color:#515154">{{ databaseTestStatus }}</span>
+                                <span v-if="databaseTestStatus" class="db-status-badge" :class="getDbStatusBadgeClass(databaseTestStatus)">
+                                    <span class="db-status-dot"></span>
+                                    {{ databaseTestStatus }}
+                                </span>
                             </div>
 
                             <div v-if="databaseConfig.type === 'sqlite' && databaseBackupStatus.supported" class="database-backup-panel">
@@ -11263,5 +9736,53 @@ button:enabled:active {
         transition-duration: 1ms !important;
         animation-duration: 1ms !important;
     }
+}
+.db-status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.3;
+    transition: all 0.2s ease;
+}
+.db-status-badge.status-success {
+    color: #1b6b3a;
+    background: rgba(52, 199, 89, 0.12);
+    border: 1px solid rgba(52, 199, 89, 0.25);
+}
+.db-status-badge.status-success .db-status-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: #34c759;
+}
+.db-status-badge.status-error {
+    color: #9f1d17;
+    background: rgba(255, 59, 48, 0.12);
+    border: 1px solid rgba(255, 59, 48, 0.25);
+}
+.db-status-badge.status-error .db-status-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: #ff3b30;
+}
+.db-status-badge.status-loading {
+    color: #0071e3;
+    background: rgba(0, 113, 227, 0.1);
+    border: 1px solid rgba(0, 113, 227, 0.22);
+}
+.db-status-badge.status-loading .db-status-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: #0071e3;
+    animation: db-dot-pulse 1s infinite alternate;
+}
+.db-status-badge.status-info {
+    color: #515154;
+    background: #e8e8ed;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+}
+.db-status-badge.status-info .db-status-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: #86868b;
+}
+@keyframes db-dot-pulse {
+    0% { opacity: 0.3; transform: scale(0.8); }
+    100% { opacity: 1; transform: scale(1.25); }
 }
 </style>
