@@ -709,6 +709,16 @@ function addDataPoint(usage = 'normal') {
     setPointUsage(point, usage, { markDirty: false })
     dataPoints.value.push(point)
     isPointsDirty.value = true
+
+    nextTick(() => {
+        if (pointsPageSize.value > 0) {
+            pointsCurrentPage.value = totalPointPages.value
+        }
+        const tableContainer = document.querySelector('.table-scroll')
+        if (tableContainer) {
+            tableContainer.scrollTo({ top: tableContainer.scrollHeight, behavior: 'smooth' })
+        }
+    })
 }
 
 function addAlarmTriggerPoint() {
@@ -7494,8 +7504,6 @@ const mainTabs = [
                         <div style="margin-top:15px;display:flex; justify-content: space-between; align-items: center;">
                             <div style="display:flex; gap:10px; flex-wrap:wrap;">
                                 <button @click="addDataPoint('normal')" class="btn">+ 添加点位</button>
-                                <button @click="addAlarmTriggerPoint" class="btn">+ 添加报警点位</button>
-                                <button @click="ensureAlarmRecordPoints" class="btn" :disabled="isAllPointsMode">补齐报警记录字段</button>
                             </div>
                             <div style="display:flex; align-items: center; gap: 15px;">
                                 <span v-if="isPointsDirty" style="color: #ff9500; font-size: 13px;">存在未保存的修改</span>
@@ -7963,36 +7971,6 @@ const mainTabs = [
                                     <p><strong>模拟模式：</strong>系统自动生成随机数据，无需连接任何外部设备。</p>
                                     <p style="color:#86868b; font-size:12px;">适用于离线演示、功能验收。数据为程序模拟生成。</p>
                                 </template>
-                            </div>
-                        </div>
-
-                        <!-- ===== PLC 实时状态 ===== -->
-                        <div class="settings-section" v-if="settings.data_mode === 'integrated_plc'">
-                            <h3 class="section-title">PLC 实时状态</h3>
-                            <div class="table-scroll">
-                                <table class="data-table plc-status-table">
-                                    <thead>
-                                        <tr><th>设备</th><th>状态</th><th>端点</th><th>采集周期</th><th>上次连接</th><th>最近读取</th><th>错误</th></tr>
-                                    </thead>
-                                    <tbody>
-                                        <tr v-for="status in (engineStatus.plcStatus?.devices || [])" :key="status.deviceId">
-                                            <td>{{ status.deviceName }} <code>{{ status.deviceId }}</code></td>
-                                            <td>
-                                                <span class="plc-status-pill" :class="'plc-' + status.status">
-                                                    {{ plcStatusLabels[status.status] || status.status }}
-                                                </span>
-                                            </td>
-                                            <td>{{ status.endpoint || '-' }}</td>
-                                            <td>{{ formatPlcIntervals(status) }}</td>
-                                            <td>{{ formatPlcTime(status.lastConnectedAt) }}</td>
-                                            <td>{{ formatPlcTime(status.lastReadAt) }}</td>
-                                            <td>{{ status.lastError || status.message || '-' }}</td>
-                                        </tr>
-                                        <tr v-if="!(engineStatus.plcStatus?.devices || []).length">
-                                            <td colspan="7" style="text-align:center;color:#86868b">暂无 PLC 设备状态，请先在设备管理里启用 PLC 采集。</td>
-                                        </tr>
-                                    </tbody>
-                                </table>
                             </div>
                         </div>
 
