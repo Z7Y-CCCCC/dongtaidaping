@@ -389,13 +389,55 @@ const voiceTriggerOptions = [
 const selectedVoicePoint = computed(() => dataPoints.value[selectedVoicePointIndex.value] || null)
 const pointUsageOptions = [
     { value: 'normal', label: '常规监控' },
-    { value: 'alarm_trigger', label: '报警触发' },
-    { value: 'alarm_text_record', label: '报警内容记录' },
-    { value: 'alarm_start_record', label: '报警开始时间' },
-    { value: 'alarm_end_record', label: '报警结束时间' },
-    { value: 'alarm_number_record', label: '报警编号记录' },
-    { value: 'alarm_state_record', label: '报警状态记录' }
+    { value: 'alarm_trigger', label: '报警触发' }
 ]
+
+// ============ 点位表格分页状态 ============
+const pointsCurrentPage = ref(1)
+const pointsPageSize = ref(20)
+
+const totalPointPages = computed(() => {
+    if (pointsPageSize.value <= 0) return 1
+    return Math.max(1, Math.ceil(dataPoints.value.length / pointsPageSize.value))
+})
+
+const paginatedDataPoints = computed(() => {
+    if (pointsPageSize.value <= 0) {
+        return dataPoints.value
+    }
+    const start = (pointsCurrentPage.value - 1) * pointsPageSize.value
+    return dataPoints.value.slice(start, start + pointsPageSize.value)
+})
+
+const displayedPageNumbers = computed(() => {
+    const total = totalPointPages.value
+    const current = pointsCurrentPage.value
+    if (total <= 7) {
+        return Array.from({ length: total }, (_, i) => i + 1)
+    }
+    const pages = []
+    let start = Math.max(1, current - 2)
+    let end = Math.min(total, current + 2)
+    if (current <= 3) {
+        end = 5
+    } else if (current >= total - 2) {
+        start = total - 4
+    }
+    for (let i = start; i <= end; i++) {
+        pages.push(i)
+    }
+    return pages
+})
+
+watch(totalPointPages, (maxPages) => {
+    if (pointsCurrentPage.value > maxPages) {
+        pointsCurrentPage.value = maxPages
+    }
+})
+
+watch([selectedDeviceForPoints, pointsPageSize], () => {
+    pointsCurrentPage.value = 1
+})
 const pointDataTypes = [
     { value: 'BOOL', label: 'BOOL 开关量' },
     { value: 'BYTE', label: 'BYTE 字节' },
@@ -531,8 +573,9 @@ async function loadSystemVoices() {
     }
 }
 
-function openVoiceConfig(pointIndex) {
-    selectedVoicePointIndex.value = pointIndex
+function openVoiceConfig(target) {
+    const idx = typeof target === 'number' ? target : dataPoints.value.indexOf(target)
+    selectedVoicePointIndex.value = idx
     loadSystemVoices()
 }
 
@@ -688,7 +731,9 @@ function addAlarmTriggerPoint() {
     isPointsDirty.value = true
 }
 
-function removeDataPoint(idx) {
+function removeDataPoint(target) {
+    const idx = typeof target === 'number' ? target : dataPoints.value.indexOf(target)
+    if (idx < 0) return
     if (selectedVoicePointIndex.value === idx) closeVoiceConfig()
     else if (selectedVoicePointIndex.value > idx) selectedVoicePointIndex.value -= 1
     dataPoints.value.splice(idx, 1)
@@ -703,8 +748,87 @@ function isBoolPoint(point) {
     return String(point?.data_type || '').toUpperCase() === 'BOOL'
 }
 
+function autoConvertPlcTagForDataType(point) {
+    if (!point || !point.plc_tag || typeof point.plc_tag !== 'string') return
+    const tag = point.plc_tag.trim()
+    if (!tag) return
+
+    const dataType = String(point.data_type || 'WORD').toUpperCase()
+
+    const dbMatch = tag.match(/^(DB\d+)\.(DBX|DBB|DBW|DBD)(\d+)(?:\.(\d+))?$/i)
+    if (!dbMatch) return
+
+    const dbPrefix = dbMatch[1].toUpperCase()
+    const byteOffset = dbMatch[3]
+    const bitOffset = dbMatch[4] !== undefined ? dbMatch[4] : '0'
+
+    let targetArea = ''
+    let isBit = false
+
+    if (dataType === 'BOOL') {
+        targetArea = 'DBX'
+        isBit = true
+    } else if (['BYTE', 'CHAR'].includes(dataType)) {
+        targetArea = 'DBB'
+    } else if (['WORD', 'INT'].includes(dataType)) {
+        targetArea = 'DBW'
+    } else if (['DWORD', 'DINT', 'REAL', 'LREAL'].includes(dataType)) {
+        targetArea = 'DBD'
+    } else {
+        return
+    }
+
+    let newTag = `${dbPrefix}.${targetArea}${byteOffset}`
+    if (isBit) {
+        newTag += `.${bitOffset}`
+    }
+
+    if (newTag !== point.plc_tag) {
+        point.plc_tag = newTag
+    }
+}
+
+function getPlcAddressWarning(point) {
+    if (!point || !point.plc_tag || !String(point.plc_tag).trim()) return ''
+    const tag = String(point.plc_tag).trim().toUpperCase()
+    const dataType = String(point.data_type || 'WORD').toUpperCase()
+
+    const dbMatch = tag.match(/^DB(\d+)\.(DBX|DBB|DBW|DBD)(\d+)(?:\.(\d+))?$/i)
+    if (dbMatch) {
+        const area = dbMatch[2].toUpperCase()
+        const bit = dbMatch[4]
+
+        if (dataType === 'BOOL') {
+            if (area !== 'DBX' || bit === undefined) {
+                return 'BOOL 类型推荐使用 DBX 位地址，如 DB1.DBX0.0'
+            }
+        } else if (['BYTE', 'CHAR'].includes(dataType)) {
+            if (area !== 'DBB') {
+                return `${dataType} 类型推荐使用 DBB 字节地址，如 DB1.DBB0`
+            }
+        } else if (['WORD', 'INT'].includes(dataType)) {
+            if (area !== 'DBW') {
+                return `${dataType} 类型推荐使用 DBW 字地址，如 DB1.DBW0`
+            }
+        } else if (['DWORD', 'DINT', 'REAL', 'LREAL'].includes(dataType)) {
+            if (area !== 'DBD') {
+                return `${dataType} 类型推荐使用 DBD 双字地址，如 DB1.DBD0`
+            }
+        }
+        return ''
+    }
+
+    const generalMatch = tag.match(/^(?:DB\d+\.(?:DBX|DBB|DBW|DBD)\d+(?:\.\d+)?|[IQM](?:X|B|W|D)?\d+(?:\.\d+)?)$/i)
+    if (!generalMatch) {
+        return '地址格式可能有误，请检查（如 DB1.DBW0 或 DB1.DBX0.0）'
+    }
+
+    return ''
+}
+
 function handlePointDataTypeChange(point) {
     if (isBoolPoint(point)) point.unit = ''
+    autoConvertPlcTagForDataType(point)
     markPointsDirty()
 }
 
@@ -1070,6 +1194,53 @@ async function saveAllPoints() {
 const selectedDeviceForMonitor = ref(storedAdminUiState.selectedDeviceForMonitor || 'all')
 const realtimePointRows = ref([])
 const realtimePointDeviceStatus = ref(null)
+
+// ============ 点位实时监视表格分页状态 ============
+const monitorCurrentPage = ref(1)
+const monitorPageSize = ref(20)
+
+const totalMonitorPages = computed(() => {
+    if (monitorPageSize.value <= 0) return 1
+    return Math.max(1, Math.ceil(realtimePointRows.value.length / monitorPageSize.value))
+})
+
+const paginatedRealtimePointRows = computed(() => {
+    if (monitorPageSize.value <= 0) {
+        return realtimePointRows.value
+    }
+    const start = (monitorCurrentPage.value - 1) * monitorPageSize.value
+    return realtimePointRows.value.slice(start, start + monitorPageSize.value)
+})
+
+const displayedMonitorPageNumbers = computed(() => {
+    const total = totalMonitorPages.value
+    const current = monitorCurrentPage.value
+    if (total <= 7) {
+        return Array.from({ length: total }, (_, i) => i + 1)
+    }
+    const pages = []
+    let start = Math.max(1, current - 2)
+    let end = Math.min(total, current + 2)
+    if (current <= 3) {
+        end = 5
+    } else if (current >= total - 2) {
+        start = total - 4
+    }
+    for (let i = start; i <= end; i++) {
+        pages.push(i)
+    }
+    return pages
+})
+
+watch(totalMonitorPages, (maxPages) => {
+    if (monitorCurrentPage.value > maxPages) {
+        monitorCurrentPage.value = maxPages
+    }
+})
+
+watch([selectedDeviceForMonitor, monitorPageSize], () => {
+    monitorCurrentPage.value = 1
+})
 const realtimePointDeviceStatuses = ref([])
 const realtimePointSnapshotAt = ref(null)
 const realtimePointLoading = ref(false)
@@ -7084,8 +7255,8 @@ const mainTabs = [
                                 <thead>
                                     <tr>
                                         <th v-if="isAllPointsMode">设备</th>
-                                        <th>点位名称</th><th>点位用途</th><th>PLC 地址</th>
-                                        <th>数据类型</th><th>采集周期(ms)</th><th>读写</th>
+                                        <th>点位名称</th><th>点位用途</th><th>数据类型</th><th>PLC 地址</th>
+                                        <th>采集周期(ms)</th><th>读写</th>
                                         <th v-if="showPointAdvancedFields" title="PLC 原始值乘以这个数，常用于把整数缩放成工程值">换算倍率</th>
                                         <th v-if="showPointAdvancedFields" title="倍率换算后再加上的修正值，常用于传感器零点校准">偏移修正</th>
                                         <th v-if="showPointAdvancedFields" title="可选高级换算，x 代表倍率和偏移后的值，例如 x/10">自定义公式</th>
@@ -7094,7 +7265,7 @@ const mainTabs = [
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    <tr v-for="(p, idx) in dataPoints" :key="idx">
+                                    <tr v-for="(p, idx) in paginatedDataPoints" :key="p.name || p.plc_tag || idx">
                                         <td v-if="isAllPointsMode">
                                             <select v-model="p.device_id" @change="markPointsDirty" class="input input-sm device-point-select">
                                                 <option value="">选择设备</option>
@@ -7107,11 +7278,26 @@ const mainTabs = [
                                                 <option v-for="item in pointUsageOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
                                             </select>
                                         </td>
-                                        <td><input v-model="p.plc_tag" @input="markPointsDirty" class="input input-sm plc-address-input" placeholder="DB1.DBW3000 / DB1.DBX6.0 / DB10,S20.30" /></td>
                                         <td>
-                                            <select v-model="p.data_type" @change="handlePointDataTypeChange(p)" class="input input-sm">
+                                            <select v-model="p.data_type" @change="handlePointDataTypeChange(p)" class="input input-sm point-datatype-select">
                                                 <option v-for="type in pointDataTypes" :key="type.value" :value="type.value">{{ type.label }}</option>
                                             </select>
+                                        </td>
+                                        <td class="plc-address-td">
+                                            <div class="plc-address-wrap">
+                                                <input v-model="p.plc_tag" @input="markPointsDirty" 
+                                                       class="input input-sm plc-address-input" 
+                                                       :class="{ 'has-warning': !!getPlcAddressWarning(p) }"
+                                                       :title="getPlcAddressWarning(p) || 'PLC 地址，如 DB1.DBW0 或 DB1.DBX0.0'" 
+                                                       placeholder="DB1.DBW0 / DB1.DBX6.0" />
+                                                <span v-if="getPlcAddressWarning(p)" class="plc-warning-icon" :title="getPlcAddressWarning(p)">
+                                                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
+                                                        <path d="M8 1.85L14.4 13.35C14.52 13.56 14.37 13.8 14.13 13.8H1.87C1.63 13.8 1.48 13.56 1.6 13.35L8 1.85Z" fill="rgba(255, 149, 0, 0.16)" stroke="#ff9500" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+                                                        <line x1="8" y1="6" x2="8" y2="9.3" stroke="#ff9500" stroke-width="1.5" stroke-linecap="round"/>
+                                                        <circle cx="8" cy="11.5" r="0.8" fill="#ff9500"/>
+                                                    </svg>
+                                                </span>
+                                            </div>
                                         </td>
                                         <td><input v-model.number="p.sample_interval_ms" @input="markPointsDirty" type="number" min="100" step="50" class="input input-sm sample-input" placeholder="1000" /></td>
                                         <td>
@@ -7125,23 +7311,59 @@ const mainTabs = [
                                         <td v-if="showPointAdvancedFields"><input v-model.number="p.offset" @input="markPointsDirty" type="number" step="0.001" class="input input-sm number-input" placeholder="0" title="倍率换算后再加上的修正值，例如传感器整体偏低 2 度就填 2" /></td>
                                         <td v-if="showPointAdvancedFields"><input v-model="p.expression" @input="markPointsDirty" class="input input-sm expression-input" placeholder="可空，如 x/10" title="可选高级换算，x 代表倍率和偏移后的值，例如 x/10、(x-32)*5/9" /></td>
                                         <td v-if="showPointAdvancedFields"><input v-model="p.display_format" @input="markPointsDirty" class="input input-sm unit-input" placeholder="如 0.0" title="控制画面显示的小数位，例如 0 表示整数，0.0 表示 1 位小数，0.00 表示 2 位小数" /></td>
-                                        <td><input v-model="p.unit" @input="markPointsDirty" class="input input-sm unit-input" :disabled="isBoolPoint(p)" :placeholder="isBoolPoint(p) ? 'BOOL无单位' : '°C'" /></td>
+                                        <td><input v-model="p.unit" @input="markPointsDirty" class="input input-sm unit-input" :disabled="isBoolPoint(p)" :placeholder="isBoolPoint(p) ? '无' : '°C'" /></td>
                                         <td>
                                             <input v-if="normalizePointUsage(p) === 'alarm_trigger'" v-model="p.alarm_text" @input="markPointsDirty" class="input input-sm alarm-text-input" placeholder="报警说明" />
                                             <span v-else class="muted-cell">-</span>
                                         </td>
                                         <td>
-                                            <button @click="openVoiceConfig(idx)" class="btn btn-sm voice-config-button" :class="{ configured: enabledVoiceRuleCount(p) > 0 }">
+                                            <button @click="openVoiceConfig(p)" class="btn btn-sm voice-config-button" :class="{ configured: enabledVoiceRuleCount(p) > 0 }">
                                                 {{ enabledVoiceRuleCount(p) > 0 ? `${enabledVoiceRuleCount(p)} 条` : '配置' }}
                                             </button>
                                         </td>
-                                        <td><button @click="removeDataPoint(idx)" class="btn btn-danger btn-sm">✕</button></td>
+                                        <td><button @click="removeDataPoint(p)" class="btn btn-danger btn-sm">✕</button></td>
                                     </tr>
                                     <tr v-if="dataPoints.length === 0">
                                         <td :colspan="(showPointAdvancedFields ? 14 : 10) + (isAllPointsMode ? 1 : 0)" style="text-align:center; padding: 20px; color: #86868b;">暂无点位配置，请手动添加或从其他设备复制。</td>
                                     </tr>
                                 </tbody>
                             </table>
+                        </div>
+
+                        <div v-if="dataPoints.length > 0" class="points-pagination-bar">
+                            <div class="pagination-info">
+                                <span>共 <strong>{{ dataPoints.length }}</strong> 条点位</span>
+                                <span v-if="pointsPageSize > 0">，第 <strong>{{ pointsCurrentPage }}</strong> / <strong>{{ totalPointPages }}</strong> 页</span>
+                            </div>
+
+                            <div class="pagination-controls">
+                                <div class="page-size-selector">
+                                    <span class="selector-label">每页显示：</span>
+                                    <select v-model.number="pointsPageSize" class="input input-sm page-size-select">
+                                        <option :value="10">10 条/页</option>
+                                        <option :value="20">20 条/页</option>
+                                        <option :value="50">50 条/页</option>
+                                        <option :value="100">100 条/页</option>
+                                        <option :value="200">200 条/页</option>
+                                        <option :value="0">显示全部</option>
+                                    </select>
+                                </div>
+
+                                <div v-if="pointsPageSize > 0 && totalPointPages > 1" class="pagination-nav-btns">
+                                    <button @click="pointsCurrentPage = 1" :disabled="pointsCurrentPage === 1" class="btn btn-sm pagination-btn" title="首页">«</button>
+                                    <button @click="pointsCurrentPage--" :disabled="pointsCurrentPage <= 1" class="btn btn-sm pagination-btn" title="上一页">‹</button>
+                                    
+                                    <button v-for="page in displayedPageNumbers" :key="page" 
+                                            @click="pointsCurrentPage = page" 
+                                            class="btn btn-sm pagination-btn page-num-btn" 
+                                            :class="{ active: pointsCurrentPage === page }">
+                                        {{ page }}
+                                    </button>
+
+                                    <button @click="pointsCurrentPage++" :disabled="pointsCurrentPage >= totalPointPages" class="btn btn-sm pagination-btn" title="下一页">›</button>
+                                    <button @click="pointsCurrentPage = totalPointPages" :disabled="pointsCurrentPage === totalPointPages" class="btn btn-sm pagination-btn" title="末页">»</button>
+                                </div>
+                            </div>
                         </div>
 
                         <Transition name="modal-fade">
@@ -7152,7 +7374,7 @@ const mainTabs = [
                                             <h3>点位语音播报</h3>
                                             <p>{{ voiceRuleDeviceName(selectedVoicePoint) }} / {{ pointDisplayName(selectedVoicePoint) || '未命名点位' }}</p>
                                         </div>
-                                        <button @click="closeVoiceConfig" class="btn btn-sm">关闭</button>
+                                        <button @click="closeVoiceConfig" class="btn btn-sm modal-close-icon-btn" title="关闭">✕</button>
                                     </div>
 
                                     <div class="voice-config-help">
@@ -7170,7 +7392,12 @@ const mainTabs = [
                                                 <input v-model="rule.enabled" type="checkbox" @change="markPointsDirty" />
                                                 启用第 {{ ruleIndex + 1 }} 条规则
                                             </label>
-                                            <button @click="removeVoiceRule(selectedVoicePoint, ruleIndex)" class="btn btn-danger btn-sm">删除规则</button>
+                                            <button @click="removeVoiceRule(selectedVoicePoint, ruleIndex)" class="btn btn-danger btn-sm rule-delete-icon-btn" title="删除规则">
+                                                <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+                                                    <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
+                                                    <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
+                                                </svg>
+                                            </button>
                                         </div>
 
                                         <div class="voice-rule-grid">
@@ -7184,7 +7411,7 @@ const mainTabs = [
                                             </label>
                                             <label>播放方式
                                                 <select v-model="rule.mode" @change="markPointsDirty" class="input">
-                                                    <option value="auto">自动（有文件播文件，否则文字转语音）</option>
+                                                    <option value="auto">自动（文件优先，无则转语音）</option>
                                                     <option value="tts">系统文字转语音</option>
                                                     <option value="file">固定语音文件</option>
                                                 </select>
@@ -7206,7 +7433,7 @@ const mainTabs = [
                                             </label>
                                             <label class="inline-check voice-startup-check">
                                                 <input v-model="rule.announce_on_start" type="checkbox" @change="markPointsDirty" />
-                                                软件启动时若条件已经成立，也播报一次
+                                                <span>软件启动时若条件成立，也播报一次</span>
                                             </label>
                                         </div>
 
@@ -7358,7 +7585,7 @@ const mainTabs = [
                                 </tr>
                             </thead>
                             <tbody>
-                                <tr v-for="point in realtimePointRows" :key="point.__runtimeKey">
+                                <tr v-for="point in paginatedRealtimePointRows" :key="point.__runtimeKey">
                                     <td>{{ point.device_name || point.device_id || '-' }}</td>
                                     <td>{{ pointDisplayName(point) || '-' }}</td>
                                     <td>{{ formatPointUsage(point) }}</td>
@@ -7379,6 +7606,42 @@ const mainTabs = [
                                 </tr>
                             </tbody>
                         </table>
+                    </div>
+
+                    <div v-if="realtimePointRows.length > 0" class="points-pagination-bar">
+                        <div class="pagination-info">
+                            <span>共 <strong>{{ realtimePointRows.length }}</strong> 条点位</span>
+                            <span v-if="monitorPageSize > 0">，第 <strong>{{ monitorCurrentPage }}</strong> / <strong>{{ totalMonitorPages }}</strong> 页</span>
+                        </div>
+
+                        <div class="pagination-controls">
+                            <div class="page-size-selector">
+                                <span class="selector-label">每页显示：</span>
+                                <select v-model.number="monitorPageSize" class="input input-sm page-size-select">
+                                    <option :value="10">10 条/页</option>
+                                    <option :value="20">20 条/页</option>
+                                    <option :value="50">50 条/页</option>
+                                    <option :value="100">100 条/页</option>
+                                    <option :value="200">200 条/页</option>
+                                    <option :value="0">显示全部</option>
+                                </select>
+                            </div>
+
+                            <div v-if="monitorPageSize > 0 && totalMonitorPages > 1" class="pagination-nav-btns">
+                                <button @click="monitorCurrentPage = 1" :disabled="monitorCurrentPage === 1" class="btn btn-sm pagination-btn" title="首页">«</button>
+                                <button @click="monitorCurrentPage--" :disabled="monitorCurrentPage <= 1" class="btn btn-sm pagination-btn" title="上一页">‹</button>
+                                
+                                <button v-for="page in displayedMonitorPageNumbers" :key="page" 
+                                        @click="monitorCurrentPage = page" 
+                                        class="btn btn-sm pagination-btn page-num-btn" 
+                                        :class="{ active: monitorCurrentPage === page }">
+                                    {{ page }}
+                                </button>
+
+                                <button @click="monitorCurrentPage++" :disabled="monitorCurrentPage >= totalMonitorPages" class="btn btn-sm pagination-btn" title="下一页">›</button>
+                                <button @click="monitorCurrentPage = totalMonitorPages" :disabled="monitorCurrentPage === totalMonitorPages" class="btn btn-sm pagination-btn" title="末页">»</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -9188,6 +9451,9 @@ button:enabled:active {
 }
 .data-table td {
     padding: 16px 18px; border-bottom: 1px solid rgba(0, 0, 0, 0.04); color: #1d1d1f;
+    vertical-align: top;
+}
+.points-table td {
     vertical-align: middle;
 }
 .data-table tbody tr { transition: background-color 0.2s ease; }
@@ -9206,7 +9472,7 @@ button:enabled:active {
     justify-content: flex-end;
     margin: 0 0 10px;
 }
-.points-table { min-width: 1180px; }
+.points-table { min-width: 960px; }
 .points-table.points-table-advanced { min-width: 1580px; }
 .points-table td { padding: 10px 6px; }
 .points-table .input-sm { width: 100%; }
@@ -9215,12 +9481,104 @@ button:enabled:active {
 .points-table .sample-input { width: 110px; }
 .points-table .access-input { width: 86px; }
 .points-table .point-name-input { min-width: 150px; }
-.points-table .point-usage-input { min-width: 132px; }
-.points-table .plc-address-input { min-width: 280px; }
+.points-table .point-usage-input { min-width: 88px; width: 95px; }
+.points-table .point-datatype-select { min-width: 128px; width: 135px; }
+.points-table .plc-address-input { min-width: 110px; width: 120px; }
+.plc-address-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    width: 100%;
+}
+.plc-address-wrap .plc-address-input.has-warning {
+    border-color: #ff9500 !important;
+    background-color: rgba(255, 149, 0, 0.05) !important;
+    padding-right: 26px;
+}
+.plc-warning-icon {
+    position: absolute;
+    right: 7px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: help;
+    user-select: none;
+    line-height: 1;
+}
 .points-table .expression-input { min-width: 150px; }
 .points-table .unit-input { width: 80px; }
 .points-table .alarm-text-input { min-width: 180px; }
 .points-table .device-point-select { min-width: 180px; }
+.points-pagination-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 12px 16px;
+    margin-top: 10px;
+    background: #f8f9fa;
+    border: 1px solid #e5e5ea;
+    border-radius: 10px;
+    font-size: 13px;
+    color: #48484a;
+}
+.pagination-info {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.pagination-controls {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+.page-size-selector {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.page-size-select {
+    width: 110px;
+    height: 30px;
+    padding: 2px 8px;
+    font-size: 13px;
+}
+.pagination-nav-btns {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.pagination-btn {
+    min-width: 30px;
+    height: 30px;
+    padding: 0 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    border-radius: 6px;
+    border: 1px solid #d1d1d6;
+    background: #ffffff;
+    color: #1d1d1f;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+.pagination-btn:hover:not(:disabled) {
+    background: #f2f2f7;
+    border-color: #c7c7cc;
+}
+.pagination-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+.pagination-btn.page-num-btn.active {
+    background: #0071e3;
+    color: #ffffff;
+    border-color: #0071e3;
+    font-weight: 600;
+}
 .voice-config-button { min-width: 70px; white-space: nowrap; }
 .voice-config-button.configured {
     color: #116a38;
@@ -9270,10 +9628,48 @@ button:enabled:active {
     gap: 16px;
     margin-bottom: 14px;
 }
+.modal-close-icon-btn {
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    font-size: 15px;
+    line-height: 1;
+}
+.rule-delete-icon-btn {
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    color: #ff3b30;
+    background: rgba(255, 59, 48, 0.1);
+    border: 1px solid rgba(255, 59, 48, 0.18);
+    cursor: pointer;
+    transition: all 0.18s ease;
+}
+.rule-delete-icon-btn:hover {
+    background: #ff3b30;
+    color: #ffffff;
+    border-color: #ff3b30;
+}
 .voice-rule-grid {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 12px;
+}
+.voice-rule-grid select,
+.voice-rule-grid input {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    text-overflow: ellipsis;
 }
 .voice-rule-grid > label,
 .voice-text-label {
@@ -9282,7 +9678,15 @@ button:enabled:active {
     color: #515154;
     font-size: 12px;
 }
-.voice-startup-check { align-self: end; min-height: 38px; }
+.voice-startup-check {
+    grid-column: span 2;
+    align-self: center;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding-top: 14px;
+    white-space: nowrap;
+}
 .voice-rule-text {
     width: 100%;
     min-height: 74px;
@@ -9461,18 +9865,22 @@ button:enabled:active {
 .quality-stale { color: #7a4b00; background: rgba(255, 204, 0, 0.16); border-color: rgba(255, 204, 0, 0.28); }
 .quality-bad { color: #9f1d17; background: rgba(255, 59, 48, 0.12); border-color: rgba(255, 59, 48, 0.24); }
 .model-name-cell {
-    display: grid;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
     gap: 4px;
 }
 .model-name-cell strong {
     color: #1d1d1f;
     font-size: 13px;
     font-weight: 600;
+    line-height: 1.4;
 }
 .model-name-cell small {
     color: #86868b;
     font-family: SFMono-Regular, Consolas, Monaco, monospace;
     font-size: 11px;
+    line-height: 1.4;
 }
 .plc-status-pill {
     display: inline-flex;
@@ -9963,6 +10371,22 @@ button:enabled:active {
     border-radius: 20px; box-shadow: 0 30px 70px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.04);
     padding: 32px; width: min(760px, calc(100vw - 48px)); max-height: 85vh; overflow-y: auto;
     border: 1px solid rgba(255, 255, 255, 0.4);
+    scrollbar-width: thin;
+    scrollbar-color: rgba(120, 120, 128, 0.3) transparent;
+}
+.modal-box::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+.modal-box::-webkit-scrollbar-track {
+    background: transparent;
+}
+.modal-box::-webkit-scrollbar-thumb {
+    background: rgba(120, 120, 128, 0.3);
+    border-radius: 6px;
+}
+.modal-box::-webkit-scrollbar-thumb:hover {
+    background: rgba(120, 120, 128, 0.55);
 }
 .modal-fade-enter-active,
 .modal-fade-leave-active {

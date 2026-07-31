@@ -55,6 +55,8 @@ function runtimeStatus(controller, values) {
         urls: [],
         pairingUrls: [],
         clients: 0,
+        clientList: [],
+        clientDevices: [],
         error: '',
         note: '电视和现场电脑需处于同一局域网；电视端需要支持现代浏览器和 WebGL。'
     };
@@ -84,7 +86,7 @@ module.exports = function createRuntimeRouter(controller = {}) {
     async function readValues({ persistDefaults = true } = {}) {
         const db = await getDb();
         const rows = await db.all(
-            "SELECT key, value FROM settings WHERE key IN ('desktop_auto_start_enabled', 'lan_display_enabled', 'lan_display_port', 'lan_display_pin')"
+            "SELECT `key`, `value` FROM `settings` WHERE `key` IN ('desktop_auto_start_enabled', 'lan_display_enabled', 'lan_display_port', 'lan_display_pin')"
         );
         const source = {};
         rows.forEach(row => { source[row.key] = row.value; });

@@ -74,6 +74,38 @@ h1{margin:0 0 12px;font-size:24px}p{color:#b7c4c6;line-height:1.7}label{display:
 </style></head><body><main><h1>连接远程大屏</h1><p>请向现场工程师索取 6 位投屏码，输入后点击“进入大屏”。连接成功后，本浏览器会记住授权。</p><form id="form"><label for="pin">投屏码</label><input id="pin" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" required><button>进入大屏</button></form><small>请确认电视和现场电脑处于同一个局域网。</small></main><script>document.getElementById('form').addEventListener('submit',function(e){e.preventDefault();var p=document.getElementById('pin').value.replace(/\\D/g,'');if(!/^\\d{6}$/.test(p)){alert('请输入 6 位数字投屏码');return}location.href='/?cast_token='+encodeURIComponent(p)+'&cast=1'})</script></body></html>`;
 }
 
+function parseDeviceName(userAgent, remoteAddress) {
+    const ip = String(remoteAddress || '').replace(/^::ffff:/, '');
+    const ua = String(userAgent || '');
+
+    let deviceType = '未知设备';
+    if (/SmartTV|MiTV|Tizen|WebOS|Android TV|HUAWEI|AppleTV|Hisense|Skyworth|TCL|Sony/i.test(ua)) {
+        if (/MiTV|Xiaomi/i.test(ua)) deviceType = '小米电视';
+        else if (/Huawei|Hisi/i.test(ua)) deviceType = '华为智慧屏';
+        else if (/Tizen|Samsung/i.test(ua)) deviceType = '三星电视';
+        else if (/WebOS|LG/i.test(ua)) deviceType = 'LG 智能电视';
+        else if (/Hisense/i.test(ua)) deviceType = '海信电视';
+        else if (/Skyworth/i.test(ua)) deviceType = '创维电视';
+        else if (/TCL/i.test(ua)) deviceType = 'TCL 电视';
+        else if (/Sony/i.test(ua)) deviceType = '索尼电视';
+        else deviceType = '智能电视/电视盒';
+    } else if (/iPad/i.test(ua)) {
+        deviceType = 'iPad 平板';
+    } else if (/Android/i.test(ua)) {
+        deviceType = 'Android 移动设备';
+    } else if (/iPhone/i.test(ua)) {
+        deviceType = 'iPhone 手机';
+    } else if (/Windows/i.test(ua)) {
+        deviceType = 'Windows PC';
+    } else if (/Macintosh|Mac OS/i.test(ua)) {
+        deviceType = 'Mac 电脑';
+    } else if (/Linux/i.test(ua)) {
+        deviceType = 'Linux 设备';
+    }
+
+    return ip ? `${deviceType} (${ip})` : deviceType;
+}
+
 class LanDisplayService {
     constructor({ app, wsServer, primaryPort }) {
         this.app = app;
@@ -87,12 +119,13 @@ class LanDisplayService {
         this.running = false;
         this.error = '';
         this.clientCount = 0;
+        this.connectedClientsMap = new Map();
     }
 
     async loadFromSettings() {
         const db = await getDb();
         const rows = await db.all(
-            "SELECT key, value FROM settings WHERE key IN ('lan_display_enabled', 'lan_display_port', 'lan_display_pin')"
+            "SELECT `key`, `value` FROM `settings` WHERE `key` IN ('lan_display_enabled', 'lan_display_port', 'lan_display_pin')"
         );
         const settings = {};
         rows.forEach(row => { settings[row.key] = row.value; });
@@ -143,8 +176,26 @@ class LanDisplayService {
             server = http.createServer((req, res) => this.handleRequest(req, res));
             wss = this.wsServer.attach(server, {
                 verifyClient: info => this.verifyWebSocket(info?.req),
-                onConnection: () => { this.clientCount += 1; },
-                onClose: () => { this.clientCount = Math.max(0, this.clientCount - 1); }
+                onConnection: (ws, req) => {
+                    const ip = req?.socket?.remoteAddress || '';
+                    const ua = req?.headers?.['user-agent'] || '';
+                    const name = parseDeviceName(ua, ip);
+                    const clientId = `${ip}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+                    ws._lanClientId = clientId;
+                    this.connectedClientsMap.set(clientId, {
+                        id: clientId,
+                        name,
+                        ip: String(ip).replace(/^::ffff:/, ''),
+                        connectedAt: new Date().toISOString()
+                    });
+                    this.clientCount = this.connectedClientsMap.size;
+                },
+                onClose: (ws) => {
+                    if (ws._lanClientId) {
+                        this.connectedClientsMap.delete(ws._lanClientId);
+                    }
+                    this.clientCount = this.connectedClientsMap.size;
+                }
             });
             await new Promise((resolve, reject) => {
                 const onError = error => { server.off('listening', onListening); reject(error); };
@@ -176,6 +227,7 @@ class LanDisplayService {
         this.wss = null;
         this.running = false;
         this.clientCount = 0;
+        this.connectedClientsMap.clear();
         if (wss) {
             for (const client of wss.clients || []) {
                 try { client.terminate(); } catch (error) { /* ignore */ }
@@ -276,6 +328,8 @@ class LanDisplayService {
                 return url;
             }
         }) : [];
+        const clientDevices = Array.from(this.connectedClientsMap.values());
+        const clientList = clientDevices.map(c => c.name);
         return {
             enabled: this.enabled,
             running: this.running,
@@ -284,6 +338,8 @@ class LanDisplayService {
             urls,
             pairingUrls: this.running ? this.getPairingUrls() : [],
             clients: this.clientCount,
+            clientList,
+            clientDevices,
             error: this.error,
             note: '电视和现场电脑需处于同一局域网；电视端需要支持现代浏览器和 WebGL。'
         };
