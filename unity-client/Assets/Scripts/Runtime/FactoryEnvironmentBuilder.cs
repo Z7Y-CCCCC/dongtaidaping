@@ -61,6 +61,21 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 key.shadowNormalBias = 0.35f;
             }
 
+            if (GameObject.Find("Factory Fill Light") == null)
+            {
+                // A shadowless opposite-side fill keeps dark PBR equipment readable in
+                // both overview and detail views. It is deliberately inexpensive for
+                // integrated GPUs and does not create a game-like rim glow.
+                var fillObject = new GameObject("Factory Fill Light");
+                fillObject.transform.SetParent(transform, false);
+                fillObject.transform.rotation = Quaternion.Euler(36f, 146f, 0f);
+                var fill = fillObject.AddComponent<Light>();
+                fill.type = LightType.Directional;
+                fill.color = new Color(0.78f, 0.88f, 1f);
+                fill.intensity = 0.48f;
+                fill.shadows = LightShadows.None;
+            }
+
             if (FindObjectOfType<Volume>() == null)
             {
                 var volumeObject = new GameObject("Professional Post Processing");
@@ -114,7 +129,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 Debug.LogWarning($"[FactoryEnvironment] Sky material unavailable: {exception.Message}");
             }
             RenderSettings.ambientMode = AmbientMode.Skybox;
-            RenderSettings.ambientIntensity = 0.82f;
+            RenderSettings.ambientIntensity = 0.94f;
             RenderSettings.reflectionIntensity = 0.92f;
             RenderSettings.defaultReflectionMode = DefaultReflectionMode.Skybox;
             RenderSettings.fog = true;

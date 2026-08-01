@@ -40,9 +40,14 @@ function ensureDirectory(directory) {
     return directory;
 }
 
-function copyDirectoryIfMissing(source, destination) {
-    if (fs.existsSync(destination) || !fs.existsSync(source)) return;
-    fs.cpSync(source, destination, { recursive: true });
+function copyMissingDirectoryContents(source, destination) {
+    if (!fs.existsSync(source)) return;
+    ensureDirectory(destination);
+    fs.cpSync(source, destination, {
+        recursive: true,
+        force: false,
+        errorOnExist: false
+    });
 }
 
 function initializeWritableData() {
@@ -57,13 +62,19 @@ function initializeWritableData() {
     if (!fs.existsSync(databaseFile)) {
         fs.copyFileSync(path.join(templateRoot, 'factory-template.db'), databaseFile);
     }
-    copyDirectoryIfMissing(path.join(templateRoot, 'uploads'), uploadsDir);
+    copyMissingDirectoryContents(path.join(templateRoot, 'uploads'), uploadsDir);
     ensureDirectory(path.join(uploadsDir, 'models'));
     ensureDirectory(path.join(uploadsDir, 'audio'));
 
     if (!fs.existsSync(databaseConfigFile)) {
         fs.writeFileSync(databaseConfigFile, JSON.stringify({
-            type: 'sqlite',
+            type: 'mysql',
+            host: process.env.DESKTOP_MYSQL_HOST || process.env.MYSQL_HOST || '127.0.0.1',
+            port: Number(process.env.DESKTOP_MYSQL_PORT || process.env.MYSQL_PORT || 3307),
+            user: process.env.DESKTOP_MYSQL_USER || process.env.MYSQL_USER || 'root',
+            password: process.env.DESKTOP_MYSQL_PASSWORD || process.env.MYSQL_PASSWORD || 'root',
+            database: process.env.DESKTOP_MYSQL_DATABASE || process.env.MYSQL_DATABASE || 'dongtai_daping',
+            // 保留随安装包生成的 SQLite 快照，供离线应急、迁移或人工切换时使用。
             filename: databaseFile
         }, null, 2), 'utf8');
     }
@@ -363,6 +374,7 @@ async function startBackend(port, writable) {
             DESKTOP_PACKAGED: app.isPackaged ? 'true' : 'false',
             DESKTOP_AUTO_START_SUPPORTED: app.isPackaged && process.platform === 'win32' && process.env.DISABLE_AUTO_START !== 'true' ? 'true' : 'false',
             SQLITE_RECOVERY_TEMPLATE: path.join(process.resourcesPath, 'templates', 'factory-template.db'),
+            SQLITE_UPGRADE_TEMPLATE: path.join(process.resourcesPath, 'templates', 'factory-template.db'),
             DESKTOP_SHUTDOWN_TOKEN: backendShutdownToken,
             NODE_PATH: path.join(process.resourcesPath, 'backend-dependencies')
         },

@@ -32,6 +32,8 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private NativeQualityController _quality;
         private FactoryEnvironmentBuilder _environment;
         private RuntimeDiagnosticsOverlay _diagnostics;
+        private FactoryDashboardController _dashboard;
+        private FactoryConfigDto _config;
         private CancellationTokenSource _lifetime;
         private CancellationTokenSource _reload;
         private Transform _factoryRoot;
@@ -67,6 +69,13 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _diagnostics = GetOrAdd<RuntimeDiagnosticsOverlay>();
             _diagnostics.Visible = _settings.showDiagnostics;
             _diagnostics.QualityController = _quality;
+
+            _dashboard = GetOrAdd<FactoryDashboardController>();
+            _dashboard.Initialize(
+                _camera,
+                _camera.GetComponent<OrbitCameraController>(),
+                _diagnostics
+            );
 
             _modelLibrary = GetOrAdd<RuntimeModelLibrary>();
             _webSocket = GetOrAdd<RealtimeWebSocketClient>();
@@ -132,9 +141,11 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private async Task BuildFactoryAsync(FactoryConfigDto config, CancellationToken cancellationToken)
         {
             DestroyCurrentFactory();
+            _config = config;
             var root = new GameObject("RuntimeFactory");
             root.transform.SetParent(transform, false);
             _factoryRoot = root.transform;
+            _dashboard.BeginFactory(config);
 
             if (config.Settings != null
                 && config.Settings.TryGetValue("native_quality_profile", out var backendQuality)
@@ -163,6 +174,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 var driver = instance.Root.GetComponent<ModelBindingDriver>();
                 var visual = instance.Root.AddComponent<DeviceStatusVisual>();
                 visual.Initialize(device);
+                _dashboard.RegisterDevice(device, instance.Root);
                 if (!string.IsNullOrWhiteSpace(device.Id))
                 {
                     _drivers[device.Id] = driver;
@@ -171,6 +183,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                     {
                         driver.ApplyRealtime(latest);
                         visual.ApplyRealtime(latest);
+                        _dashboard.ApplyRealtime(device.Id, latest);
                     }
                 }
                 _diagnostics.ReadyDeviceCount += 1;
@@ -180,7 +193,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             }
 
             var bounds = CalculateRendererBounds(_factoryRoot);
-            _camera.GetComponent<OrbitCameraController>()?.FrameBounds(bounds, true);
+            _dashboard.CompleteFactory(bounds);
             _environment.RefreshReflectionProbe();
             _diagnostics.Activity = _diagnostics.FallbackDeviceCount == 0
                 ? "Native factory ready"
@@ -231,6 +244,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                     _latestDeviceFrames[id] = deviceData;
                     if (_drivers.TryGetValue(id, out var driver)) driver.ApplyRealtime(deviceData);
                     if (_visuals.TryGetValue(id, out var visual)) visual.ApplyRealtime(deviceData);
+                    _dashboard.ApplyRealtime(id, deviceData);
                 }
                 _diagnostics.RecordRealtimeFrame(payload.Value<long?>("timestamp") ?? 0L, devices.Count);
             }
@@ -240,18 +254,49 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 _diagnostics.PlcState = payload?.Value<string>("status")
                     ?? payload?.Value<string>("message")
                     ?? "updated";
+                _dashboard.PlcState = _diagnostics.PlcState;
             }
+            else if (type == "configuration_changed")
+            {
+                ApplyLiveSettings(message["payload"] as JObject);
+            }
+        }
+
+        private void ApplyLiveSettings(JObject payload)
+        {
+            if (!(payload?["settings"] is JObject changedSettings)) return;
+            var merged = _config?.Settings ?? new Dictionary<string, string>();
+            foreach (var property in changedSettings.Properties())
+            {
+                merged[property.Name] = property.Value.Type == JTokenType.String
+                    ? property.Value.Value<string>()
+                    : property.Value.ToString();
+            }
+            if (_config != null) _config.Settings = merged;
+            _dashboard.ApplySettings(merged);
+
+            if (merged.TryGetValue("native_quality_profile", out var qualityProfile)
+                && !string.IsNullOrWhiteSpace(qualityProfile)
+                && !string.Equals(qualityProfile, "auto", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(_settings.qualityProfile, "auto", StringComparison.OrdinalIgnoreCase))
+            {
+                _quality.Apply(qualityProfile, false);
+            }
+            _diagnostics.Activity = "Dashboard configuration updated live";
+            Debug.Log("[FactoryRuntime] Dashboard configuration updated live");
         }
 
         private void OnConnectionStateChanged(string state)
         {
             _diagnostics.BackendState = state ?? "unknown";
+            _dashboard.BackendState = _diagnostics.BackendState;
         }
 
         private void DestroyCurrentFactory()
         {
             _drivers.Clear();
             _visuals.Clear();
+            _dashboard?.ClearFactory();
             if (_factoryRoot != null) Destroy(_factoryRoot.gameObject);
             _factoryRoot = null;
             if (_diagnostics != null)

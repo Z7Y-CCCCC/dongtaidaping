@@ -56,6 +56,7 @@ namespace HeatTreatment.DigitalTwin.Backend
         [JsonProperty("rotation_y")] public float RotationY { get; set; }
         [JsonProperty("scale")] public float Scale { get; set; } = 1f;
         [JsonProperty("instance_config")] public JToken InstanceConfig { get; set; }
+        [JsonProperty("dataPoints")] public List<DataPointDto> DataPoints { get; set; } = new List<DataPointDto>();
 
         public JObject InstanceConfigObject
         {
@@ -70,6 +71,23 @@ namespace HeatTreatment.DigitalTwin.Backend
                 return new JObject();
             }
         }
+    }
+
+    public sealed class DataPointDto
+    {
+        [JsonProperty("id")] public long Id { get; set; }
+        [JsonProperty("device_id")] public string DeviceId { get; set; }
+        [JsonProperty("name")] public string Name { get; set; }
+        [JsonProperty("label")] public string Label { get; set; }
+        [JsonProperty("plc_tag")] public string PlcTag { get; set; }
+        [JsonProperty("data_type")] public string DataType { get; set; }
+        [JsonProperty("category")] public string Category { get; set; }
+        [JsonProperty("value_role")] public string ValueRole { get; set; }
+        [JsonProperty("unit")] public string Unit { get; set; }
+        [JsonProperty("display_format")] public string DisplayFormat { get; set; }
+        [JsonProperty("point_kind")] public string PointKind { get; set; }
+        [JsonProperty("alarm_text")] public string AlarmText { get; set; }
+        [JsonProperty("alarm_level")] public string AlarmLevel { get; set; }
     }
 
     public sealed class ModelAssetDto

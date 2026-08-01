@@ -21,17 +21,33 @@ namespace HeatTreatment.DigitalTwin.Rendering
         private Bounds _lastBounds = new Bounds(Vector3.zero, new Vector3(40f, 8f, 30f));
 
         public Vector3 Target => _target;
+        public bool InteractionEnabled { get; set; } = true;
+        public bool PointerInputBlocked { get; set; }
 
         public void FrameBounds(Bounds bounds, bool immediate = false)
         {
+            FocusBounds(bounds, -35f, 24f, 1.08f, immediate);
+        }
+
+        public void FocusBounds(
+            Bounds bounds,
+            float yaw,
+            float pitch,
+            float padding = 1.08f,
+            bool immediate = false)
+        {
             _lastBounds = bounds;
             _desiredTarget = bounds.center + Vector3.up * Mathf.Max(0.5f, bounds.extents.y * 0.08f);
+            _desiredYaw = yaw;
+            _desiredPitch = Mathf.Clamp(pitch, 6f, 82f);
             var camera = GetComponent<Camera>();
             var radius = Mathf.Max(3f, bounds.extents.magnitude);
             var halfFov = Mathf.Max(12f, camera.fieldOfView * 0.5f) * Mathf.Deg2Rad;
-            _desiredDistance = Mathf.Clamp(radius / Mathf.Tan(halfFov) * 1.08f, 6f, 220f);
+            _desiredDistance = Mathf.Clamp(radius / Mathf.Tan(halfFov) * Mathf.Max(0.65f, padding), 6f, 220f);
             if (!immediate) return;
             _target = _desiredTarget;
+            _yaw = _desiredYaw;
+            _pitch = _desiredPitch;
             _distance = _desiredDistance;
             ApplyTransform();
         }
@@ -44,14 +60,15 @@ namespace HeatTreatment.DigitalTwin.Rendering
 
         private void Update()
         {
-            if (Input.GetMouseButton(0))
+            var allowPointer = InteractionEnabled && !PointerInputBlocked;
+            if (allowPointer && Input.GetMouseButton(0))
             {
                 _desiredYaw += Input.GetAxisRaw("Mouse X") * rotateSpeed * 14f;
                 _desiredPitch -= Input.GetAxisRaw("Mouse Y") * rotateSpeed * 14f;
                 _desiredPitch = Mathf.Clamp(_desiredPitch, 6f, 82f);
             }
 
-            if (Input.GetMouseButton(2) || Input.GetMouseButton(1))
+            if (allowPointer && (Input.GetMouseButton(2) || Input.GetMouseButton(1)))
             {
                 var rotation = Quaternion.Euler(0f, _yaw, 0f);
                 var right = rotation * Vector3.right;
@@ -61,22 +78,24 @@ namespace HeatTreatment.DigitalTwin.Rendering
                 _desiredTarget -= forward * (Input.GetAxisRaw("Mouse Y") * amount);
             }
 
-            var wheel = Input.mouseScrollDelta.y;
+            var wheel = allowPointer ? Input.mouseScrollDelta.y : 0f;
             if (Mathf.Abs(wheel) > 0.001f)
             {
                 _desiredDistance *= Mathf.Exp(-wheel * zoomSpeed);
                 _desiredDistance = Mathf.Clamp(_desiredDistance, 2.5f, 260f);
             }
 
-            var keyboard = new Vector2(Input.GetAxisRaw("Horizontal"), Input.GetAxisRaw("Vertical"));
+            var keyboard = InteractionEnabled
+                ? new Vector2(Input.GetAxisRaw("Horizontal"), Input.GetAxisRaw("Vertical"))
+                : Vector2.zero;
             if (keyboard.sqrMagnitude > 0.001f)
             {
                 var rotation = Quaternion.Euler(0f, _yaw, 0f);
                 var move = rotation * new Vector3(keyboard.x, 0f, keyboard.y);
                 _desiredTarget += move * (keyboardPanSpeed * Time.unscaledDeltaTime);
             }
-            if (Input.GetKey(KeyCode.Q)) _desiredTarget += Vector3.down * (keyboardPanSpeed * Time.unscaledDeltaTime);
-            if (Input.GetKey(KeyCode.E)) _desiredTarget += Vector3.up * (keyboardPanSpeed * Time.unscaledDeltaTime);
+            if (InteractionEnabled && Input.GetKey(KeyCode.Q)) _desiredTarget += Vector3.down * (keyboardPanSpeed * Time.unscaledDeltaTime);
+            if (InteractionEnabled && Input.GetKey(KeyCode.E)) _desiredTarget += Vector3.up * (keyboardPanSpeed * Time.unscaledDeltaTime);
             if (Input.GetKeyDown(KeyCode.Home)) FrameBounds(_lastBounds);
         }
 

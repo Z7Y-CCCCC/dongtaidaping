@@ -81,8 +81,14 @@ async function main() {
         await waitForHttp(`${origin}/api/health`, 30000);
 
         const initial = await requestJson(`${origin}/api/system/runtime`);
-        if (!initial.success || initial.auto_start_enabled !== true || !/^\d{6}$/.test(initial.lan_display_pin)) {
-            throw new Error(`运行配置默认值不正确: ${JSON.stringify(initial)}`);
+        if (
+            !initial.success
+            || typeof initial.auto_start_enabled !== 'boolean'
+            || initial.auto_start_supported !== true
+            || initial.packaged !== true
+            || !/^\d{6}$/.test(initial.lan_display_pin)
+        ) {
+            throw new Error(`运行配置读取结果不正确: ${JSON.stringify(initial)}`);
         }
 
         const enabled = await requestJson(`${origin}/api/system/runtime`, {
@@ -94,7 +100,11 @@ async function main() {
                 lan_display_pin: initial.lan_display_pin
             })
         });
-        if (!enabled.lan_display?.running || enabled.lan_display.port !== castPort) {
+        if (
+            enabled.auto_start_enabled !== false
+            || !enabled.lan_display?.running
+            || enabled.lan_display.port !== castPort
+        ) {
             throw new Error(`投屏服务未启动: ${JSON.stringify(enabled)}`);
         }
 
@@ -158,4 +168,3 @@ main().catch(error => {
     console.error(error.stack || error.message || error);
     process.exitCode = 1;
 });
-

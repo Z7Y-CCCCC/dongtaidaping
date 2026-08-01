@@ -47,6 +47,17 @@ async function waitForUnityReady(child, timeoutMs = 120000) {
     return fs.existsSync(unityLog) ? fs.readFileSync(unityLog, 'utf8') : '';
 }
 
+async function waitForUnityLiveConfiguration(previousCount, timeoutMs = 15000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const text = fs.existsSync(unityLog) ? fs.readFileSync(unityLog, 'utf8') : '';
+        const count = (text.match(/\[FactoryRuntime\] Dashboard configuration updated live/g) || []).length;
+        if (count > previousCount) return text;
+        await wait(250);
+    }
+    return fs.existsSync(unityLog) ? fs.readFileSync(unityLog, 'utf8') : '';
+}
+
 function terminate(child) {
     if (!child || child.exitCode !== null || child.killed) return;
     try { child.kill(); } catch (error) { /* ignore */ }
@@ -64,7 +75,9 @@ async function main() {
     const origin = `http://127.0.0.1:${port}`;
     let backend;
     let unity;
+    let originalDashboardConfig;
     try {
+        const databaseType = process.env.NATIVE_SMOKE_DB_TYPE || 'mysql';
         backend = spawn(process.execPath, ['server.js'], {
             cwd: backendDir,
             windowsHide: true,
@@ -76,8 +89,13 @@ async function main() {
                 APP_DATA_DIR: path.join(backendDir, 'data'),
                 UPLOADS_DIR: path.join(backendDir, 'uploads'),
                 FRONTEND_DIST: path.join(projectDir, 'frontend', 'dist'),
-                DB_TYPE: 'sqlite',
+                DB_TYPE: databaseType,
                 SQLITE_FILE: path.join(backendDir, 'data', 'factory.db'),
+                MYSQL_HOST: process.env.NATIVE_SMOKE_MYSQL_HOST || '127.0.0.1',
+                MYSQL_PORT: process.env.NATIVE_SMOKE_MYSQL_PORT || '3307',
+                MYSQL_USER: process.env.NATIVE_SMOKE_MYSQL_USER || 'root',
+                MYSQL_PASSWORD: process.env.NATIVE_SMOKE_MYSQL_PASSWORD || 'root',
+                MYSQL_DATABASE: process.env.NATIVE_SMOKE_MYSQL_DATABASE || 'dongtai_daping',
                 ENABLE_CORS: 'true',
                 DESKTOP_SHUTDOWN_TOKEN: shutdownToken
             },
@@ -88,14 +106,27 @@ async function main() {
         const configResponse = await fetch(`${origin}/api/config`);
         if (!configResponse.ok) throw new Error(`Config HTTP ${configResponse.status}`);
         const config = await configResponse.json();
-        const devices = (config.workshops || []).flatMap(workshop =>
-            (workshop.lines || []).flatMap(line => line.devices || [])
-        );
+        const devices = (config.workshops || []).flatMap(workshop => [
+            ...(workshop.devices || []),
+            ...(workshop.lines || []).flatMap(line => line.devices || [])
+        ]);
         const deviceModels = [...new Set(devices.map(device => device.model_type))];
-
-        const modelResponse = await fetch(`${origin}/assets/models/photo_multipurpose_furnace_v5.glb`);
-        const modelBytes = (await modelResponse.arrayBuffer()).byteLength;
-        if (!modelResponse.ok) throw new Error(`Model HTTP ${modelResponse.status}`);
+        const modelById = new Map((config.models || []).map(model => [model.id, model]));
+        const modelResults = [];
+        for (const modelId of deviceModels) {
+            const model = modelById.get(modelId);
+            if (!model?.file_path) throw new Error(`Configured model has no file: ${modelId}`);
+            const modelUrl = new URL(model.file_path, origin);
+            const response = await fetch(modelUrl);
+            const bytes = (await response.arrayBuffer()).byteLength;
+            modelResults.push({
+                id: modelId,
+                status: response.status,
+                contentType: response.headers.get('content-type'),
+                bytes
+            });
+            if (!response.ok || bytes <= 0) throw new Error(`Model ${modelId} HTTP ${response.status}`);
+        }
 
         unity = spawn(unityExe, [
             '-batchmode',
@@ -117,32 +148,46 @@ async function main() {
             },
             stdio: 'ignore'
         });
-        const unityText = await waitForUnityReady(unity);
-        const loadedLine = unityText.split(/\r?\n/).find(line =>
-            line.includes('[RuntimeModelLibrary] Loaded photo_multipurpose_furnace_v5')
-        ) || '';
+        let unityText = await waitForUnityReady(unity);
+        const loadedModels = deviceModels.filter(modelId => unityText.includes(`[RuntimeModelLibrary] Loaded ${modelId}`));
         const readyLine = unityText.split(/\r?\n/).find(line =>
             line.includes('[FactoryRuntime] Native factory ready')
         ) || '';
+        const settings = await fetch(`${origin}/api/settings`).then(response => response.json());
+        originalDashboardConfig = settings.native_dashboard_config || '{}';
+        const dashboardConfig = JSON.parse(originalDashboardConfig);
+        const previousLiveUpdates = (unityText.match(/\[FactoryRuntime\] Dashboard configuration updated live/g) || []).length;
+        await fetch(`${origin}/api/settings`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                native_dashboard_config: JSON.stringify({
+                    ...dashboardConfig,
+                    sideMargin: Number(dashboardConfig.sideMargin || 24) === 31 ? 32 : 31
+                })
+            })
+        });
+        unityText = await waitForUnityLiveConfiguration(previousLiveUpdates);
+        const liveConfigurationApplied = (unityText.match(/\[FactoryRuntime\] Dashboard configuration updated live/g) || []).length > previousLiveUpdates;
         const usedFallback = unityText.includes('one or more model files used fallback geometry');
         const runtimeExceptions = unityText.match(/(?:InvalidCast|NullReference|Argument|IndexOutOfRange)Exception:/g) || [];
         const result = {
-            success: deviceModels.length === 1
-                && deviceModels[0] === 'photo_multipurpose_furnace_v5'
-                && modelResponse.status === 200
-                && modelBytes > 0
-                && Boolean(loadedLine)
+            success: devices.length > 0
+                && deviceModels.length > 0
+                && modelResults.every(model => model.status === 200 && model.bytes > 0)
+                && loadedModels.length === deviceModels.length
                 && Boolean(readyLine)
+                && liveConfigurationApplied
                 && !usedFallback
                 && runtimeExceptions.length === 0,
             backendPort: port,
+            databaseType,
             deviceCount: devices.length,
             deviceModels,
-            modelHttpStatus: modelResponse.status,
-            modelContentType: modelResponse.headers.get('content-type'),
-            modelBytes,
-            loadedLine,
+            modelResults,
+            loadedModels,
             readyLine,
+            liveConfigurationApplied,
             usedFallback,
             runtimeExceptionCount: runtimeExceptions.length,
             unityExitedEarly: unity.exitCode !== null
@@ -150,6 +195,15 @@ async function main() {
         console.log(JSON.stringify(result, null, 2));
         if (!result.success) throw new Error(`Native smoke test failed; inspect ${unityLog}`);
     } finally {
+        if (originalDashboardConfig && backend) {
+            try {
+                await fetch(`${origin}/api/settings`, {
+                    method: 'PUT',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ native_dashboard_config: originalDashboardConfig })
+                });
+            } catch (error) { /* best effort restore */ }
+        }
         terminate(unity);
         if (backend) {
             try {

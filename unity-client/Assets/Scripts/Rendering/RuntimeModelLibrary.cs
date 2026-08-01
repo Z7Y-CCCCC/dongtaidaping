@@ -257,12 +257,18 @@ namespace HeatTreatment.DigitalTwin.Rendering
             var config = device.InstanceConfigObject;
             var scaleMultiplier = config.Value<float?>("scaleMultiplier") ?? 1f;
             var scale = Mathf.Max(0.0001f, device.Scale * (asset?.DefaultScale ?? 1f) * scaleMultiplier);
-            var mirrorX = config.Value<bool?>("mirrorX") ?? false;
+            var mirrorX = config.Value<bool?>("mirrorX")
+                ?? config.Value<bool?>("mirror_x")
+                ?? (string.Equals(config.Value<string>("mirrorAxis"), "x", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(config.Value<string>("mirror_axis"), "x", StringComparison.OrdinalIgnoreCase));
             target.localPosition = new Vector3(device.PositionX, device.PositionY, device.PositionZ);
             var rotationDegrees = Mathf.Abs(device.RotationY) <= Mathf.PI * 2f + 0.01f
                 ? device.RotationY * Mathf.Rad2Deg
                 : device.RotationY;
-            target.localRotation = Quaternion.Euler(0f, rotationDegrees, 0f);
+            // The Web scene and glTF use a right-handed coordinate system while Unity uses
+            // a left-handed world. Positions are shared directly, but yaw must be inverted
+            // so an existing Web layout keeps the same equipment-facing direction.
+            target.localRotation = Quaternion.Euler(0f, -rotationDegrees, 0f);
             target.localScale = new Vector3(mirrorX ? -scale : scale, scale, scale);
         }
 

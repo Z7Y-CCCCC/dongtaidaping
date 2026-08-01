@@ -8,6 +8,129 @@ import { adminApi } from '../../../config/factoryConfig.js'
 import { API_BASE } from '../../../runtime/backendEndpoint.js'
 import { RENDER_PROFILE_OPTIONS, normalizeRenderSettings } from '../../../runtime/renderConfig.js'
 
+function createDefaultNativeDashboardConfig() {
+    return {
+        version: 1,
+        uiScale: 1,
+        sideMargin: 24,
+        showHeader: true,
+        showWorldLabels: true,
+        showBottomHints: true,
+        overview: {
+            left: { visible: true, width: 326, height: 824, opacity: 1 },
+            right: { visible: true, width: 326, height: 824, opacity: 1, maxDevices: 20 }
+        },
+        detail: {
+            left: { visible: true, width: 326, height: 742, opacity: 1, maxPoints: 6 },
+            right: { visible: true, width: 326, height: 742, opacity: 1, maxPoints: 24 },
+            trends: { visible: true, height: 192, opacity: 1, maxCharts: 3 }
+        },
+        deviceOverrides: {}
+    }
+}
+
+function dashboardNumber(value, fallback, minimum, maximum) {
+    const parsed = Number(value)
+    if (!Number.isFinite(parsed)) return fallback
+    return Math.min(maximum, Math.max(minimum, parsed))
+}
+
+function dashboardInteger(value, fallback, minimum, maximum) {
+    return Math.round(dashboardNumber(value, fallback, minimum, maximum))
+}
+
+function dashboardBoolean(value, fallback) {
+    if (value === undefined || value === null || value === '') return fallback
+    if (typeof value === 'boolean') return value
+    return ['1', 'true', 'yes', 'on', 'enabled'].includes(String(value).trim().toLowerCase())
+}
+
+function dashboardPointIds(value) {
+    if (!Array.isArray(value)) return []
+    return [...new Set(value.map(item => String(item || '').trim()).filter(Boolean))].slice(0, 200)
+}
+
+function parseDashboardSource(value) {
+    if (!value) return {}
+    if (typeof value === 'object' && !Array.isArray(value)) return value
+    try {
+        const parsed = JSON.parse(String(value))
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+    } catch (error) {
+        return {}
+    }
+}
+
+function normalizeNativeDashboardConfig(value) {
+    const defaults = createDefaultNativeDashboardConfig()
+    const source = parseDashboardSource(value)
+    const overview = source.overview || {}
+    const detail = source.detail || {}
+    const overviewLeft = overview.left || {}
+    const overviewRight = overview.right || {}
+    const detailLeft = detail.left || {}
+    const detailRight = detail.right || {}
+    const trends = detail.trends || {}
+    const deviceOverrides = {}
+
+    for (const [deviceId, override] of Object.entries(source.deviceOverrides || {})) {
+        const id = String(deviceId || '').trim()
+        if (!id || !override || typeof override !== 'object' || Array.isArray(override)) continue
+        deviceOverrides[id] = {
+            analogPointIds: dashboardPointIds(override.analogPointIds),
+            statusPointIds: dashboardPointIds(override.statusPointIds),
+            trendPointIds: dashboardPointIds(override.trendPointIds)
+        }
+    }
+
+    return {
+        version: 1,
+        uiScale: dashboardNumber(source.uiScale, defaults.uiScale, 0.8, 1.2),
+        sideMargin: dashboardInteger(source.sideMargin, defaults.sideMargin, 8, 100),
+        showHeader: dashboardBoolean(source.showHeader, defaults.showHeader),
+        showWorldLabels: dashboardBoolean(source.showWorldLabels, defaults.showWorldLabels),
+        showBottomHints: dashboardBoolean(source.showBottomHints, defaults.showBottomHints),
+        overview: {
+            left: {
+                visible: dashboardBoolean(overviewLeft.visible, defaults.overview.left.visible),
+                width: dashboardInteger(overviewLeft.width, defaults.overview.left.width, 260, 520),
+                height: dashboardInteger(overviewLeft.height, defaults.overview.left.height, 800, 900),
+                opacity: dashboardNumber(overviewLeft.opacity, defaults.overview.left.opacity, 0.25, 1)
+            },
+            right: {
+                visible: dashboardBoolean(overviewRight.visible, defaults.overview.right.visible),
+                width: dashboardInteger(overviewRight.width, defaults.overview.right.width, 260, 520),
+                height: dashboardInteger(overviewRight.height, defaults.overview.right.height, 420, 900),
+                opacity: dashboardNumber(overviewRight.opacity, defaults.overview.right.opacity, 0.25, 1),
+                maxDevices: dashboardInteger(overviewRight.maxDevices, defaults.overview.right.maxDevices, 1, 100)
+            }
+        },
+        detail: {
+            left: {
+                visible: dashboardBoolean(detailLeft.visible, defaults.detail.left.visible),
+                width: dashboardInteger(detailLeft.width, defaults.detail.left.width, 260, 520),
+                height: dashboardInteger(detailLeft.height, defaults.detail.left.height, 520, 830),
+                opacity: dashboardNumber(detailLeft.opacity, defaults.detail.left.opacity, 0.25, 1),
+                maxPoints: dashboardInteger(detailLeft.maxPoints, defaults.detail.left.maxPoints, 1, 12)
+            },
+            right: {
+                visible: dashboardBoolean(detailRight.visible, defaults.detail.right.visible),
+                width: dashboardInteger(detailRight.width, defaults.detail.right.width, 260, 520),
+                height: dashboardInteger(detailRight.height, defaults.detail.right.height, 420, 830),
+                opacity: dashboardNumber(detailRight.opacity, defaults.detail.right.opacity, 0.25, 1),
+                maxPoints: dashboardInteger(detailRight.maxPoints, defaults.detail.right.maxPoints, 1, 100)
+            },
+            trends: {
+                visible: dashboardBoolean(trends.visible, defaults.detail.trends.visible),
+                height: dashboardInteger(trends.height, defaults.detail.trends.height, 140, 320),
+                opacity: dashboardNumber(trends.opacity, defaults.detail.trends.opacity, 0.25, 1),
+                maxCharts: dashboardInteger(trends.maxCharts, defaults.detail.trends.maxCharts, 1, 4)
+            }
+        },
+        deviceOverrides
+    }
+}
+
 export function useSystemSettings({
     alert,
     confirm,
@@ -36,6 +159,9 @@ export function useSystemSettings({
         render_label_fps: 12
     }
     const settings = reactive({ ...defaultSettings })
+    const nativeDashboardConfig = reactive(createDefaultNativeDashboardConfig())
+    const nativeDashboardSaving = ref(false)
+    const nativeDashboardMessage = ref('')
 
     const renderProfileOptions = RENDER_PROFILE_OPTIONS
     const resolvedRenderSettings = computed(() => normalizeRenderSettings(settings))
@@ -195,8 +321,13 @@ export function useSystemSettings({
     async function loadSettings() {
         const s = await adminApi.getSettings()
         if (s.data_mode !== 'simulation') s.data_mode = 'integrated_plc'
+        const normalizedDashboard = normalizeNativeDashboardConfig(s.native_dashboard_config)
+        for (const key of Object.keys(nativeDashboardConfig)) delete nativeDashboardConfig[key]
+        Object.assign(nativeDashboardConfig, normalizedDashboard)
+        const loadedSettings = { ...s }
+        delete loadedSettings.native_dashboard_config
         for (const key of Object.keys(settings)) delete settings[key]
-        Object.assign(settings, defaultSettings, s)
+        Object.assign(settings, defaultSettings, loadedSettings)
         settings.render_target_fps = Number(settings.render_target_fps || 45)
         settings.render_scale = Number(settings.render_scale || 1)
         settings.render_label_fps = Number(settings.render_label_fps || 12)
@@ -518,19 +649,50 @@ export function useSystemSettings({
             render_target_fps: settings.render_target_fps,
             render_scale: settings.render_scale,
             render_antialias: settings.render_antialias,
-            render_label_fps: settings.render_label_fps
+            render_label_fps: settings.render_label_fps,
+            native_dashboard_config: JSON.stringify(normalizeNativeDashboardConfig(nativeDashboardConfig))
         })
         if (result?.error) return alert(result.error, { title: '设置保存失败', type: 'danger' })
         if (!result?.success) return alert('设置保存失败：后端没有返回成功状态', { title: '设置保存失败', type: 'danger' })
         // 保存后自动重启数据引擎
         try {
             await fetch(`${API_BASE}/engine/restart`, { method: 'POST' })
-            alert('设置已保存。数据引擎正在重启；Unity 原生客户端按 F5 重载配置或重启后生效。', { title: '保存成功', type: 'success' })
+            alert('设置已保存。Unity 原生大屏组件已实时更新，数据引擎正在重启。', { title: '保存成功', type: 'success' })
         } catch (e) {
             alert('设置已保存，但数据引擎重启失败，请手动重启后端服务', { title: '保存成功', type: 'warning' })
         }
         // 刷新引擎状态
         setTimeout(() => loadEngineStatus(), 2000)
+    }
+
+    async function saveNativeDashboardSettings({ silent = false } = {}) {
+        nativeDashboardSaving.value = true
+        if (!silent) nativeDashboardMessage.value = '正在推送到 Unity 原生大屏...'
+        try {
+            const normalized = normalizeNativeDashboardConfig(nativeDashboardConfig)
+            const result = await adminApi.saveSettings({
+                native_dashboard_config: JSON.stringify(normalized)
+            })
+            if (result?.error) throw new Error(result.error)
+            if (!result?.success) throw new Error('后端没有返回成功状态')
+            for (const key of Object.keys(nativeDashboardConfig)) delete nativeDashboardConfig[key]
+            Object.assign(nativeDashboardConfig, normalized)
+            nativeDashboardMessage.value = '已保存，并实时推送到正在运行的 Unity 大屏。'
+            return true
+        } catch (error) {
+            nativeDashboardMessage.value = `Unity 大屏组件配置保存失败：${error.message || error}`
+            if (!silent) await alert(nativeDashboardMessage.value, { title: '保存失败', type: 'danger' })
+            return false
+        } finally {
+            nativeDashboardSaving.value = false
+        }
+    }
+
+    function resetNativeDashboardConfig() {
+        const defaults = createDefaultNativeDashboardConfig()
+        for (const key of Object.keys(nativeDashboardConfig)) delete nativeDashboardConfig[key]
+        Object.assign(nativeDashboardConfig, defaults)
+        nativeDashboardMessage.value = '已恢复默认值，点击“立即应用”后推送到 Unity。'
     }
 
     return {
@@ -539,6 +701,11 @@ export function useSystemSettings({
         renderProfileOptions,
         resolvedRenderSettings,
         selectedRenderProfile,
+        nativeDashboardConfig,
+        nativeDashboardSaving,
+        nativeDashboardMessage,
+        saveNativeDashboardSettings,
+        resetNativeDashboardConfig,
         runtimeSettings,
         runtimeStatus,
         runtimeSaving,

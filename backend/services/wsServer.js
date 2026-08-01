@@ -33,6 +33,13 @@ class WsServer {
         this.wss = this.wss || wss;
         this.wssInstances.add(wss);
 
+        // 监听器端口被占用时，底层 WebSocketServer 也会转发 HTTP server 的 error。
+        // 必须消费该事件，否则 Node 会把它视为未处理异常并结束整个后台进程。
+        wss.on('error', error => {
+            console.error('[WebSocket] 服务监听错误:', error.message);
+            options.onError?.(error);
+        });
+
         wss.on('connection', (ws, req) => {
             const clientIp = req.socket.remoteAddress;
             console.log(`[WebSocket] 客户端已连接: ${clientIp} (当前 ${this.clients.size + 1} 个连接)`);
@@ -105,17 +112,25 @@ class WsServer {
      * 广播 PLC/数据源连接状态
      */
     broadcastStatus(statusInfo) {
-        if (this.clients.size === 0) return;
+        this.broadcast('plc_status', statusInfo);
+    }
 
-        const message = JSON.stringify({
-            type: 'plc_status',
-            payload: statusInfo
-        });
+    /**
+     * 广播通用服务端事件。配置保存等非实时采集事件也通过同一通道推送，
+     * 这样 Unity 原生客户端无需轮询或手动按 F5。
+     */
+    broadcast(type, payload = {}) {
+        if (this.clients.size === 0) return 0;
+
+        const message = JSON.stringify({ type, payload });
+        let sent = 0;
         this.clients.forEach(client => {
             if (client.readyState === 1) {
                 client.send(message);
+                sent += 1;
             }
         });
+        return sent;
     }
 
     /**

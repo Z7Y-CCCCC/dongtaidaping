@@ -198,7 +198,88 @@ function quarantineSqliteFiles(filename, label = 'corrupt') {
     return moved;
 }
 
-function openSqliteWithRecovery(filename) {
+function isLegacyDemoDatabase(db) {
+    try {
+        const devices = db.prepare('SELECT id FROM devices ORDER BY id').all().map(row => String(row.id));
+        const expectedIds = Array.from({ length: 20 }, (_, index) => `Furnace_${String(index + 1).padStart(2, '0')}`);
+        const pointCount = Number(db.prepare('SELECT COUNT(*) AS count FROM data_points').get()?.count || 0);
+        const lineCount = Number(db.prepare('SELECT COUNT(*) AS count FROM `lines`').get()?.count || 0);
+        return devices.length === expectedIds.length
+            && devices.every((id, index) => id === expectedIds[index])
+            && pointCount <= 1
+            && lineCount === 4;
+    } catch (error) {
+        return false;
+    }
+}
+
+function isDeliverableTemplate(filename) {
+    const verification = verifySqliteFile(filename);
+    if (!verification.valid) return false;
+    const Database = getSqliteDatabase();
+    let db;
+    try {
+        db = new Database(filename, { readonly: true, fileMustExist: true });
+        const devices = Number(db.prepare('SELECT COUNT(*) AS count FROM devices').get()?.count || 0);
+        const points = Number(db.prepare('SELECT COUNT(*) AS count FROM data_points').get()?.count || 0);
+        return devices > 0 && points > 0 && !isLegacyDemoDatabase(db);
+    } catch (error) {
+        return false;
+    } finally {
+        try { db?.close(); } catch (error) { /* ignore */ }
+    }
+}
+
+async function upgradeLegacyDemoDatabase(filename) {
+    const template = process.env.SQLITE_UPGRADE_TEMPLATE
+        ? path.resolve(process.env.SQLITE_UPGRADE_TEMPLATE)
+        : '';
+    if (!template || !fs.existsSync(filename) || path.resolve(filename) === template) return null;
+    if (!isDeliverableTemplate(template)) {
+        console.warn(`[DB] 跳过旧演示库迁移：交付模板无效或缺少设备/点位配置 (${template})`);
+        return null;
+    }
+
+    const Database = getSqliteDatabase();
+    let current;
+    try {
+        current = new Database(filename, { readonly: true, fileMustExist: true });
+        sqliteQuickCheck(current);
+        if (!isLegacyDemoDatabase(current)) return null;
+    } finally {
+        try { current?.close(); } catch (error) { /* ignore */ }
+    }
+
+    ensureDirectory(BACKUP_DIR);
+    const backupName = `factory-before-template-upgrade-${timestampToken()}.db`;
+    const backupPath = path.join(BACKUP_DIR, backupName);
+    const temporaryBackup = `${backupPath}.tmp`;
+    let source;
+    try {
+        source = new Database(filename, { fileMustExist: true });
+        await source.backup(temporaryBackup);
+    } finally {
+        try { source?.close(); } catch (error) { /* ignore */ }
+    }
+    const backupVerification = verifySqliteFile(temporaryBackup);
+    if (!backupVerification.valid) {
+        fs.rmSync(temporaryBackup, { force: true });
+        throw new Error(`旧演示数据库备份校验失败: ${backupVerification.error}`);
+    }
+    fs.renameSync(temporaryBackup, backupPath);
+    installSqliteCopy(template, filename);
+    const migration = {
+        reason: 'legacy_demo_upgrade',
+        sourceType: 'delivery_template',
+        source: path.basename(template),
+        backup: backupName,
+        recoveredAt: new Date().toISOString()
+    };
+    console.warn(`[DB] 已备份并迁移旧演示数据库：${backupName} -> ${path.basename(template)}`);
+    return migration;
+}
+
+async function openSqliteWithRecovery(filename) {
     const Database = getSqliteDatabase();
     const resolved = path.resolve(filename);
     ensureDirectory(path.dirname(resolved));
@@ -213,6 +294,15 @@ function openSqliteWithRecovery(filename) {
                 source: path.basename(recoverySource.filename),
                 recoveredAt: new Date().toISOString()
             };
+        }
+    }
+
+    if (fs.existsSync(resolved)) {
+        try {
+            const migration = await upgradeLegacyDemoDatabase(resolved);
+            if (migration) lastRecovery = migration;
+        } catch (error) {
+            console.warn(`[DB] 旧演示库自动迁移失败，继续保留原数据库: ${error.message}`);
         }
     }
 
@@ -468,7 +558,7 @@ async function initDb() {
         pool = await sqlserver.connect(sqlServerConnectionConfig(activeConfig));
     } else if (dialect === 'sqlite') {
         ensureDataDir();
-        sqliteDb = openSqliteWithRecovery(activeConfig.filename || DEFAULT_CONFIG.filename);
+        sqliteDb = await openSqliteWithRecovery(activeConfig.filename || DEFAULT_CONFIG.filename);
     } else {
         throw new Error(`不支持的数据库类型: ${activeConfig.type}`);
     }
@@ -1329,7 +1419,25 @@ async function seedDefaults() {
         ['render_target_fps', '45'],
         ['render_scale', '1'],
         ['render_antialias', 'false'],
-        ['render_label_fps', '12']
+        ['render_label_fps', '12'],
+        ['native_dashboard_config', JSON.stringify({
+            version: 1,
+            uiScale: 1,
+            sideMargin: 24,
+            showHeader: true,
+            showWorldLabels: true,
+            showBottomHints: true,
+            overview: {
+                left: { visible: true, width: 326, height: 824, opacity: 1 },
+                right: { visible: true, width: 326, height: 824, opacity: 1, maxDevices: 20 }
+            },
+            detail: {
+                left: { visible: true, width: 326, height: 742, opacity: 1, maxPoints: 6 },
+                right: { visible: true, width: 326, height: 742, opacity: 1, maxPoints: 24 },
+                trends: { visible: true, height: 192, opacity: 1, maxCharts: 3 }
+            },
+            deviceOverrides: {}
+        })]
     ];
     for (const [key, value] of rows) {
         await db.insertIgnore('settings', { key, value }, 'key');

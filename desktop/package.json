@@ -1,6 +1,6 @@
 {
   "name": "heat-treatment-digital-twin-desktop",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "热处理数字孪生大屏 Windows 桌面部署版",
   "main": "main.cjs",
   "author": "Digital Twin Team",
@@ -34,7 +34,9 @@
       {
         "from": "../frontend/dist",
         "to": "frontend",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "../backend",
@@ -53,22 +55,30 @@
       {
         "from": "resources/runtime",
         "to": "runtime",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "resources/backend-dependencies",
         "to": "backend-dependencies",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "resources/native-client",
         "to": "native-client",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "resources/templates",
         "to": "templates",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "README-交付说明.md",
@@ -83,7 +93,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "assets/icon.png",
