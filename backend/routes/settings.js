@@ -2,22 +2,27 @@ const express = require('express');
 const { getDb } = require('../db/database');
 
 const MAX_DASHBOARD_CONFIG_BYTES = 256 * 1024;
+const JSON_OBJECT_SETTING_LABELS = {
+    native_dashboard_config: 'Unity 大屏组件配置',
+    native_environment_config: 'Unity 场景与光效配置'
+};
 
 function normalizeSettingValue(key, value) {
-    if (key !== 'native_dashboard_config') return String(value);
+    const label = JSON_OBJECT_SETTING_LABELS[key];
+    if (!label) return String(value);
 
     const text = typeof value === 'string' ? value : JSON.stringify(value || {});
     if (Buffer.byteLength(text, 'utf8') > MAX_DASHBOARD_CONFIG_BYTES) {
-        throw new Error('Unity 大屏组件配置过大');
+        throw new Error(`${label}过大`);
     }
     let parsed;
     try {
         parsed = JSON.parse(text);
     } catch (error) {
-        throw new Error('Unity 大屏组件配置不是有效 JSON');
+        throw new Error(`${label}不是有效 JSON`);
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new Error('Unity 大屏组件配置必须是 JSON 对象');
+        throw new Error(`${label}必须是 JSON 对象`);
     }
     return JSON.stringify(parsed);
 }

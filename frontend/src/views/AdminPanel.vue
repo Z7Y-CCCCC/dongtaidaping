@@ -42,10 +42,78 @@ import { useSystemSettings } from './admin/composables/useSystemSettings.js'
 import { usePointMonitor } from './admin/composables/usePointMonitor.js'
 import { useDataPoints } from './admin/composables/useDataPoints.js'
 import { formatPointValue, formatQualityLabel, formatPointTime } from './admin/utils/points.js'
+import NativeEnvironmentSettings from './admin/components/NativeEnvironmentSettings.vue'
 
 defineOptions({ name: 'AdminPanel' })
 
 const ADMIN_UI_STATE_KEY = 'digital_twin_admin_ui_state_v1'
+const isUnityEmbedded = new URLSearchParams(window.location.search).get('embedded') === 'unity'
+const unityHostState = reactive({ attached: true, maximized: false, dockReady: false, adminVisible: true })
+let unityHostDragActive = false
+
+function postUnityHostMessage(message) {
+    window.chrome?.webview?.postMessage(message)
+}
+
+function handleUnityHostMessage(event) {
+    if (event.data?.type !== 'host_state') return
+    unityHostState.attached = event.data.attached !== false
+    unityHostState.maximized = event.data.maximized === true
+    unityHostState.dockReady = event.data.dockReady === true
+    unityHostState.adminVisible = event.data.adminVisible !== false
+}
+
+function requestUnityHostAction(action) {
+    postUnityHostMessage({ type: 'host_action', action })
+}
+
+function beginUnityHostDrag(event) {
+    if (event.button !== 0) return
+    unityHostDragActive = true
+    event.currentTarget?.setPointerCapture?.(event.pointerId)
+    postUnityHostMessage({ type: 'host_drag_start', screenX: Math.round(event.screenX), screenY: Math.round(event.screenY) })
+}
+
+function continueUnityHostDrag(event) {
+    if (!unityHostDragActive) return
+    postUnityHostMessage({ type: 'host_drag_move', screenX: Math.round(event.screenX), screenY: Math.round(event.screenY) })
+}
+
+function endUnityHostDrag(event) {
+    if (!unityHostDragActive) return
+    unityHostDragActive = false
+    postUnityHostMessage({
+        type: 'host_drag_end',
+        screenX: Math.round(event?.screenX || 0),
+        screenY: Math.round(event?.screenY || 0)
+    })
+}
+
+if (isUnityEmbedded) {
+    onMounted(() => {
+        window.chrome?.webview?.addEventListener('message', handleUnityHostMessage)
+        postUnityHostMessage({ type: 'host_action', action: 'state' })
+    })
+    onUnmounted(() => window.chrome?.webview?.removeEventListener('message', handleUnityHostMessage))
+}
+
+function closeAdminPanel() {
+    if (isUnityEmbedded && window.chrome?.webview) {
+        requestUnityHostAction('close_window')
+        return
+    }
+    window.location.assign('/')
+}
+
+function showUnityDashboard() {
+    requestUnityHostAction('show_dashboard')
+}
+
+function showUnityAdmin() {
+    if (unityHostState.attached && !unityHostState.adminVisible) {
+        requestUnityHostAction('show_admin')
+    }
+}
 
 function loadAdminUiState() {
     try {
@@ -83,6 +151,13 @@ const {
     renderProfileOptions,
     resolvedRenderSettings,
     selectedRenderProfile,
+    nativeEnvironmentConfig,
+    nativeEnvironmentSaving,
+    nativeEnvironmentMessage,
+    nativeEnvironmentPresetOptions,
+    saveNativeEnvironmentSettings,
+    applyNativeEnvironmentPreset,
+    resetNativeEnvironmentConfig,
     nativeDashboardConfig,
     nativeDashboardSaving,
     nativeDashboardMessage,
@@ -227,6 +302,172 @@ const lineDeviceDrag = reactive({
     canDrop: false,
     message: ''
 })
+
+const nativeScenePreviewSessionId = globalThis.crypto?.randomUUID?.()
+    || `admin-${Date.now()}-${Math.random().toString(16).slice(2)}`
+const nativeScenePreviewStatus = ref('正在检测 Unity...')
+const nativeScenePreviewConnected = ref(false)
+const nativeScenePreviewBusy = ref(false)
+const nativeScenePreviewStatusClass = computed(() => ({
+    'is-online': nativeScenePreviewConnected.value,
+    'is-busy': nativeScenePreviewBusy.value,
+    'is-offline': !nativeScenePreviewConnected.value && !nativeScenePreviewBusy.value
+}))
+let nativeScenePreviewTimer = null
+let nativeScenePreviewStatusTimer = null
+let nativeScenePreviewSequence = 0
+let nativeScenePreviewPending = null
+
+function nativePreviewDevicePayload(device, override = null) {
+    const source = override?.id === device?.id ? { ...device, ...override } : (device || {})
+    return {
+        id: source.id,
+        name: source.name,
+        line_id: source.line_id || '',
+        model_type: source.model_type || 'builtin_furnace',
+        pos_x: numberOrDefault(source.pos_x, 0),
+        pos_y: numberOrDefault(source.pos_y, 0),
+        pos_z: numberOrDefault(source.pos_z, 0),
+        rotation_y: numberOrDefault(source.rotation_y, 0),
+        scale: Math.max(0.0001, numberOrDefault(source.scale, 1)),
+        instance_config: parseInstanceConfig(source.instance_config)
+    }
+}
+
+function buildNativePreviewFocus(source = activeTab.value) {
+    if (source === 'lines') {
+        return {
+            mode: 'line',
+            workshopId: selectedLineEditor.value?.workshop_id || '',
+            lineId: selectedLineEditor.value?.id || '',
+            deviceId: ''
+        }
+    }
+    const mode = composerPreviewMode.value || 'line'
+    return {
+        mode,
+        workshopId: selectedComposerWorkshop.value?.id || '',
+        lineId: selectedComposerLineId.value || '',
+        deviceId: mode === 'device' ? (selectedComposerDeviceId.value || '') : ''
+    }
+}
+
+function buildNativePreviewDevices(source, override = null) {
+    const sourceDevices = source === 'composer' ? composerPreviewDevices.value : devices.value
+    return sourceDevices.map(device => nativePreviewDevicePayload(device, override))
+}
+
+function buildNativePreviewLines() {
+    return lines.value.map(line => ({
+        id: line.id,
+        layout: normalizeLineLayout(getLineLayout(line))
+    }))
+}
+
+async function refreshNativeScenePreviewStatus() {
+    try {
+        const result = await adminApi.getNativePreviewStatus()
+        if (result?.error) {
+            nativeScenePreviewConnected.value = false
+            nativeScenePreviewStatus.value = 'Unity 实时连接检测失败'
+            return
+        }
+        nativeScenePreviewConnected.value = Number(result.unityClients || 0) > 0
+        nativeScenePreviewStatus.value = nativeScenePreviewConnected.value
+            ? `Unity 实时同步已连接 · ${result.unityClients} 个客户端`
+            : 'Unity 未运行，修改暂未发送'
+    } catch (error) {
+        nativeScenePreviewConnected.value = false
+        nativeScenePreviewStatus.value = 'Unity 实时连接检测失败'
+    }
+}
+
+async function sendNativeScenePreview(payload, { quiet = false } = {}) {
+    const sequence = ++nativeScenePreviewSequence
+    nativeScenePreviewBusy.value = true
+    if (!quiet) nativeScenePreviewStatus.value = '正在实时应用到 Unity...'
+    try {
+        const result = await adminApi.sendNativePreview({
+            sessionId: nativeScenePreviewSessionId,
+            sequence,
+            ...payload
+        })
+        if (sequence !== nativeScenePreviewSequence) return result
+        if (result?.error) {
+            nativeScenePreviewConnected.value = false
+            nativeScenePreviewStatus.value = `Unity 实时同步失败：${result.error}`
+            return result
+        }
+        nativeScenePreviewConnected.value = Number(result.unityClients || 0) > 0
+        nativeScenePreviewStatus.value = nativeScenePreviewConnected.value
+            ? '已实时应用到 Unity（尚未保存）'
+            : 'Unity 未运行；启动后再次调整即可实时同步'
+        return result
+    } catch (error) {
+        if (sequence === nativeScenePreviewSequence) {
+            nativeScenePreviewConnected.value = false
+            nativeScenePreviewStatus.value = `Unity 实时同步失败：${error?.message || '后端不可用'}`
+        }
+        return { error: error?.message || '后端不可用' }
+    } finally {
+        if (sequence === nativeScenePreviewSequence) nativeScenePreviewBusy.value = false
+    }
+}
+
+function scheduleNativeScenePreview({ source = activeTab.value, includeLayout = false, deviceOverride } = {}) {
+    if (source !== 'composer' && source !== 'lines') return
+    nativeScenePreviewPending = {
+        source,
+        includeLayout: includeLayout || nativeScenePreviewPending?.includeLayout || false,
+        deviceOverride: deviceOverride === undefined
+            ? (nativeScenePreviewPending?.deviceOverride || null)
+            : deviceOverride
+    }
+    if (nativeScenePreviewTimer) clearTimeout(nativeScenePreviewTimer)
+    nativeScenePreviewTimer = setTimeout(() => {
+        const pending = nativeScenePreviewPending
+        nativeScenePreviewPending = null
+        nativeScenePreviewTimer = null
+        if (!pending) return
+        sendNativeScenePreview({
+            action: 'apply',
+            source: pending.source,
+            includeLayout: pending.includeLayout,
+            devices: buildNativePreviewDevices(pending.source, pending.deviceOverride),
+            lines: pending.includeLayout ? buildNativePreviewLines() : [],
+            focus: buildNativePreviewFocus(pending.source)
+        }, { quiet: true })
+    }, 90)
+}
+
+async function restoreSavedNativeScenePreview() {
+    if (nativeScenePreviewTimer) clearTimeout(nativeScenePreviewTimer)
+    nativeScenePreviewTimer = null
+    nativeScenePreviewPending = null
+    await sendNativeScenePreview({
+        action: 'reset',
+        source: activeTab.value,
+        includeLayout: true,
+        focus: buildNativePreviewFocus(activeTab.value)
+    })
+}
+
+async function reloadSavedNativeScenePreview(source = activeTab.value) {
+    await sendNativeScenePreview({
+        action: 'reload',
+        source,
+        focus: buildNativePreviewFocus(source)
+    }, { quiet: true })
+}
+
+function sendNativePreviewCameraAction(cameraAction) {
+    return sendNativeScenePreview({
+        action: 'camera',
+        source: 'composer',
+        cameraAction,
+        focus: buildNativePreviewFocus('composer')
+    }, { quiet: true })
+}
 
 function ensureSelectedLineEditor() {
     if (!lines.value.length) {
@@ -3202,6 +3443,7 @@ async function flipSelectedComposerLine() {
         await loadDevices()
         composerPreviewMode.value = 'line'
         composerPreviewStatus.value = `${lineName} 已完成整体反向`
+        await reloadSavedNativeScenePreview('composer')
         await alert(`${lineName} 已完成整体反向`, { title: '调转成功', type: 'success' })
     } finally {
         composerBulkSaving.value = false
@@ -3242,11 +3484,13 @@ function toggleComposerPreviewWide() {
 
 function controlComposerCamera(action) {
     composerRuntime?.controlCamera(action)
+    sendNativePreviewCameraAction(action)
 }
 
 function fitComposerPreview() {
     resizeComposerPreviewAfterLayout()
     focusComposerPreview()
+    sendNativePreviewCameraAction('fit')
 }
 
 function disconnectComposerResizeObserver() {
@@ -3378,6 +3622,7 @@ async function saveComposerDevice() {
         await loadDevices()
         if (payload.line_id) selectedComposerLineId.value = payload.line_id
         selectedComposerDeviceId.value = composerDraft.id
+        await reloadSavedNativeScenePreview('composer')
         await alert('设备布局已保存', { title: '保存成功', type: 'success' })
     } finally {
         composerSaving.value = false
@@ -3387,19 +3632,29 @@ async function saveComposerDevice() {
 watch(selectedComposerLineId, () => {
     ensureComposerSelection()
     scheduleComposerPreview()
+    scheduleNativeScenePreview({ source: 'composer' })
 })
 
 watch(selectedComposerDeviceId, () => {
     syncComposerDraftFromSelection()
     scheduleComposerPreview()
+    scheduleNativeScenePreview({ source: 'composer' })
 })
 
 watch(composerPreviewMode, () => {
     focusComposerPreview()
+    scheduleNativeScenePreview({ source: 'composer' })
 })
 
 watch(composerDraft, () => {
     scheduleComposerPreview()
+    if (activeTab.value === 'composer') scheduleNativeScenePreview({ source: 'composer' })
+}, { deep: true })
+
+watch([lines, devices, selectedLineEditorId], () => {
+    if (activeTab.value === 'lines') {
+        scheduleNativeScenePreview({ source: 'lines', includeLayout: true })
+    }
 }, { deep: true })
 
 watch(() => composerDraft.line_id, (lineId) => {
@@ -3445,8 +3700,13 @@ watch(activeTab, async (tab) => {
         }
         await nextTick()
         scheduleComposerPreview()
+        scheduleNativeScenePreview({ source: 'composer' })
     } else {
         disposeComposerPreview()
+    }
+    if (tab === 'lines') {
+        await nextTick()
+        scheduleNativeScenePreview({ source: 'lines', includeLayout: true })
     }
     if (tab === 'models') {
         await nextTick()
@@ -3524,16 +3784,26 @@ onMounted(async () => {
     syncComposerDraftFromSelection()
     await nextTick()
     scheduleComposerPreview()
+    await refreshNativeScenePreviewStatus()
+    nativeScenePreviewStatusTimer = setInterval(refreshNativeScenePreviewStatus, 3000)
+    if (activeTab.value === 'composer') scheduleNativeScenePreview({ source: 'composer' })
+    if (activeTab.value === 'lines') scheduleNativeScenePreview({ source: 'lines', includeLayout: true })
 })
 
 onActivated(async () => {
     await nextTick()
     if (activeTab.value === 'composer') scheduleComposerPreview()
+    if (!nativeScenePreviewStatusTimer) {
+        refreshNativeScenePreviewStatus()
+        nativeScenePreviewStatusTimer = setInterval(refreshNativeScenePreviewStatus, 3000)
+    }
     if (activeTab.value === 'models') await renderSelectedModelPreview()
     if (activeTab.value === 'point-monitor') startPointMonitor()
 })
 
 onDeactivated(() => {
+    if (nativeScenePreviewStatusTimer) clearInterval(nativeScenePreviewStatusTimer)
+    nativeScenePreviewStatusTimer = null
     finishLinePreviewDrag()
     cancelLineDeviceDrag()
     cancelLineDevicePoolMove()
@@ -3543,6 +3813,10 @@ onDeactivated(() => {
 })
 
 onUnmounted(() => {
+    if (nativeScenePreviewTimer) clearTimeout(nativeScenePreviewTimer)
+    if (nativeScenePreviewStatusTimer) clearInterval(nativeScenePreviewStatusTimer)
+    nativeScenePreviewTimer = null
+    nativeScenePreviewStatusTimer = null
     stopRuntimeRefresh()
     finishLinePreviewDrag()
     cancelLineDeviceDrag()
@@ -3829,6 +4103,7 @@ async function saveSelectedLineLayout() {
         }
         await loadLines()
         await loadDevices()
+        await reloadSavedNativeScenePreview('lines')
         return alert(deviceResult?.saved ? `产线结构已保存，${deviceResult.saved} 台设备位置已同步` : '产线结构已保存', { type: 'success' })
     } finally {
         lineLayoutSaving.value = false
@@ -4279,6 +4554,15 @@ function handleLineDeviceDrag(event) {
         : insideStage
             ? (isAuxiliaryDeviceConfig(device) ? '当前产线没有小车导轨' : '当前产线没有设备线')
             : '拖回预览区域后松手'
+    scheduleNativeScenePreview({
+        source: 'lines',
+        includeLayout: true,
+        deviceOverride: insideStage ? {
+            id: device.id,
+            pos_x: x,
+            pos_z: state.bounds.baseZ + targetZ
+        } : null
+    })
 }
 
 async function finishLineDeviceDrag(event) {
@@ -4296,6 +4580,7 @@ async function finishLineDeviceDrag(event) {
     window.removeEventListener('pointermove', handleLineDeviceDrag)
     resetLineDeviceDrag()
     if (!drag.active || !drag.canDrop) {
+        scheduleNativeScenePreview({ source: 'lines', includeLayout: true, deviceOverride: null })
         if (drag.active && drag.message) alert(drag.message, { type: 'warning' })
         return
     }
@@ -4366,6 +4651,7 @@ async function placeLineDeviceOnTarget(drag) {
             return alert(result.error, { title: '设备归位失败', type: 'danger' })
         }
         await loadDevices()
+        await reloadSavedNativeScenePreview('lines')
     } finally {
         lineDeviceSavingId.value = ''
     }
@@ -4403,6 +4689,7 @@ async function removeDeviceFromLineCanvas(device) {
             return alert(result.error, { title: '移出画布失败', type: 'danger' })
         }
         await loadDevices()
+        await reloadSavedNativeScenePreview('lines')
     } finally {
         lineDeviceSavingId.value = ''
     }
@@ -4541,7 +4828,89 @@ const mainTabs = [
 </script>
 
 <template>
-    <div class="admin-container" :class="{ 'nav-collapsed': isAdminNavCollapsed, 'composer-active': activeTab === 'composer', 'line-planner-active': activeTab === 'lines' }">
+    <div class="admin-container" :class="{ 'unity-embedded': isUnityEmbedded, 'unity-dashboard-tab': isUnityEmbedded && unityHostState.attached && !unityHostState.adminVisible, 'nav-collapsed': isAdminNavCollapsed, 'composer-active': activeTab === 'composer', 'line-planner-active': activeTab === 'lines' }">
+        <div v-if="isUnityEmbedded" class="unity-window-chrome" :class="{ 'is-dock-ready': unityHostState.dockReady }">
+            <div class="unity-tab-strip">
+                <button
+                    v-if="unityHostState.attached"
+                    type="button"
+                    class="unity-browser-tab unity-screen-tab"
+                    :class="{ 'is-active': !unityHostState.adminVisible }"
+                    title="显示正在运行的 Unity 大屏"
+                    @pointerdown.stop
+                    @click="showUnityDashboard"
+                >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <rect x="3.5" y="4.5" width="17" height="12" rx="2" />
+                        <path d="M8 20h8M12 16.5V20" />
+                    </svg>
+                    <span>实时大屏</span>
+                </button>
+
+                <div
+                    class="unity-browser-tab unity-admin-tab"
+                    :class="{ 'is-active': !unityHostState.attached || unityHostState.adminVisible }"
+                    role="tab"
+                    aria-selected="true"
+                    title="拖动页签可移出窗口；拖回 Unity 顶部后松开可重新嵌入"
+                    @pointerdown="beginUnityHostDrag"
+                    @pointermove="continueUnityHostDrag"
+                    @pointerup="endUnityHostDrag"
+                    @pointercancel="endUnityHostDrag"
+                    @lostpointercapture="endUnityHostDrag"
+                    @dblclick="requestUnityHostAction('maximize')"
+                    @click="showUnityAdmin"
+                >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M4 7h10M18 7h2M4 12h2M10 12h10M4 17h7M15 17h5" />
+                        <circle cx="16" cy="7" r="2" />
+                        <circle cx="8" cy="12" r="2" />
+                        <circle cx="13" cy="17" r="2" />
+                    </svg>
+                    <span>后台管理</span>
+                    <i class="unity-tab-online" aria-hidden="true"></i>
+                </div>
+
+                <span class="unity-tab-drag-hint">
+                    {{ unityHostState.attached
+                        ? unityHostState.adminVisible
+                            ? '拖动“后台管理”页签可移出'
+                            : '点击后台管理进入配置，或拖出为独立窗口'
+                        : unityHostState.dockReady
+                            ? '松开即可嵌入 Unity'
+                            : '拖到 Unity 窗口顶部后松开即可嵌入' }}
+                </span>
+            </div>
+
+            <div class="unity-window-actions" @pointerdown.stop>
+                <button
+                    type="button"
+                    class="unity-window-action"
+                    :title="unityHostState.maximized ? '还原' : '最大化'"
+                    :aria-label="unityHostState.maximized ? '还原窗口' : '最大化窗口'"
+                    @click="requestUnityHostAction('maximize')"
+                >
+                    <svg v-if="unityHostState.maximized" viewBox="0 0 24 24" aria-hidden="true">
+                        <rect x="7" y="5" width="11" height="11" rx="1" />
+                        <path d="M7 9H5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-3" />
+                    </svg>
+                    <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                        <rect x="5" y="5" width="14" height="14" rx="1.5" />
+                    </svg>
+                </button>
+                <button
+                    type="button"
+                    class="unity-window-action is-close"
+                    title="关闭后台管理"
+                    aria-label="关闭后台管理"
+                    @click="closeAdminPanel"
+                >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M6 6l12 12M18 6 6 18" />
+                    </svg>
+                </button>
+            </div>
+        </div>
         <!-- 顶部标题栏 -->
         <header class="admin-header">
             <div class="header-logo-section">
@@ -4554,7 +4923,6 @@ const mainTabs = [
                 </span>
                 <h1>数字孪生后台配置管理</h1>
             </div>
-            <RouterLink to="/" class="back-link">← 返回大屏</RouterLink>
         </header>
 
         <div class="admin-body">
@@ -4687,7 +5055,11 @@ const mainTabs = [
                     <section class="composer-editor">
                         <div class="composer-section">
                             <h2>现场编排器</h2>
-                            <p class="desc">左侧调整车间、产线和设备布局，右侧实时预览大屏现场效果。</p>
+                            <p class="desc">这里现在直接控制正在运行的 Unity。左侧调整会实时生效，右侧 Web 画面仅用于快速选取和操作定位。</p>
+                            <div class="native-live-row">
+                                <span class="native-live-status" :class="nativeScenePreviewStatusClass">{{ nativeScenePreviewStatus }}</span>
+                                <button type="button" class="btn btn-sm" @click="restoreSavedNativeScenePreview">恢复已保存布局</button>
+                            </div>
                             <div class="composer-stat-grid">
                                 <div><span>车间</span><strong>{{ composerStats.workshops }}</strong></div>
                                 <div><span>产线</span><strong>{{ composerStats.lines }}</strong></div>
@@ -4834,6 +5206,7 @@ const mainTabs = [
                             <button class="btn btn-primary composer-save" @click="saveComposerDevice" :disabled="composerSaving">
                                 {{ composerSaving ? '保存中...' : '保存设备布局' }}
                             </button>
+                            <small class="native-live-help">位置、朝向、缩放、镜像和模型切换会先实时显示在 Unity；点击保存后才写入数据库。</small>
                         </div>
                     </section>
 
@@ -4862,8 +5235,8 @@ const mainTabs = [
                         </div>
                         <div ref="composerPreviewRef" class="composer-preview-stage"></div>
                         <div class="composer-preview-footer">
-                            <span>{{ composerPreviewStatus }}</span>
-                            <span>预览修改不会写入数据库，点击保存后生效</span>
+                            <span>{{ composerPreviewStatus }} · Web 操作辅助</span>
+                            <span>{{ nativeScenePreviewConnected ? '修改已实时作用于 Unity，保存后永久生效' : 'Unity 未连接，当前仅保留编辑草稿' }}</span>
                         </div>
                     </section>
                 </div>
@@ -4902,17 +5275,21 @@ const mainTabs = [
                         <div class="line-planner-header">
                             <div>
                                 <h2>产线结构管理</h2>
-                                <p class="desc">先定义设备线和小车导轨，再到现场编排器里摆放设备实例。</p>
+                                <p class="desc">拖动设备线、导轨和设备时会实时改变 Unity 场景；保存后固化到数据库。</p>
                             </div>
-                            <button class="btn btn-primary" @click="saveSelectedLineLayout" :disabled="lineLayoutSaving || !selectedLineEditor">
-                                {{ lineLayoutSaving ? '保存中...' : '保存产线结构' }}
-                            </button>
+                            <div class="line-native-actions">
+                                <span class="native-live-status" :class="nativeScenePreviewStatusClass">{{ nativeScenePreviewStatus }}</span>
+                                <button type="button" class="btn" @click="restoreSavedNativeScenePreview">恢复已保存布局</button>
+                                <button class="btn btn-primary" @click="saveSelectedLineLayout" :disabled="lineLayoutSaving || !selectedLineEditor">
+                                    {{ lineLayoutSaving ? '保存中...' : '保存产线结构' }}
+                                </button>
+                            </div>
                         </div>
 
                         <div class="line-planner-steps">
                             <span class="active">1 选择产线</span>
-                            <span>2 定义设备线 / 导轨</span>
-                            <span>3 保存后进入现场编排</span>
+                            <span>2 实时调整 Unity 设备线 / 导轨</span>
+                            <span>3 保存并固化现场布局</span>
                         </div>
 
                         <div class="line-planner-layout" :class="{ 'editor-collapsed': isLinePlannerEditorCollapsed }">
@@ -4965,7 +5342,7 @@ const mainTabs = [
                                     <div class="line-structure-section">
                                         <div class="line-structure-title">
                                             <strong>产线方向</strong>
-                                            <span class="line-flow-hint">保存后同步到大屏地面箭头</span>
+                                            <span class="line-flow-hint">调整时实时同步到 Unity 地面箭头</span>
                                         </div>
                                         <div class="line-flow-controls">
                                             <button
@@ -5747,6 +6124,16 @@ const mainTabs = [
                         </div>
                         <button @click="saveActiveScene" class="btn btn-primary" style="margin-top:16px;">保存当前场景</button>
                     </div>
+
+                    <NativeEnvironmentSettings
+                        :config="nativeEnvironmentConfig"
+                        :saving="nativeEnvironmentSaving"
+                        :message="nativeEnvironmentMessage"
+                        :preset-options="nativeEnvironmentPresetOptions"
+                        @save="saveNativeEnvironmentSettings($event || {})"
+                        @apply-preset="applyNativeEnvironmentPreset"
+                        @reset="resetNativeEnvironmentConfig"
+                    />
 
                     <div class="settings-section" style="margin-top:24px;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
@@ -6656,7 +7043,7 @@ const mainTabs = [
                                 <template v-else>
                                     <p><strong>自动识别：</strong>按显卡名称和显存选择档位；工程师也可在客户端按 F1 / F2 / F3 临时切换。</p>
                                 </template>
-                                <p>保存后通过 WebSocket 实时切换画质，无需按 F5；所有档位都不会自动减面。</p>
+                                <p>保存后通过 WebSocket 实时切换画质，无需按 F5；所有档位都不会自动减面。场景光效请在“组件配置”页面调整。</p>
                             </div>
                         </div>
 
@@ -6951,10 +7338,157 @@ const mainTabs = [
     display: flex; flex-direction: column;
     overflow: hidden;
 }
+.unity-window-chrome {
+    height: 46px;
+    flex: 0 0 46px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 6px 0 8px;
+    color: #344054;
+    background: linear-gradient(180deg, #edf2f7 0%, #dfe7ef 100%);
+    border-bottom: 1px solid #cbd5df;
+    box-shadow: 0 2px 8px rgba(31, 50, 68, 0.14);
+    user-select: none;
+    z-index: 500;
+}
+.unity-tab-strip {
+    min-width: 0;
+    flex: 1;
+    align-self: stretch;
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    overflow: hidden;
+}
+.unity-browser-tab {
+    height: 35px;
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 14px;
+    border: 1px solid transparent;
+    border-bottom: 0;
+    border-radius: 10px 10px 0 0;
+    color: #475467;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+.unity-browser-tab svg,
+.unity-window-action svg {
+    width: 17px;
+    height: 17px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+.unity-screen-tab {
+    background: transparent;
+    cursor: pointer;
+    transition: color 0.16s ease, background 0.16s ease;
+}
+.unity-screen-tab:hover {
+    color: #175cd3;
+    background: rgba(255, 255, 255, 0.58);
+}
+.unity-admin-tab {
+    min-width: 178px;
+    background: transparent;
+    cursor: grab;
+    touch-action: none;
+    position: relative;
+    transition: color 0.16s ease, background 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+}
+.unity-admin-tab:hover { background: rgba(255, 255, 255, 0.58); }
+.unity-admin-tab:active { cursor: grabbing; }
+.unity-browser-tab.is-active {
+    color: #172b3f;
+    background: #f8fafc;
+    border-color: #cbd5df;
+    box-shadow: 0 -1px 4px rgba(27, 45, 63, 0.08);
+}
+.unity-browser-tab.is-active::after {
+    content: '';
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: -1px;
+    height: 2px;
+    background: #f8fafc;
+}
+.unity-screen-tab { position: relative; }
+.unity-admin-tab > svg { color: #1570ef; }
+.unity-window-chrome.is-dock-ready .unity-admin-tab {
+    border-color: #6ce9a6;
+    box-shadow: 0 -1px 0 #6ce9a6, 0 0 0 3px rgba(18, 183, 106, 0.1);
+}
+.unity-window-chrome.is-dock-ready .unity-tab-drag-hint {
+    color: #067647;
+    font-weight: 700;
+}
+.unity-tab-online {
+    width: 7px;
+    height: 7px;
+    margin-left: auto;
+    border-radius: 50%;
+    background: #12b76a;
+    box-shadow: 0 0 0 3px rgba(18, 183, 106, 0.12);
+}
+.unity-tab-drag-hint {
+    min-width: 0;
+    margin: 0 0 9px 10px;
+    color: #7a8998;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+}
+.unity-window-actions {
+    height: 35px;
+    display: flex;
+    align-items: center;
+    align-self: flex-start;
+    margin-left: 8px;
+}
+.unity-window-action {
+    width: 40px;
+    height: 32px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 7px;
+    color: #475467;
+    background: transparent;
+    cursor: pointer;
+    transition: color 0.16s ease, background 0.16s ease;
+}
+.unity-window-action:hover {
+    color: #172b3f;
+    background: rgba(75, 98, 120, 0.13);
+}
+.unity-window-action.is-close:hover {
+    color: #fff;
+    background: #e5484d;
+}
+.admin-container.unity-embedded.line-planner-active {
+    height: 100vh;
+    min-height: 0;
+    overflow: hidden;
+}
+.admin-container.unity-dashboard-tab .admin-header,
+.admin-container.unity-dashboard-tab .admin-body {
+    display: none;
+}
 .admin-container.line-planner-active {
-    height: auto;
-    min-height: 100vh;
-    overflow: visible;
+    height: 100vh;
+    min-height: 0;
+    overflow: hidden;
 }
 
 .admin-header {
@@ -6988,16 +7522,10 @@ const mainTabs = [
     stroke-linejoin: round;
 }
 .admin-header h1 { margin: 0; font-size: 19px; color: #1d1d1f; font-weight: 600; letter-spacing: -0.2px; }
-.back-link {
-    color: #0066cc; text-decoration: none; font-size: 14px; font-weight: 500;
-    transition: all 0.2s ease; padding: 6px 14px; border-radius: 98px;
-    background: rgba(0, 102, 204, 0.05);
-}
-.back-link:hover { color: #0077ed; background: rgba(0, 102, 204, 0.08); }
-
-.admin-body { display: flex; flex: 1; overflow: hidden; position: relative; }
+.admin-body { display: flex; flex: 1; min-height: 0; overflow: hidden; position: relative; }
 .admin-container.line-planner-active .admin-body {
-    overflow: visible;
+    min-height: 0;
+    overflow: hidden;
 }
 
 .admin-nav {
@@ -7144,14 +7672,16 @@ const mainTabs = [
 }
 
 .admin-content {
-    flex: 1; padding: 32px; overflow-y: auto; background: #f5f5f7;
+    flex: 1; min-width: 0; min-height: 0; padding: 32px; overflow-y: auto; overflow-x: hidden;
+    overscroll-behavior: contain; scrollbar-gutter: stable; background: #f5f5f7;
 }
 .admin-container.composer-active .admin-content {
     padding: 14px 16px 16px;
 }
 .admin-container.line-planner-active .admin-content {
     padding: 10px 12px 12px;
-    overflow: visible;
+    overflow-y: auto;
+    overflow-x: hidden;
 }
 
 .tab-transition-host {
@@ -7214,6 +7744,35 @@ const mainTabs = [
     letter-spacing: 0;
 }
 .line-planner-header .desc { margin: 0; color: #6b737a; }
+.line-native-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.native-live-status {
+    display: inline-flex;
+    align-items: center;
+    min-height: 30px;
+    padding: 5px 10px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+.native-live-status::before {
+    content: '';
+    width: 7px;
+    height: 7px;
+    margin-right: 7px;
+    border-radius: 50%;
+    background: currentColor;
+}
+.native-live-status.is-online { color: #176b3a; background: #e8f7ee; border-color: #bfe6cd; }
+.native-live-status.is-busy { color: #17628a; background: #eaf5fb; border-color: #bedfed; }
+.native-live-status.is-offline { color: #8a4b0f; background: #fff4e8; border-color: #efd2b4; }
 .line-planner-steps {
     display: flex;
     gap: 8px;
@@ -8012,6 +8571,19 @@ const mainTabs = [
 .composer-section h2 { font-size: 22px; }
 .composer-section h3 { margin: 0 0 12px; font-size: 15px; color: #1d1d1f; }
 .composer-section .desc { margin-bottom: 16px; line-height: 1.5; }
+.native-live-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 14px;
+}
+.native-live-help {
+    display: block;
+    color: #6e6e73;
+    font-size: 11px;
+    line-height: 1.5;
+}
 
 .composer-stat-grid {
     display: grid;

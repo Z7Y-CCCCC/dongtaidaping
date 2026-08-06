@@ -1,0 +1,87 @@
+using System.Diagnostics;
+using System.IO.Pipes;
+using System.Text;
+using System.Text.Json;
+
+namespace HeatTreatmentAdminHost;
+
+internal sealed record HostOptions(
+    string Url,
+    int ParentProcessId,
+    IntPtr ParentWindowHandle,
+    string? UserDataFolder,
+    string? FixedRuntimeFolder,
+    bool StartInDashboardMode
+)
+{
+    public string PipeName => $"HeatTreatmentAdminHost_{ParentProcessId}";
+    public string MutexName => $"Local\\HeatTreatmentAdminHost_{ParentProcessId}";
+
+    public static HostOptions Parse(string[] args)
+    {
+        string url = "http://127.0.0.1:3001/admin?embedded=unity";
+        var parentPid = 0;
+        var parentHandle = IntPtr.Zero;
+        string? userData = null;
+        string? fixedRuntime = null;
+        var startInDashboardMode = false;
+
+        for (var index = 0; index < args.Length; index += 1)
+        {
+            var key = args[index];
+            var value = index + 1 < args.Length ? args[index + 1] : string.Empty;
+            switch (key.ToLowerInvariant())
+            {
+                case "--url": url = value; index += 1; break;
+                case "--parent-pid": int.TryParse(value, out parentPid); index += 1; break;
+                case "--parent-hwnd":
+                    if (long.TryParse(value, out var handleValue)) parentHandle = new IntPtr(handleValue);
+                    index += 1;
+                    break;
+                case "--user-data": userData = value; index += 1; break;
+                case "--fixed-runtime": fixedRuntime = value; index += 1; break;
+                case "--dashboard-mode": startInDashboardMode = true; break;
+            }
+        }
+
+        return new HostOptions(url, parentPid, parentHandle, userData, fixedRuntime, startInDashboardMode);
+    }
+}
+
+internal static class Program
+{
+    internal const uint ShowMessage = NativeMethods.WmApp + 410;
+    internal const uint CloseMessage = NativeMethods.WmApp + 411;
+
+    [STAThread]
+    private static void Main(string[] args)
+    {
+        var options = HostOptions.Parse(args);
+        using var mutex = new Mutex(true, options.MutexName, out var isOwner);
+        if (!isOwner)
+        {
+            SignalExistingHost(options.PipeName, "show");
+            return;
+        }
+
+        ApplicationConfiguration.Initialize();
+        using var form = new AdminPanelForm(options);
+        Application.Run(form);
+    }
+
+    private static void SignalExistingHost(string pipeName, string command)
+    {
+        try
+        {
+            using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.Out, PipeOptions.Asynchronous);
+            client.Connect(1800);
+            using var writer = new StreamWriter(client, Encoding.UTF8, leaveOpen: false) { AutoFlush = true };
+            writer.WriteLine(command);
+        }
+        catch
+        {
+            // A previous process may have exited between mutex acquisition and the pipe connect.
+            // The next menu click will start a fresh host.
+        }
+    }
+}

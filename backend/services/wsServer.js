@@ -8,6 +8,7 @@
  * - 服务端 → 客户端: { type: "realtime_frame", payload: { seq, timestamp, devices: [] } }
  * - 服务端 → 客户端: { type: "plc_status", payload: { status, message } }
  * - 客户端 → 服务端: { type: "ping" }  →  回复 { type: "pong" }
+ * - 客户端 → 服务端: { type: "client_hello", role: "unity" }
  */
 
 const { WebSocketServer } = require('ws');
@@ -51,6 +52,9 @@ class WsServer {
                     const data = JSON.parse(msg);
                     if (data.type === 'ping') {
                         ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+                    } else if (data.type === 'client_hello') {
+                        const role = String(data.role || data.payload?.role || '').trim().toLowerCase();
+                        ws.clientRole = ['unity', 'web', 'admin'].includes(role) ? role : '';
                     }
                 } catch (e) { /* 忽略非 JSON 消息 */ }
             });
@@ -131,6 +135,31 @@ class WsServer {
             }
         });
         return sent;
+    }
+
+    broadcastToRole(type, payload = {}, role = '') {
+        if (this.clients.size === 0) return 0;
+        const normalizedRole = String(role || '').trim().toLowerCase();
+        const message = JSON.stringify({ type, payload });
+        let sent = 0;
+        this.clients.forEach(client => {
+            if (client.readyState !== 1) return;
+            if (normalizedRole && client.clientRole !== normalizedRole) return;
+            client.send(message);
+            sent += 1;
+        });
+        return sent;
+    }
+
+    countClients(role = '') {
+        const normalizedRole = String(role || '').trim().toLowerCase();
+        let count = 0;
+        this.clients.forEach(client => {
+            if (client.readyState !== 1) return;
+            if (normalizedRole && client.clientRole !== normalizedRole) return;
+            count += 1;
+        });
+        return count;
     }
 
     /**

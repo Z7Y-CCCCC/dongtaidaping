@@ -203,6 +203,8 @@ export const adminApi = {
     async getRuntimeSettings() { return readApiJson(await fetch(`${API_BASE}/system/runtime`), '读取运行配置失败') },
     async saveRuntimeSettings(data) { return readApiJson(await fetch(`${API_BASE}/system/runtime`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存运行配置失败') },
     async rotateCastPin() { return readApiJson(await fetch(`${API_BASE}/system/runtime/rotate-pin`, { method: 'POST' }), '重新生成投屏码失败') },
+    async getNativePreviewStatus() { return readApiJson(await fetch(`${API_BASE}/native-preview/status`), '读取 Unity 实时预览状态失败') },
+    async sendNativePreview(data) { return readApiJson(await fetch(`${API_BASE}/native-preview`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '推送 Unity 实时预览失败') },
     async getDatabaseConfig() { return (await fetch(`${API_BASE}/database/config`)).json() },
     async testDatabaseConfig(data) { return readApiJson(await fetch(`${API_BASE}/database/test`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '测试数据库连接失败') },
     async saveDatabaseConfig(data) { return readApiJson(await fetch(`${API_BASE}/database/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存数据库配置失败') },

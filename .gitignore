@@ -43,3 +43,7 @@ unity-client/*.csproj
 unity-client/*.sln
 unity-client/*.suo
 unity-client/*.user
+
+# Native admin host (WebView2) build output
+native-admin-host/bin/
+native-admin-host/obj/

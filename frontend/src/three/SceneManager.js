@@ -114,7 +114,8 @@ function numberOrDefault(value, fallback = 0) {
     return Number.isFinite(next) ? next : fallback;
 }
 
-const LINE_LAYOUT_Z_VISUAL_SCALE = 1.35;
+// 后台编排坐标与 Unity 共用同一套世界坐标，预览层不再额外拉伸 Z 轴。
+const LINE_LAYOUT_Z_VISUAL_SCALE = 1;
 
 function layoutOffsetToSceneZ(offsetZ) {
     return numberOrDefault(offsetZ, 0) * LINE_LAYOUT_Z_VISUAL_SCALE;
@@ -246,13 +247,6 @@ export class SceneManager {
         const baseWall = new THREE.Mesh(new THREE.BoxGeometry(560, 0.28, 2.2), new THREE.MeshStandardMaterial({ color: 0x747c79, roughness: 0.72 }));
         baseWall.position.set(0, 0.2, -176.9);
         this.scene.add(baseWall);
-
-        const aisleMat = new THREE.MeshStandardMaterial({ color: 0x4b5351, roughness: 0.78, metalness: 0.02 });
-        const aisle = new THREE.Mesh(new THREE.PlaneGeometry(440, 8), aisleMat);
-        aisle.rotation.x = -Math.PI / 2;
-        aisle.position.set(0, -0.075, 8);
-        aisle.receiveShadow = true;
-        this.scene.add(aisle);
 
     }
 

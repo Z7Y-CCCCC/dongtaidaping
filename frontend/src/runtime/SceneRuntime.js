@@ -18,7 +18,8 @@ function numberOrDefault(value, fallback = 0) {
     return Number.isFinite(next) ? next : fallback;
 }
 
-const LINE_LAYOUT_Z_VISUAL_SCALE = 1.35;
+// 后台编排坐标与 Unity 共用同一套世界坐标，预览层不再额外拉伸 Z 轴。
+const LINE_LAYOUT_Z_VISUAL_SCALE = 1;
 
 function layoutOffsetToSceneZ(offsetZ) {
     return numberOrDefault(offsetZ, 0) * LINE_LAYOUT_Z_VISUAL_SCALE;

@@ -95,6 +95,12 @@ namespace HeatTreatment.DigitalTwin.Rendering
             };
         }
 
+        public void ApplyPreviewTransform(Transform target, DeviceDto device)
+        {
+            if (target == null || device == null) return;
+            ApplyDeviceTransform(target, device, ResolveAsset(device.ModelType));
+        }
+
         private async Task<TemplateEntry> LoadTemplateSafeAsync(
             ModelAssetDto asset,
             string requestedModelType,

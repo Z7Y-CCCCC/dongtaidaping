@@ -8,6 +8,211 @@ import { adminApi } from '../../../config/factoryConfig.js'
 import { API_BASE } from '../../../runtime/backendEndpoint.js'
 import { RENDER_PROFILE_OPTIONS, normalizeRenderSettings } from '../../../runtime/renderConfig.js'
 
+function createDefaultNativeEnvironmentConfig() {
+    return {
+        version: 2,
+        preset: 'bright_industrial',
+        sceneBrightness: 1.2,
+        ambientIntensity: 1.25,
+        keyLightIntensity: 1.4,
+        fillLightIntensity: 0.82,
+        reflectionIntensity: 1.08,
+        postExposure: 0.6,
+        contrast: 2,
+        saturation: 3,
+        bloomIntensity: 0.06,
+        vignetteIntensity: 0.035,
+        fogEnabled: true,
+        fogStart: 95,
+        fogEnd: 360,
+        showGrid: true,
+        showBackdrop: false,
+        showWalls: false,
+        wallEditorWidth: 100,
+        wallEditorDepth: 80,
+        walls: [],
+        skyColor: '#607FAF',
+        horizonColor: '#354A6A',
+        fogColor: '#26364F',
+        keyLightColor: '#FFF0DC',
+        fillLightColor: '#B5D2FF',
+        floorColor: '#263442',
+        gridColor: '#1D4759',
+        wallColor: '#283B59',
+        frameColor: '#526A86'
+    }
+}
+
+const NATIVE_ENVIRONMENT_PRESETS = [
+    {
+        value: 'bright_industrial',
+        label: '明亮工业蓝（推荐）',
+        description: '接近参考图 2，抬高暗部并保留实体 PBR 材质。',
+        config: createDefaultNativeEnvironmentConfig()
+    },
+    {
+        value: 'neutral_factory',
+        label: '中性真实厂房',
+        description: '色彩更克制，适合长期运行和现场监控。',
+        config: {
+            ...createDefaultNativeEnvironmentConfig(),
+            preset: 'neutral_factory',
+            sceneBrightness: 1.05,
+            ambientIntensity: 1.05,
+            keyLightIntensity: 1.25,
+            fillLightIntensity: 0.58,
+            reflectionIntensity: 0.96,
+            postExposure: 0.34,
+            contrast: 1,
+            saturation: 0,
+            bloomIntensity: 0.02,
+            vignetteIntensity: 0.02,
+            fogStart: 120,
+            fogEnd: 430,
+            skyColor: '#718096',
+            horizonColor: '#465363',
+            fogColor: '#3A4654',
+            floorColor: '#343B42',
+            gridColor: '#34505A',
+            wallColor: '#3F4A58',
+            frameColor: '#667482'
+        }
+    },
+    {
+        value: 'showcase_blue',
+        label: '展厅增强蓝',
+        description: '反射和色彩更强，适合独显展厅机器。',
+        config: {
+            ...createDefaultNativeEnvironmentConfig(),
+            preset: 'showcase_blue',
+            sceneBrightness: 1.18,
+            ambientIntensity: 1.18,
+            keyLightIntensity: 1.65,
+            fillLightIntensity: 0.98,
+            reflectionIntensity: 1.25,
+            postExposure: 0.72,
+            contrast: 6,
+            saturation: 6,
+            bloomIntensity: 0.12,
+            vignetteIntensity: 0.055,
+            fogStart: 80,
+            fogEnd: 300,
+            skyColor: '#5C79BC',
+            horizonColor: '#334C7A',
+            fogColor: '#293C63',
+            gridColor: '#1D6478',
+            wallColor: '#243A63',
+            frameColor: '#506E9D'
+        }
+    },
+    {
+        value: 'dark_technical',
+        label: '深色科技监控',
+        description: '保留暗色风格，适合需要更强 UI 对比度的场景。',
+        config: {
+            ...createDefaultNativeEnvironmentConfig(),
+            preset: 'dark_technical',
+            sceneBrightness: 0.9,
+            ambientIntensity: 0.78,
+            keyLightIntensity: 1.18,
+            fillLightIntensity: 0.36,
+            reflectionIntensity: 0.88,
+            postExposure: 0.12,
+            contrast: 8,
+            saturation: -2,
+            bloomIntensity: 0.04,
+            vignetteIntensity: 0.1,
+            fogStart: 70,
+            fogEnd: 260,
+            skyColor: '#263855',
+            horizonColor: '#141E2C',
+            fogColor: '#101A28',
+            floorColor: '#141C24',
+            gridColor: '#153847',
+            wallColor: '#172438',
+            frameColor: '#31465D'
+        }
+    },
+    {
+        value: 'custom',
+        label: '自定义参数',
+        description: '工程师手动调整后的组合。',
+        config: null
+    }
+]
+
+function normalizeEnvironmentColor(value, fallback) {
+    const text = String(value || '').trim().toUpperCase()
+    return /^#[0-9A-F]{6}$/.test(text) ? text : fallback
+}
+
+function normalizeOptionalEnvironmentColor(value) {
+    const text = String(value || '').trim().toUpperCase()
+    return /^#[0-9A-F]{6}$/.test(text) ? text : ''
+}
+
+function normalizeWallStyle(value) {
+    const style = String(value || '').trim().toLowerCase()
+    return ['solid', 'frame', 'solid_frame'].includes(style) ? style : 'solid_frame'
+}
+
+function normalizeWallSegment(value, index) {
+    const source = value && typeof value === 'object' ? value : {}
+    return {
+        id: String(source.id || `wall_${index + 1}`).trim() || `wall_${index + 1}`,
+        name: String(source.name || `围墙 ${index + 1}`).trim() || `围墙 ${index + 1}`,
+        enabled: dashboardBoolean(source.enabled, true),
+        style: normalizeWallStyle(source.style),
+        x: dashboardNumber(source.x, 0, -1000, 1000),
+        baseY: dashboardNumber(source.baseY, 0, -10, 50),
+        z: dashboardNumber(source.z, 0, -1000, 1000),
+        length: dashboardNumber(source.length, 30, 1, 500),
+        height: dashboardNumber(source.height, 6, 0.5, 100),
+        thickness: dashboardNumber(source.thickness, 0.3, 0.05, 5),
+        rotationY: dashboardNumber(source.rotationY, 0, -180, 180),
+        color: normalizeOptionalEnvironmentColor(source.color),
+        frameColor: normalizeOptionalEnvironmentColor(source.frameColor)
+    }
+}
+
+function normalizeNativeEnvironmentConfig(value) {
+    const defaults = createDefaultNativeEnvironmentConfig()
+    const source = parseDashboardSource(value)
+    const fogStart = dashboardNumber(source.fogStart, defaults.fogStart, 0, 500)
+    return {
+        version: 2,
+        preset: String(source.preset || defaults.preset).trim() || 'custom',
+        sceneBrightness: dashboardNumber(source.sceneBrightness, defaults.sceneBrightness, 0.8, 1.6),
+        ambientIntensity: dashboardNumber(source.ambientIntensity, defaults.ambientIntensity, 0.2, 2.5),
+        keyLightIntensity: dashboardNumber(source.keyLightIntensity, defaults.keyLightIntensity, 0, 3),
+        fillLightIntensity: dashboardNumber(source.fillLightIntensity, defaults.fillLightIntensity, 0, 2.5),
+        reflectionIntensity: dashboardNumber(source.reflectionIntensity, defaults.reflectionIntensity, 0, 2),
+        postExposure: dashboardNumber(source.postExposure, defaults.postExposure, -1.5, 2),
+        contrast: dashboardNumber(source.contrast, defaults.contrast, -30, 30),
+        saturation: dashboardNumber(source.saturation, defaults.saturation, -30, 30),
+        bloomIntensity: dashboardNumber(source.bloomIntensity, defaults.bloomIntensity, 0, 1),
+        vignetteIntensity: dashboardNumber(source.vignetteIntensity, defaults.vignetteIntensity, 0, 0.5),
+        fogEnabled: dashboardBoolean(source.fogEnabled, defaults.fogEnabled),
+        fogStart,
+        fogEnd: dashboardNumber(source.fogEnd, defaults.fogEnd, fogStart + 10, 1000),
+        showGrid: dashboardBoolean(source.showGrid, defaults.showGrid),
+        showBackdrop: false,
+        showWalls: dashboardBoolean(source.showWalls, defaults.showWalls),
+        wallEditorWidth: dashboardNumber(source.wallEditorWidth, defaults.wallEditorWidth, 20, 1000),
+        wallEditorDepth: dashboardNumber(source.wallEditorDepth, defaults.wallEditorDepth, 20, 1000),
+        walls: (Array.isArray(source.walls) ? source.walls : []).slice(0, 64).map(normalizeWallSegment),
+        skyColor: normalizeEnvironmentColor(source.skyColor, defaults.skyColor),
+        horizonColor: normalizeEnvironmentColor(source.horizonColor, defaults.horizonColor),
+        fogColor: normalizeEnvironmentColor(source.fogColor, defaults.fogColor),
+        keyLightColor: normalizeEnvironmentColor(source.keyLightColor, defaults.keyLightColor),
+        fillLightColor: normalizeEnvironmentColor(source.fillLightColor, defaults.fillLightColor),
+        floorColor: normalizeEnvironmentColor(source.floorColor, defaults.floorColor),
+        gridColor: normalizeEnvironmentColor(source.gridColor, defaults.gridColor),
+        wallColor: normalizeEnvironmentColor(source.wallColor, defaults.wallColor),
+        frameColor: normalizeEnvironmentColor(source.frameColor, defaults.frameColor)
+    }
+}
+
 function createDefaultNativeDashboardConfig() {
     return {
         version: 1,
@@ -159,6 +364,14 @@ export function useSystemSettings({
         render_label_fps: 12
     }
     const settings = reactive({ ...defaultSettings })
+    const nativeEnvironmentConfig = reactive(createDefaultNativeEnvironmentConfig())
+    const nativeEnvironmentSaving = ref(false)
+    const nativeEnvironmentMessage = ref('')
+    const nativeEnvironmentPresetOptions = NATIVE_ENVIRONMENT_PRESETS.map(({ value, label, description }) => ({
+        value,
+        label,
+        description
+    }))
     const nativeDashboardConfig = reactive(createDefaultNativeDashboardConfig())
     const nativeDashboardSaving = ref(false)
     const nativeDashboardMessage = ref('')
@@ -321,10 +534,14 @@ export function useSystemSettings({
     async function loadSettings() {
         const s = await adminApi.getSettings()
         if (s.data_mode !== 'simulation') s.data_mode = 'integrated_plc'
+        const normalizedEnvironment = normalizeNativeEnvironmentConfig(s.native_environment_config)
+        for (const key of Object.keys(nativeEnvironmentConfig)) delete nativeEnvironmentConfig[key]
+        Object.assign(nativeEnvironmentConfig, normalizedEnvironment)
         const normalizedDashboard = normalizeNativeDashboardConfig(s.native_dashboard_config)
         for (const key of Object.keys(nativeDashboardConfig)) delete nativeDashboardConfig[key]
         Object.assign(nativeDashboardConfig, normalizedDashboard)
         const loadedSettings = { ...s }
+        delete loadedSettings.native_environment_config
         delete loadedSettings.native_dashboard_config
         for (const key of Object.keys(settings)) delete settings[key]
         Object.assign(settings, defaultSettings, loadedSettings)
@@ -650,6 +867,7 @@ export function useSystemSettings({
             render_scale: settings.render_scale,
             render_antialias: settings.render_antialias,
             render_label_fps: settings.render_label_fps,
+            native_environment_config: JSON.stringify(normalizeNativeEnvironmentConfig(nativeEnvironmentConfig)),
             native_dashboard_config: JSON.stringify(normalizeNativeDashboardConfig(nativeDashboardConfig))
         })
         if (result?.error) return alert(result.error, { title: '设置保存失败', type: 'danger' })
@@ -663,6 +881,59 @@ export function useSystemSettings({
         }
         // 刷新引擎状态
         setTimeout(() => loadEngineStatus(), 2000)
+    }
+
+    async function saveNativeEnvironmentSettings({ silent = false, markCustom = false } = {}) {
+        if (markCustom) nativeEnvironmentConfig.preset = 'custom'
+        nativeEnvironmentSaving.value = true
+        if (!silent) nativeEnvironmentMessage.value = '正在推送场景与光效配置到 Unity...'
+        try {
+            const normalized = normalizeNativeEnvironmentConfig(nativeEnvironmentConfig)
+            const result = await adminApi.saveSettings({
+                native_environment_config: JSON.stringify(normalized)
+            })
+            if (result?.error) throw new Error(result.error)
+            if (!result?.success) throw new Error('后端没有返回成功状态')
+            for (const key of Object.keys(nativeEnvironmentConfig)) delete nativeEnvironmentConfig[key]
+            Object.assign(nativeEnvironmentConfig, normalized)
+            nativeEnvironmentMessage.value = '场景与光效已保存，并实时应用到正在运行的 Unity。'
+            return true
+        } catch (error) {
+            nativeEnvironmentMessage.value = `场景与光效保存失败：${error.message || error}`
+            if (!silent) await alert(nativeEnvironmentMessage.value, { title: '保存失败', type: 'danger' })
+            return false
+        } finally {
+            nativeEnvironmentSaving.value = false
+        }
+    }
+
+    async function applyNativeEnvironmentPreset(preset) {
+        const selected = NATIVE_ENVIRONMENT_PRESETS.find(item => item.value === preset)
+        if (!selected?.config) return
+        const next = normalizeNativeEnvironmentConfig({
+            ...selected.config,
+            preset: selected.value,
+            showWalls: nativeEnvironmentConfig.showWalls,
+            wallEditorWidth: nativeEnvironmentConfig.wallEditorWidth,
+            wallEditorDepth: nativeEnvironmentConfig.wallEditorDepth,
+            walls: nativeEnvironmentConfig.walls
+        })
+        for (const key of Object.keys(nativeEnvironmentConfig)) delete nativeEnvironmentConfig[key]
+        Object.assign(nativeEnvironmentConfig, next)
+        await saveNativeEnvironmentSettings({ silent: true })
+    }
+
+    function resetNativeEnvironmentConfig() {
+        const defaults = {
+            ...createDefaultNativeEnvironmentConfig(),
+            showWalls: nativeEnvironmentConfig.showWalls,
+            wallEditorWidth: nativeEnvironmentConfig.wallEditorWidth,
+            wallEditorDepth: nativeEnvironmentConfig.wallEditorDepth,
+            walls: nativeEnvironmentConfig.walls
+        }
+        for (const key of Object.keys(nativeEnvironmentConfig)) delete nativeEnvironmentConfig[key]
+        Object.assign(nativeEnvironmentConfig, defaults)
+        nativeEnvironmentMessage.value = '已恢复“明亮工业蓝”默认值，点击“立即应用”后推送到 Unity。'
     }
 
     async function saveNativeDashboardSettings({ silent = false } = {}) {
@@ -701,6 +972,13 @@ export function useSystemSettings({
         renderProfileOptions,
         resolvedRenderSettings,
         selectedRenderProfile,
+        nativeEnvironmentConfig,
+        nativeEnvironmentSaving,
+        nativeEnvironmentMessage,
+        nativeEnvironmentPresetOptions,
+        saveNativeEnvironmentSettings,
+        applyNativeEnvironmentPreset,
+        resetNativeEnvironmentConfig,
         nativeDashboardConfig,
         nativeDashboardSaving,
         nativeDashboardMessage,

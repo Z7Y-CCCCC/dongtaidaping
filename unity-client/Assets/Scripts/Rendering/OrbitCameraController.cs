@@ -52,6 +52,16 @@ namespace HeatTreatment.DigitalTwin.Rendering
             ApplyTransform();
         }
 
+        public void NudgeYaw(float degrees)
+        {
+            _desiredYaw += degrees;
+        }
+
+        public void ZoomBy(float multiplier)
+        {
+            _desiredDistance = Mathf.Clamp(_desiredDistance * Mathf.Max(0.1f, multiplier), 2.5f, 260f);
+        }
+
         private void Awake()
         {
             _target = _desiredTarget = new Vector3(0f, 2f, 0f);

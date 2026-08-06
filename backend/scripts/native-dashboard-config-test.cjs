@@ -31,6 +31,7 @@ function waitForConfigurationChanged(socket, timeoutMs = 5000) {
             const message = JSON.parse(String(raw));
             if (message.type !== 'configuration_changed') return;
             if (!message.payload?.keys?.includes('native_dashboard_config')) return;
+            if (!message.payload?.keys?.includes('native_environment_config')) return;
             clearTimeout(timer);
             socket.off('message', onMessage);
             resolve(message);
@@ -61,14 +62,22 @@ async function main() {
 
     let socket;
     let originalText;
+    let originalEnvironmentText;
     try {
         const health = await waitForHttp(`${origin}/api/health`, 35000);
         const originalSettings = await requestJson(`${origin}/api/settings`);
         originalText = originalSettings.native_dashboard_config || '{}';
+        originalEnvironmentText = originalSettings.native_environment_config || '{}';
         const original = JSON.parse(originalText);
+        const originalEnvironment = JSON.parse(originalEnvironmentText);
         const changed = {
             ...original,
             sideMargin: Number(original.sideMargin || 24) === 31 ? 32 : 31
+        };
+        const changedEnvironment = {
+            ...originalEnvironment,
+            preset: 'custom',
+            sceneBrightness: Number(originalEnvironment.sceneBrightness || 1.2) === 1.23 ? 1.24 : 1.23
         };
 
         socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
@@ -76,11 +85,15 @@ async function main() {
         const eventPromise = waitForConfigurationChanged(socket);
         const saved = await requestJson(`${origin}/api/settings`, {
             method: 'PUT',
-            body: JSON.stringify({ native_dashboard_config: JSON.stringify(changed) })
+            body: JSON.stringify({
+                native_dashboard_config: JSON.stringify(changed),
+                native_environment_config: JSON.stringify(changedEnvironment)
+            })
         });
         const event = await eventPromise;
         const persisted = await requestJson(`${origin}/api/settings`);
         const persistedConfig = JSON.parse(persisted.native_dashboard_config);
+        const persistedEnvironment = JSON.parse(persisted.native_environment_config);
         const config = await requestJson(`${origin}/api/config`);
         const devices = (config.workshops || []).flatMap(workshop => [
             ...(workshop.devices || []),
@@ -91,6 +104,9 @@ async function main() {
         if (saved.success !== true) throw new Error('设置保存接口未返回 success');
         if (event.type !== 'configuration_changed') throw new Error('WebSocket 配置事件类型不正确');
         if (persistedConfig.sideMargin !== changed.sideMargin) throw new Error('MySQL 配置未持久化');
+        if (persistedEnvironment.sceneBrightness !== changedEnvironment.sceneBrightness) {
+            throw new Error('MySQL 场景与光效配置未持久化');
+        }
         if (health.db?.type !== 'mysql') throw new Error(`测试后端未使用 MySQL: ${health.db?.type}`);
         if (devices.length === 0 || points === 0) throw new Error('MySQL 中未读到设备或点位配置');
 
@@ -100,16 +116,20 @@ async function main() {
             eventType: event.type,
             changedKeys: event.payload.keys,
             persistedSideMargin: persistedConfig.sideMargin,
+            persistedSceneBrightness: persistedEnvironment.sceneBrightness,
             devices: devices.length,
             points,
             output: runDirectory
         }, null, 2));
     } finally {
-        if (originalText !== undefined) {
+        if (originalText !== undefined || originalEnvironmentText !== undefined) {
             try {
                 await requestJson(`${origin}/api/settings`, {
                     method: 'PUT',
-                    body: JSON.stringify({ native_dashboard_config: originalText })
+                    body: JSON.stringify({
+                        native_dashboard_config: originalText || '{}',
+                        native_environment_config: originalEnvironmentText || '{}'
+                    })
                 });
             } catch (error) {
                 console.error(`原配置恢复失败: ${error.message}`);

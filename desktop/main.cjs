@@ -32,8 +32,16 @@ let applicationOrigin = null;
 let writablePaths = null;
 let desktopSettingsTimer = null;
 let appliedAutoStartSetting = null;
+let desktopControlServer = null;
+let desktopControlOrigin = null;
+let desktopControlToken = null;
 let isQuitting = false;
 let quitReady = false;
+
+function resourcePath(...parts) {
+    const root = app.isPackaged ? process.resourcesPath : path.join(__dirname, 'resources');
+    return path.join(root, ...parts);
+}
 
 function ensureDirectory(directory) {
     fs.mkdirSync(directory, { recursive: true });
@@ -57,7 +65,7 @@ function initializeWritableData() {
     const logsDir = ensureDirectory(path.join(root, 'logs'));
     const databaseFile = path.join(dataDir, 'factory.db');
     const databaseConfigFile = path.join(dataDir, 'database-config.json');
-    const templateRoot = path.join(process.resourcesPath, 'templates');
+    const templateRoot = resourcePath('templates');
 
     if (!fs.existsSync(databaseFile)) {
         fs.copyFileSync(path.join(templateRoot, 'factory-template.db'), databaseFile);
@@ -145,6 +153,65 @@ function waitForHealth(url, timeoutMs = 30000) {
     });
 }
 
+function isLoopbackAddress(address) {
+    return address === '::1' || /^(::ffff:)?127\.0\.0\.1$/.test(String(address || ''));
+}
+
+function startDesktopControlServer() {
+    if (desktopControlServer) return Promise.resolve(desktopControlOrigin);
+    desktopControlToken = crypto.randomBytes(32).toString('hex');
+    desktopControlServer = http.createServer((request, response) => {
+        const pathname = new URL(request.url || '/', 'http://127.0.0.1').pathname;
+        if (request.method === 'GET' && pathname === '/health') {
+            response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            response.end(JSON.stringify({ success: true }));
+            return;
+        }
+
+        const suppliedToken = String(request.headers['x-desktop-control-token'] || '');
+        if (!isLoopbackAddress(request.socket.remoteAddress) || suppliedToken !== desktopControlToken) {
+            response.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
+            response.end(JSON.stringify({ success: false, error: '拒绝访问' }));
+            return;
+        }
+
+        if (request.method === 'POST' && pathname === '/open-admin') {
+            response.writeHead(202, { 'content-type': 'application/json; charset=utf-8' });
+            response.end(JSON.stringify({ success: true }));
+            setImmediate(showNativeAdminPanel);
+            return;
+        }
+
+        response.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ success: false, error: '未找到桌面控制命令' }));
+    });
+
+    return new Promise((resolve, reject) => {
+        const server = desktopControlServer;
+        server.once('error', error => {
+            if (desktopControlServer === server) {
+                desktopControlServer = null;
+                desktopControlOrigin = null;
+                desktopControlToken = null;
+            }
+            reject(error);
+        });
+        server.listen(0, '127.0.0.1', () => {
+            desktopControlOrigin = `http://127.0.0.1:${server.address().port}`;
+            resolve(desktopControlOrigin);
+        });
+    });
+}
+
+function stopDesktopControlServer() {
+    const server = desktopControlServer;
+    desktopControlServer = null;
+    desktopControlOrigin = null;
+    desktopControlToken = null;
+    if (!server) return Promise.resolve();
+    return new Promise(resolve => server.close(() => resolve()));
+}
+
 function readRuntimeSettings(port) {
     return new Promise((resolve, reject) => {
         const request = http.get({
@@ -228,8 +295,46 @@ function guardLogStream(stream, label) {
 
 function nativeClientDirectory() {
     return app.isPackaged
-        ? path.join(process.resourcesPath, 'native-client')
+        ? resourcePath('native-client')
         : path.resolve(__dirname, '..', 'unity-client', 'Builds', 'Windows');
+}
+
+function nativeAdminHostExecutable() {
+    return path.join(nativeClientDirectory(), 'AdminHost', 'HeatTreatmentAdminHost.exe');
+}
+
+function showNativeAdminPanel() {
+    const executable = nativeAdminHostExecutable();
+    if (!nativeProcess || nativeProcess.killed || !applicationOrigin || !fs.existsSync(executable)) {
+        showAdminWindow();
+        return;
+    }
+
+    const fixedRuntime = path.join(path.dirname(executable), 'WebView2Runtime');
+    const args = [
+        '--url', `${applicationOrigin}/admin?embedded=unity`,
+        '--parent-pid', String(nativeProcess.pid),
+        '--user-data', path.join(app.getPath('userData'), 'webview2')
+    ];
+    if (fs.existsSync(fixedRuntime)) args.push('--fixed-runtime', fixedRuntime);
+    const child = spawn(executable, args, {
+        cwd: path.dirname(executable),
+        windowsHide: false,
+        detached: false,
+        env: {
+            ...process.env,
+            HTTP_PROXY: '',
+            HTTPS_PROXY: '',
+            ALL_PROXY: '',
+            NO_PROXY: [process.env.NO_PROXY, 'localhost', '127.0.0.1'].filter(Boolean).join(',')
+        },
+        stdio: 'ignore'
+    });
+    child.once('error', error => {
+        logDesktopError('native-admin-panel', error);
+        showAdminWindow();
+    });
+    child.unref();
 }
 
 function closeNativeLogStreams() {
@@ -267,15 +372,30 @@ async function startNativeClient(origin, writable) {
             '-screen-height', '540',
             '-logFile', '-'
         ]
-        : ['-screen-fullscreen', '1', '-logFile', '-'];
+        : [
+            '-screen-fullscreen', '0',
+            '-screen-width', '1600',
+            '-screen-height', '900',
+            '-logFile', '-'
+        ];
     const child = spawn(executable, nativeArgs, {
         cwd: clientDir,
         windowsHide: false,
         env: {
             ...process.env,
             NO_PROXY: noProxy,
+            no_proxy: noProxy,
+            HTTP_PROXY: '',
+            HTTPS_PROXY: '',
+            ALL_PROXY: '',
             DIGITAL_TWIN_BACKEND_HTTP_URL: origin,
-            DIGITAL_TWIN_BACKEND_WEBSOCKET_URL: `${webSocketOrigin}/ws`
+            DIGITAL_TWIN_BACKEND_WEBSOCKET_URL: `${webSocketOrigin}/ws`,
+            DIGITAL_TWIN_ADMIN_URL: `${origin}/admin`,
+            DIGITAL_TWIN_ADMIN_HOST_PATH: nativeAdminHostExecutable(),
+            DIGITAL_TWIN_ADMIN_FIXED_RUNTIME: path.join(path.dirname(nativeAdminHostExecutable()), 'WebView2Runtime'),
+            DIGITAL_TWIN_DESKTOP_CONTROL_URL: desktopControlOrigin || '',
+            DIGITAL_TWIN_DESKTOP_CONTROL_TOKEN: desktopControlToken || '',
+            DIGITAL_TWIN_MAXIMIZE_WINDOW: 'true'
         },
         stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -346,9 +466,13 @@ async function restartNativeClient() {
 }
 
 async function startBackend(port, writable) {
-    const backendDir = path.join(process.resourcesPath, 'backend');
-    const nodeBinary = path.join(process.resourcesPath, 'runtime', 'node.exe');
-    const frontendDir = path.join(process.resourcesPath, 'frontend');
+    const backendDir = app.isPackaged
+        ? resourcePath('backend')
+        : path.resolve(__dirname, '..', 'backend');
+    const nodeBinary = resourcePath('runtime', 'node.exe');
+    const frontendDir = app.isPackaged
+        ? resourcePath('frontend')
+        : path.resolve(__dirname, '..', 'frontend', 'dist');
     const errorLogPath = path.join(writable.logsDir, 'backend-error.log');
     backendPort = port;
     backendShutdownToken = crypto.randomBytes(32).toString('hex');
@@ -373,10 +497,10 @@ async function startBackend(port, writable) {
             ENABLE_CORS: 'false',
             DESKTOP_PACKAGED: app.isPackaged ? 'true' : 'false',
             DESKTOP_AUTO_START_SUPPORTED: app.isPackaged && process.platform === 'win32' && process.env.DISABLE_AUTO_START !== 'true' ? 'true' : 'false',
-            SQLITE_RECOVERY_TEMPLATE: path.join(process.resourcesPath, 'templates', 'factory-template.db'),
-            SQLITE_UPGRADE_TEMPLATE: path.join(process.resourcesPath, 'templates', 'factory-template.db'),
+            SQLITE_RECOVERY_TEMPLATE: resourcePath('templates', 'factory-template.db'),
+            SQLITE_UPGRADE_TEMPLATE: resourcePath('templates', 'factory-template.db'),
             DESKTOP_SHUTDOWN_TOKEN: backendShutdownToken,
-            NODE_PATH: path.join(process.resourcesPath, 'backend-dependencies')
+            NODE_PATH: resourcePath('backend-dependencies')
         },
         stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -462,16 +586,23 @@ function showAdminWindow() {
     }
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.maximize();
+    // Unity normally occupies the full screen. Lift the bundled settings window above it
+    // long enough to transfer focus, then restore normal z-order behavior.
+    mainWindow.setAlwaysOnTop(true, 'screen-saver');
     mainWindow.show();
     mainWindow.focus();
+    mainWindow.moveTop();
+    setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setAlwaysOnTop(false);
+    }, 800).unref?.();
 }
 
 function updateTrayMenu() {
     if (!tray) return;
     tray.setContextMenu(Menu.buildFromTemplate([
         {
-            label: '打开后台管理',
-            click: showAdminWindow
+            label: '显示内嵌后台',
+            click: showNativeAdminPanel
         },
         {
             label: nativeProcess ? '重启 Unity 原生大屏' : '启动 Unity 原生大屏',
@@ -581,7 +712,7 @@ async function launchApplication() {
     await startBackend(port, writable);
     await waitForHealth(`${origin}/api/health`);
     startDesktopSettingsSync();
-    createMainWindow(origin, process.argv.includes('--admin'));
+    await startDesktopControlServer();
     createTray();
     try {
         await startNativeClient(origin, writable);
@@ -590,6 +721,7 @@ async function launchApplication() {
         dialog.showErrorBox(APP_NAME, `原生大屏启动失败：${error.message}`);
         showAdminWindow();
     }
+    if (process.argv.includes('--admin')) showNativeAdminPanel();
     const smokeExitAfterMs = Number(process.env.DESKTOP_SMOKE_EXIT_AFTER_MS || 0);
     if (Number.isFinite(smokeExitAfterMs) && smokeExitAfterMs > 0)
     {
@@ -600,7 +732,7 @@ async function launchApplication() {
 if (!app.requestSingleInstanceLock()) {
     app.quit();
 } else {
-    app.on('second-instance', showAdminWindow);
+    app.on('second-instance', showNativeAdminPanel);
 
     app.whenReady().then(() => {
         return launchApplication();
@@ -618,7 +750,10 @@ if (!app.requestSingleInstanceLock()) {
         isQuitting = true;
         if (desktopSettingsTimer) clearInterval(desktopSettingsTimer);
         desktopSettingsTimer = null;
-        stopNativeClient().then(() => stopBackend()).finally(() => {
+        stopNativeClient().then(() => Promise.all([
+            stopDesktopControlServer(),
+            stopBackend()
+        ])).finally(() => {
             if (logCleanupTimer) clearInterval(logCleanupTimer);
             logCleanupTimer = null;
             tray?.destroy();

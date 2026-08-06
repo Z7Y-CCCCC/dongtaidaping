@@ -49,6 +49,7 @@ namespace HeatTreatment.DigitalTwin.Backend
     {
         [JsonProperty("id")] public string Id { get; set; }
         [JsonProperty("name")] public string Name { get; set; }
+        [JsonProperty("line_id")] public string LineId { get; set; }
         [JsonProperty("model_type")] public string ModelType { get; set; }
         [JsonProperty("pos_x")] public float PositionX { get; set; }
         [JsonProperty("pos_y")] public float PositionY { get; set; }

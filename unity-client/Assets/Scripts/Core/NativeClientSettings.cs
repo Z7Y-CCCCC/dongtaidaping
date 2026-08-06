@@ -10,6 +10,12 @@ namespace HeatTreatment.DigitalTwin.Core
     {
         public string backendHttpUrl = "http://127.0.0.1:3001";
         public string backendWebSocketUrl = "ws://127.0.0.1:3001/ws";
+        public string adminUrl = "";
+        public string adminHostExecutable = "";
+        public string adminHostFixedRuntimeFolder = "";
+        public string desktopControlUrl = "";
+        public string desktopControlToken = "";
+        public bool maximizeWindowOnStart = true;
         public string qualityProfile = "auto";
         public float autoReconnectSeconds = 2f;
         public float configurationRetrySeconds = 3f;
@@ -51,6 +57,32 @@ namespace HeatTreatment.DigitalTwin.Core
                 "DIGITAL_TWIN_BACKEND_WEBSOCKET_URL",
                 settings.backendWebSocketUrl
             );
+            settings.adminUrl = EnvironmentValue(
+                "DIGITAL_TWIN_ADMIN_URL",
+                string.IsNullOrWhiteSpace(settings.adminUrl)
+                    ? $"{settings.backendHttpUrl.TrimEnd('/')}/admin"
+                    : settings.adminUrl
+            );
+            settings.adminHostExecutable = EnvironmentValue(
+                "DIGITAL_TWIN_ADMIN_HOST_PATH",
+                settings.adminHostExecutable
+            );
+            settings.adminHostFixedRuntimeFolder = EnvironmentValue(
+                "DIGITAL_TWIN_ADMIN_FIXED_RUNTIME",
+                settings.adminHostFixedRuntimeFolder
+            );
+            settings.desktopControlUrl = EnvironmentValue(
+                "DIGITAL_TWIN_DESKTOP_CONTROL_URL",
+                settings.desktopControlUrl
+            );
+            settings.desktopControlToken = EnvironmentValue(
+                "DIGITAL_TWIN_DESKTOP_CONTROL_TOKEN",
+                settings.desktopControlToken
+            );
+            settings.maximizeWindowOnStart = EnvironmentBoolean(
+                "DIGITAL_TWIN_MAXIMIZE_WINDOW",
+                settings.maximizeWindowOnStart
+            );
             settings.qualityProfile = EnvironmentValue(
                 "DIGITAL_TWIN_QUALITY_PROFILE",
                 settings.qualityProfile
@@ -62,6 +94,14 @@ namespace HeatTreatment.DigitalTwin.Core
         {
             var value = Environment.GetEnvironmentVariable(key);
             return string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
+        }
+
+        private static bool EnvironmentBoolean(string key, bool fallback)
+        {
+            var value = Environment.GetEnvironmentVariable(key);
+            if (string.IsNullOrWhiteSpace(value)) return fallback;
+            if (bool.TryParse(value, out var parsed)) return parsed;
+            return value == "1" ? true : value == "0" ? false : fallback;
         }
     }
 }

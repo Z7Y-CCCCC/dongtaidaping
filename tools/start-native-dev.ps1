@@ -15,6 +15,10 @@ $backendDir = Join-Path $projectDir 'backend'
 $tmpDir = Join-Path $projectDir 'tmp'
 $unityDir = Join-Path $projectDir 'unity-client\Builds\Windows'
 $unityExe = Join-Path $unityDir 'HeatTreatmentDigitalTwin.exe'
+$adminHostDir = Join-Path $unityDir 'AdminHost'
+$adminHostExe = Join-Path $adminHostDir 'HeatTreatmentAdminHost.exe'
+$adminHostProjectDir = Join-Path $projectDir 'native-admin-host'
+$adminHostBuildScript = Join-Path $projectDir 'desktop\scripts\build-native-admin-host.cjs'
 $origin = "http://127.0.0.1:$BackendPort"
 $webSocketUrl = "ws://127.0.0.1:$BackendPort/ws"
 $backendOut = Join-Path $tmpDir 'native-dev-backend.out.log'
@@ -22,6 +26,23 @@ $backendErr = Join-Path $tmpDir 'native-dev-backend.err.log'
 $unityLog = Join-Path $tmpDir 'native-dev-unity.log'
 
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+$node = Get-Command node -ErrorAction Stop
+
+$adminHostSources = Get-ChildItem $adminHostProjectDir -File -ErrorAction SilentlyContinue | Where-Object {
+    $_.Extension -in @('.cs', '.csproj')
+}
+$adminHostNeedsBuild = -not (Test-Path $adminHostExe)
+if (-not $adminHostNeedsBuild -and $adminHostSources) {
+    $adminHostTimestamp = (Get-Item $adminHostExe).LastWriteTimeUtc
+    $adminHostNeedsBuild = ($adminHostSources | Where-Object { $_.LastWriteTimeUtc -gt $adminHostTimestamp }).Count -gt 0
+}
+if ($adminHostNeedsBuild) {
+    Write-Host 'Building Unity embedded admin host...'
+    & $node.Source $adminHostBuildScript
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $adminHostExe)) {
+        throw 'Unity embedded admin host build failed.'
+    }
+}
 
 function Read-BackendHealth {
     try {
@@ -65,7 +86,6 @@ if ($health) {
     Assert-OriginalWebDatabase $health
     Write-Host "Reusing backend at $origin (original Web MySQL)."
 } else {
-    $node = Get-Command node -ErrorAction Stop
     $shutdownToken = "native-dev-$PID-$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
     $backendEnvironment = @{
         NODE_ENV = 'development'
@@ -129,8 +149,15 @@ if (-not $BackendOnly) {
         $noProxy = @($env:NO_PROXY, 'localhost', '127.0.0.1') | Where-Object { $_ } | Select-Object -Unique
         $unityEnvironment = @{
             NO_PROXY = ($noProxy -join ',')
+            HTTP_PROXY = ''
+            HTTPS_PROXY = ''
+            ALL_PROXY = ''
             DIGITAL_TWIN_BACKEND_HTTP_URL = $origin
             DIGITAL_TWIN_BACKEND_WEBSOCKET_URL = $webSocketUrl
+            DIGITAL_TWIN_ADMIN_URL = "$origin/admin"
+            DIGITAL_TWIN_ADMIN_HOST_PATH = $adminHostExe
+            DIGITAL_TWIN_ADMIN_FIXED_RUNTIME = (Join-Path $adminHostDir 'WebView2Runtime')
+            DIGITAL_TWIN_MAXIMIZE_WINDOW = 'false'
         }
         Invoke-WithProcessEnvironment $unityEnvironment {
             $script:unityProcess = Start-Process `

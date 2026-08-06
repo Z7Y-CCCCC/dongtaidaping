@@ -1,0 +1,179 @@
+using System;
+using System.Collections;
+using System.Runtime.InteropServices;
+using System.Threading;
+using UnityEngine;
+
+namespace HeatTreatment.DigitalTwin.Runtime
+{
+    /// <summary>
+    /// Converts the Unity player into a clean borderless application shell. The visible
+    /// browser-style chrome is supplied by the embedded admin host, so the default Windows
+    /// caption and menu must not remain around the digital-twin interface.
+    /// </summary>
+    public sealed class NativeWindowMenu : MonoBehaviour
+    {
+        private bool _maximizeOnStart;
+
+        public event Action SettingsRequested;
+
+#if UNITY_STANDALONE_WIN && !UNITY_EDITOR
+        private const int GwlStyle = -16;
+        private const long WsChild = 0x40000000L;
+        private const long WsVisible = 0x10000000L;
+        private const long WsClipChildren = 0x02000000L;
+        private const long WsClipSiblings = 0x04000000L;
+        private const long WsPopup = unchecked((long)0x80000000);
+        private const long WsCaption = 0x00C00000L;
+        private const long WsThickFrame = 0x00040000L;
+        private const long WsMinimizeBox = 0x00020000L;
+        private const long WsMaximizeBox = 0x00010000L;
+        private const long WsSysMenu = 0x00080000L;
+        private const uint MonitorDefaultToNearest = 0x00000002;
+        private const uint SwpFrameChanged = 0x0020;
+        private const uint SwpShowWindow = 0x0040;
+
+        private static readonly IntPtr HwndTop = IntPtr.Zero;
+
+        private IntPtr _windowHandle;
+        private int _openAdminRequested;
+        private bool _installed;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeRect
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+
+            public int Width => Right - Left;
+            public int Height => Bottom - Top;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MonitorInfo
+        {
+            public int Size;
+            public NativeRect Monitor;
+            public NativeRect WorkArea;
+            public uint Flags;
+        }
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+        private static extern IntPtr GetWindowLongPtr64(IntPtr window, int index);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+        private static extern IntPtr GetWindowLongPtr32(IntPtr window, int index);
+
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
+        private static extern IntPtr SetWindowLongPtr64(IntPtr window, int index, IntPtr value);
+
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)]
+        private static extern IntPtr SetWindowLongPtr32(IntPtr window, int index, IntPtr value);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetWindowRect(IntPtr window, out NativeRect rect);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowPos(
+            IntPtr window,
+            IntPtr insertAfter,
+            int x,
+            int y,
+            int width,
+            int height,
+            uint flags
+        );
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetMenu(IntPtr window, IntPtr menu);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DrawMenuBar(IntPtr window);
+#endif
+
+        public void Configure(bool maximizeOnStart)
+        {
+            _maximizeOnStart = maximizeOnStart;
+        }
+
+        private IEnumerator Start()
+        {
+#if UNITY_STANDALONE_WIN && !UNITY_EDITOR
+            for (var attempt = 0; attempt < 180 && !_installed; attempt += 1)
+            {
+                TryInstallBorderlessShell();
+                if (_installed) break;
+                yield return null;
+            }
+#else
+            yield break;
+#endif
+        }
+
+        private void Update()
+        {
+#if UNITY_STANDALONE_WIN && !UNITY_EDITOR
+            if (Input.GetKeyDown(KeyCode.F10)) Interlocked.Exchange(ref _openAdminRequested, 1);
+            if (Interlocked.Exchange(ref _openAdminRequested, 0) == 1)
+            {
+                SettingsRequested?.Invoke();
+            }
+#endif
+        }
+
+#if UNITY_STANDALONE_WIN && !UNITY_EDITOR
+        private void TryInstallBorderlessShell()
+        {
+            if (_installed) return;
+            _windowHandle = System.Diagnostics.Process.GetCurrentProcess().MainWindowHandle;
+            if (_windowHandle == IntPtr.Zero || !GetWindowRect(_windowHandle, out var originalBounds)) return;
+
+            var style = GetWindowStyle(_windowHandle);
+            style &= ~(WsChild | WsCaption | WsThickFrame | WsMinimizeBox | WsMaximizeBox | WsSysMenu);
+            style |= WsPopup | WsVisible | WsClipChildren | WsClipSiblings;
+            SetWindowStyle(_windowHandle, style);
+            SetMenu(_windowHandle, IntPtr.Zero);
+            DrawMenuBar(_windowHandle);
+
+            var target = originalBounds;
+            if (_maximizeOnStart)
+            {
+                var monitor = MonitorFromWindow(_windowHandle, MonitorDefaultToNearest);
+                var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
+                if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info)) target = info.WorkArea;
+            }
+
+            SetWindowPos(
+                _windowHandle,
+                HwndTop,
+                target.Left,
+                target.Top,
+                Math.Max(1, target.Width),
+                Math.Max(1, target.Height),
+                SwpFrameChanged | SwpShowWindow
+            );
+            _installed = true;
+            Debug.Log("[NativeWindowMenu] Borderless application shell installed; F10 opens the admin tab.");
+        }
+
+        private static long GetWindowStyle(IntPtr window)
+        {
+            return (IntPtr.Size == 8 ? GetWindowLongPtr64(window, GwlStyle) : GetWindowLongPtr32(window, GwlStyle)).ToInt64();
+        }
+
+        private static void SetWindowStyle(IntPtr window, long style)
+        {
+            if (IntPtr.Size == 8) SetWindowLongPtr64(window, GwlStyle, new IntPtr(style));
+            else SetWindowLongPtr32(window, GwlStyle, new IntPtr(style));
+        }
+#endif
+    }
+}

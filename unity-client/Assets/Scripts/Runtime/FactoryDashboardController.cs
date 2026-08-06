@@ -97,6 +97,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
 
         private const float DesignWidth = 1920f;
         private const float DesignHeight = 1080f;
+        private const float ApplicationChromeHeight = 46f;
         private const int HistoryLimit = 72;
 
         private readonly Dictionary<string, DeviceView> _devices = new Dictionary<string, DeviceView>();
@@ -136,11 +137,11 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private GUIStyle _buttonStyle;
         private GUIStyle _centerStyle;
 
-        private static readonly Color Background = new Color(0.012f, 0.027f, 0.043f, 0.96f);
-        private static readonly Color Panel = new Color(0.025f, 0.059f, 0.086f, 0.91f);
-        private static readonly Color PanelStrong = new Color(0.032f, 0.075f, 0.108f, 0.96f);
-        private static readonly Color PanelSoft = new Color(0.05f, 0.095f, 0.125f, 0.72f);
-        private static readonly Color Border = new Color(0.18f, 0.39f, 0.52f, 0.72f);
+        private static readonly Color Background = new Color(0.025f, 0.055f, 0.095f, 0.9f);
+        private static readonly Color Panel = new Color(0.035f, 0.075f, 0.12f, 0.84f);
+        private static readonly Color PanelStrong = new Color(0.045f, 0.095f, 0.145f, 0.91f);
+        private static readonly Color PanelSoft = new Color(0.065f, 0.12f, 0.17f, 0.68f);
+        private static readonly Color Border = new Color(0.22f, 0.46f, 0.62f, 0.72f);
         private static readonly Color Accent = new Color(0.24f, 0.69f, 0.88f, 1f);
         private static readonly Color AccentSoft = new Color(0.18f, 0.46f, 0.62f, 0.72f);
         private static readonly Color Good = new Color(0.18f, 0.78f, 0.52f, 1f);
@@ -239,6 +240,46 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 WorldBounds = CalculateBounds(root),
                 LineName = _lineNames.TryGetValue(device.Id, out var lineName) ? lineName : "未分配产线"
             };
+        }
+
+        public void ApplyPreviewDevice(DeviceDto device, GameObject root)
+        {
+            if (device == null || root == null || string.IsNullOrWhiteSpace(device.Id)) return;
+            if (_devices.TryGetValue(device.Id, out var existing))
+            {
+                existing.Device = device;
+                existing.Root = root;
+                existing.WorldBounds = CalculateBounds(root);
+                return;
+            }
+            RegisterDevice(device, root);
+        }
+
+        public void UpdatePreviewFactoryBounds(Bounds factoryBounds)
+        {
+            _factoryBounds = factoryBounds;
+            foreach (var device in _devices.Values)
+            {
+                if (device.Root != null) device.WorldBounds = CalculateBounds(device.Root);
+            }
+        }
+
+        public void FocusPreviewBounds(Bounds bounds)
+        {
+            _selected = null;
+            _mode = DashboardMode.Overview;
+            _uiBlend = 1f;
+            foreach (var entry in _devices.Values)
+            {
+                if (entry.Root != null) entry.Root.SetActive(true);
+            }
+            _orbit?.FocusBounds(bounds, -39f, 48f, 1.08f, false);
+        }
+
+        public void FocusPreviewDevice(string deviceId)
+        {
+            if (string.IsNullOrWhiteSpace(deviceId)) return;
+            if (_devices.TryGetValue(deviceId, out var device)) ShowDetail(device);
         }
 
         public void CompleteFactory(Bounds factoryBounds)
@@ -418,7 +459,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             if (_dashboardConfig.ShowWorldLabels) DrawWorldLabels();
             if (_dashboardConfig.ShowBottomHints)
             {
-                DrawBottomHint("单击设备进入详情   |   左键拖动旋转   |   右键/中键平移   |   滚轮缩放   |   F9 诊断信息");
+                DrawBottomHint("顶部菜单栏“设置”进入管理后台   |   单击设备进入详情   |   左键拖动旋转   |   右键/中键平移   |   滚轮缩放");
             }
         }
 
@@ -781,11 +822,12 @@ namespace HeatTreatment.DigitalTwin.Runtime
 
         private void UpdateCanvasMetrics()
         {
-            var fitScale = Mathf.Max(0.1f, Mathf.Min(Screen.width / DesignWidth, Screen.height / DesignHeight));
+            var availableHeight = Mathf.Max(1f, Screen.height - ApplicationChromeHeight);
+            var fitScale = Mathf.Max(0.1f, Mathf.Min(Screen.width / DesignWidth, availableHeight / DesignHeight));
             _uiScale = fitScale * _dashboardConfig.UiScale;
             _uiOffset = new Vector2(
                 (Screen.width - DesignWidth * _uiScale) * 0.5f,
-                (Screen.height - DesignHeight * _uiScale) * 0.5f
+                ApplicationChromeHeight + (availableHeight - DesignHeight * _uiScale) * 0.5f
             );
         }
 

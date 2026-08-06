@@ -64,6 +64,8 @@ app.use('/api/datapoints', require('./routes/datapoints'));
 app.use('/api/voice', require('./routes/voice'));
 const settingsController = { wsServer: null };
 app.use('/api/settings', require('./routes/settings')(settingsController));
+const nativePreviewController = { wsServer: null };
+app.use('/api/native-preview', require('./routes/nativePreview')(nativePreviewController));
 app.use('/api/platform', require('./routes/platform'));
 
 // 仅供 Electron 本机管理“登录后自启”和局域网投屏，路由内部会拒绝非回环请求。
@@ -478,6 +480,7 @@ async function startServer() {
     const wsServer = new WsServer();
     wsServer.attach(httpServer);
     settingsController.wsServer = wsServer;
+    nativePreviewController.wsServer = wsServer;
 
     const LanDisplayService = require('./services/lanDisplay');
     const lanDisplay = new LanDisplayService({ app, wsServer, primaryPort: PORT });

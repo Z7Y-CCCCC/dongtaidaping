@@ -1,6 +1,12 @@
 {
   "backendHttpUrl": "http://127.0.0.1:3001",
   "backendWebSocketUrl": "ws://127.0.0.1:3001/ws",
+  "adminUrl": "http://127.0.0.1:3001/admin",
+  "adminHostExecutable": "",
+  "adminHostFixedRuntimeFolder": "",
+  "desktopControlUrl": "",
+  "desktopControlToken": "",
+  "maximizeWindowOnStart": true,
   "qualityProfile": "auto",
   "autoReconnectSeconds": 2.0,
   "configurationRetrySeconds": 3.0,

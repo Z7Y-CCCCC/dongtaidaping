@@ -1,13 +1,20 @@
 using System;
 using System.Collections.Generic;
+using System.Collections;
+using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using HeatTreatment.DigitalTwin.Backend;
 using HeatTreatment.DigitalTwin.Core;
 using HeatTreatment.DigitalTwin.Rendering;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
+using Process = System.Diagnostics.Process;
+using ProcessStartInfo = System.Diagnostics.ProcessStartInfo;
+using ProcessWindowStyle = System.Diagnostics.ProcessWindowStyle;
 
 namespace HeatTreatment.DigitalTwin.Runtime
 {
@@ -18,12 +25,20 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             public DeviceDto Device;
             public Transform Parent;
+            public string WorkshopId;
+            public string LineId;
         }
 
         private static FactoryRuntime _instance;
         private readonly Dictionary<string, ModelBindingDriver> _drivers = new Dictionary<string, ModelBindingDriver>();
         private readonly Dictionary<string, DeviceStatusVisual> _visuals = new Dictionary<string, DeviceStatusVisual>();
         private readonly Dictionary<string, JObject> _latestDeviceFrames = new Dictionary<string, JObject>();
+        private readonly Dictionary<string, Transform> _deviceRoots = new Dictionary<string, Transform>();
+        private readonly Dictionary<string, string> _deviceModelTypes = new Dictionary<string, string>();
+        private readonly Dictionary<string, string> _deviceLineIds = new Dictionary<string, string>();
+        private readonly Dictionary<string, string> _deviceWorkshopIds = new Dictionary<string, string>();
+        private readonly Dictionary<string, int> _previewModelVersions = new Dictionary<string, int>();
+        private readonly Dictionary<string, long> _previewSessionSequences = new Dictionary<string, long>();
 
         private NativeClientSettings _settings;
         private BackendApiClient _api;
@@ -33,11 +48,13 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private FactoryEnvironmentBuilder _environment;
         private RuntimeDiagnosticsOverlay _diagnostics;
         private FactoryDashboardController _dashboard;
+        private NativeWindowMenu _windowMenu;
         private FactoryConfigDto _config;
         private CancellationTokenSource _lifetime;
         private CancellationTokenSource _reload;
         private Transform _factoryRoot;
         private Camera _camera;
+        private OrbitCameraController _orbit;
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         private static void EnsureRuntimeExists()
@@ -59,8 +76,13 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _settings = NativeClientSettings.Load();
             _api = new BackendApiClient(_settings.backendHttpUrl);
 
+            _windowMenu = GetOrAdd<NativeWindowMenu>();
+            _windowMenu.Configure(_settings.maximizeWindowOnStart);
+            _windowMenu.SettingsRequested += OpenAdminSettings;
+
             _environment = GetOrAdd<FactoryEnvironmentBuilder>();
             _camera = _environment.EnsureCamera();
+            _orbit = _camera.GetComponent<OrbitCameraController>();
             _environment.BuildLightingAndPostProcessing();
 
             _quality = GetOrAdd<NativeQualityController>();
@@ -95,6 +117,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private void Start()
         {
             BeginReload();
+            StartCoroutine(StartApplicationChromeCoroutine());
         }
 
         private void Update()
@@ -155,6 +178,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             {
                 _quality.Apply(backendQuality, false);
             }
+            _environment.ApplySettings(config.Settings);
 
             var placements = CreateHierarchy(config, _factoryRoot);
             var devices = placements.Select(placement => placement.Device).ToList();
@@ -179,6 +203,10 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 {
                     _drivers[device.Id] = driver;
                     _visuals[device.Id] = visual;
+                    _deviceRoots[device.Id] = instance.Root.transform;
+                    _deviceModelTypes[device.Id] = device.ModelType ?? string.Empty;
+                    _deviceLineIds[device.Id] = placement.LineId ?? device.LineId ?? string.Empty;
+                    _deviceWorkshopIds[device.Id] = placement.WorkshopId ?? string.Empty;
                     if (_latestDeviceFrames.TryGetValue(device.Id, out var latest))
                     {
                         driver.ApplyRealtime(latest);
@@ -217,12 +245,24 @@ namespace HeatTreatment.DigitalTwin.Runtime
                     lineRoot.transform.SetParent(workshopRoot.transform, false);
                     foreach (var device in line.Devices ?? new List<DeviceDto>())
                     {
-                        result.Add(new DevicePlacement { Device = device, Parent = lineRoot.transform });
+                        result.Add(new DevicePlacement
+                        {
+                            Device = device,
+                            Parent = lineRoot.transform,
+                            WorkshopId = workshop.Id,
+                            LineId = line.Id
+                        });
                     }
                 }
                 foreach (var device in workshop.Devices ?? new List<DeviceDto>())
                 {
-                    result.Add(new DevicePlacement { Device = device, Parent = workshopRoot.transform });
+                    result.Add(new DevicePlacement
+                    {
+                        Device = device,
+                        Parent = workshopRoot.transform,
+                        WorkshopId = workshop.Id,
+                        LineId = device.LineId
+                    });
                 }
             }
             return result;
@@ -260,6 +300,372 @@ namespace HeatTreatment.DigitalTwin.Runtime
             {
                 ApplyLiveSettings(message["payload"] as JObject);
             }
+            else if (type == "native_scene_preview")
+            {
+                ApplyNativeScenePreview(message["payload"] as JObject);
+            }
+        }
+
+        private void ApplyNativeScenePreview(JObject payload)
+        {
+            if (payload == null || _config == null || _factoryRoot == null) return;
+            var sessionId = payload.Value<string>("sessionId") ?? "admin";
+            var sequence = payload.Value<long?>("sequence") ?? 0L;
+            if (_previewSessionSequences.TryGetValue(sessionId, out var previous) && sequence > 0 && sequence <= previous)
+            {
+                return;
+            }
+            if (sequence > 0) _previewSessionSequences[sessionId] = sequence;
+
+            var action = payload.Value<string>("action") ?? "apply";
+            if (string.Equals(action, "reload", StringComparison.OrdinalIgnoreCase))
+            {
+                _diagnostics.Activity = "Reloading saved Unity layout";
+                BeginReload();
+                return;
+            }
+
+            if (string.Equals(action, "camera", StringComparison.OrdinalIgnoreCase))
+            {
+                ApplyPreviewCameraAction(payload);
+                return;
+            }
+
+            var reset = string.Equals(action, "reset", StringComparison.OrdinalIgnoreCase);
+            var devices = reset
+                ? EnumerateConfigDevices(_config).ToList()
+                : payload["devices"]?.ToObject<List<DeviceDto>>() ?? new List<DeviceDto>();
+            if (devices.Count == 0) devices = EnumerateConfigDevices(_config).ToList();
+
+            foreach (var device in devices)
+            {
+                ApplyPreviewDevice(device);
+            }
+
+            var includeLayout = reset || payload.Value<bool?>("includeLayout") == true;
+            if (includeLayout)
+            {
+                var previewConfig = reset ? _config : BuildPreviewConfig(payload["lines"] as JArray);
+                _environment.RebuildFactoryFloor(previewConfig, devices, reset);
+                if (reset) _environment.RefreshReflectionProbe();
+            }
+
+            var factoryBounds = CalculateRendererBounds(_factoryRoot);
+            _dashboard.UpdatePreviewFactoryBounds(factoryBounds);
+            ApplyPreviewFocus(payload["focus"] as JObject, factoryBounds);
+            _diagnostics.Activity = reset
+                ? "Unity live layout restored from database"
+                : "Unity live layout updated from admin";
+        }
+
+        private void ApplyPreviewDevice(DeviceDto device)
+        {
+            if (device == null || string.IsNullOrWhiteSpace(device.Id)) return;
+            if (!_deviceRoots.TryGetValue(device.Id, out var root) || root == null) return;
+            if (!string.IsNullOrWhiteSpace(device.LineId))
+            {
+                _deviceLineIds[device.Id] = device.LineId;
+                var workshop = FindWorkshopForLine(device.LineId);
+                if (!string.IsNullOrWhiteSpace(workshop)) _deviceWorkshopIds[device.Id] = workshop;
+            }
+            var configuredWorkshop = device.InstanceConfigObject.Value<string>("workshop_id")
+                ?? device.InstanceConfigObject.Value<string>("workshopId");
+            if (!string.IsNullOrWhiteSpace(configuredWorkshop)) _deviceWorkshopIds[device.Id] = configuredWorkshop;
+
+            var nextModelType = device.ModelType ?? string.Empty;
+            if (_deviceModelTypes.TryGetValue(device.Id, out var currentModelType)
+                && !string.Equals(currentModelType, nextModelType, StringComparison.OrdinalIgnoreCase))
+            {
+                var version = _previewModelVersions.TryGetValue(device.Id, out var currentVersion)
+                    ? currentVersion + 1
+                    : 1;
+                _previewModelVersions[device.Id] = version;
+                _ = ReplacePreviewModelAsync(device, root, version);
+                return;
+            }
+
+            _modelLibrary.ApplyPreviewTransform(root, device);
+            if (!string.IsNullOrWhiteSpace(device.Name)) root.name = device.Name;
+            _dashboard.ApplyPreviewDevice(device, root.gameObject);
+        }
+
+        private async Task ReplacePreviewModelAsync(DeviceDto device, Transform previousRoot, int version)
+        {
+            try
+            {
+                var parent = previousRoot != null ? previousRoot.parent : _factoryRoot;
+                var wasActive = previousRoot == null || previousRoot.gameObject.activeSelf;
+                var instance = await _modelLibrary.InstantiateAsync(device, parent, _lifetime.Token);
+                if (!_previewModelVersions.TryGetValue(device.Id, out var latestVersion) || latestVersion != version)
+                {
+                    if (instance.Root != null) Destroy(instance.Root);
+                    return;
+                }
+
+                var root = instance.Root;
+                root.SetActive(wasActive);
+                var driver = root.GetComponent<ModelBindingDriver>();
+                var visual = root.AddComponent<DeviceStatusVisual>();
+                visual.Initialize(device);
+                _drivers[device.Id] = driver;
+                _visuals[device.Id] = visual;
+                _deviceRoots[device.Id] = root.transform;
+                _deviceModelTypes[device.Id] = device.ModelType ?? string.Empty;
+                _dashboard.ApplyPreviewDevice(device, root);
+                if (_latestDeviceFrames.TryGetValue(device.Id, out var latest))
+                {
+                    driver?.ApplyRealtime(latest);
+                    visual.ApplyRealtime(latest);
+                    _dashboard.ApplyRealtime(device.Id, latest);
+                }
+                if (previousRoot != null) Destroy(previousRoot.gameObject);
+
+                var bounds = CalculateRendererBounds(_factoryRoot);
+                _dashboard.UpdatePreviewFactoryBounds(bounds);
+                _environment.RefreshReflectionProbe();
+            }
+            catch (OperationCanceledException)
+            {
+                // A full factory reload superseded the preview model request.
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning($"[FactoryRuntime] Live model preview failed for {device.Id}: {exception.Message}");
+            }
+        }
+
+        private FactoryConfigDto BuildPreviewConfig(JArray linePatches)
+        {
+            var clone = JsonConvert.DeserializeObject<FactoryConfigDto>(JsonConvert.SerializeObject(_config))
+                ?? _config;
+            if (linePatches == null) return clone;
+            var linesById = (clone.Workshops ?? new List<WorkshopDto>())
+                .SelectMany(workshop => workshop.Lines ?? new List<LineDto>())
+                .Where(line => !string.IsNullOrWhiteSpace(line.Id))
+                .ToDictionary(line => line.Id, line => line);
+            foreach (var token in linePatches)
+            {
+                if (!(token is JObject patch)) continue;
+                var lineId = patch.Value<string>("id");
+                if (string.IsNullOrWhiteSpace(lineId) || !linesById.TryGetValue(lineId, out var line)) continue;
+                line.Layout = (patch["layout_json"] ?? patch["layout"])?.DeepClone();
+            }
+            return clone;
+        }
+
+        private void ApplyPreviewFocus(JObject focus, Bounds factoryBounds)
+        {
+            var mode = focus?.Value<string>("mode") ?? "factory";
+            if (string.Equals(mode, "device", StringComparison.OrdinalIgnoreCase))
+            {
+                _dashboard.FocusPreviewDevice(focus?.Value<string>("deviceId"));
+                return;
+            }
+
+            IEnumerable<Transform> roots = _deviceRoots.Values.Where(root => root != null);
+            if (string.Equals(mode, "line", StringComparison.OrdinalIgnoreCase))
+            {
+                var lineId = focus?.Value<string>("lineId");
+                roots = _deviceRoots
+                    .Where(pair => _deviceLineIds.TryGetValue(pair.Key, out var value) && value == lineId)
+                    .Select(pair => pair.Value)
+                    .Where(root => root != null);
+            }
+            else if (string.Equals(mode, "workshop", StringComparison.OrdinalIgnoreCase))
+            {
+                var workshopId = focus?.Value<string>("workshopId");
+                roots = _deviceRoots
+                    .Where(pair => _deviceWorkshopIds.TryGetValue(pair.Key, out var value) && value == workshopId)
+                    .Select(pair => pair.Value)
+                    .Where(root => root != null);
+            }
+
+            var selectedRoots = roots.ToList();
+            _dashboard.FocusPreviewBounds(selectedRoots.Count > 0
+                ? CalculateRendererBounds(selectedRoots)
+                : factoryBounds);
+        }
+
+        private void ApplyPreviewCameraAction(JObject payload)
+        {
+            var action = payload.Value<string>("cameraAction") ?? string.Empty;
+            switch (action)
+            {
+                case "rotateLeft":
+                    _orbit?.NudgeYaw(-12f);
+                    break;
+                case "rotateRight":
+                    _orbit?.NudgeYaw(12f);
+                    break;
+                case "zoomIn":
+                    _orbit?.ZoomBy(0.82f);
+                    break;
+                case "zoomOut":
+                    _orbit?.ZoomBy(1.22f);
+                    break;
+                case "fit":
+                    ApplyPreviewFocus(payload["focus"] as JObject, CalculateRendererBounds(_factoryRoot));
+                    break;
+            }
+        }
+
+        private void OpenAdminSettings()
+        {
+            StartCoroutine(OpenAdminSettingsCoroutine());
+        }
+
+        private string ResolveAdminHostExecutable()
+        {
+            if (!string.IsNullOrWhiteSpace(_settings?.adminHostExecutable)
+                && File.Exists(_settings.adminHostExecutable))
+            {
+                return _settings.adminHostExecutable;
+            }
+
+            var buildDirectory = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            var bundledHost = Path.Combine(buildDirectory, "AdminHost", "HeatTreatmentAdminHost.exe");
+            return File.Exists(bundledHost) ? bundledHost : string.Empty;
+        }
+
+        private static string AppendEmbeddedFlag(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return url;
+            var separator = url.Contains("?") ? "&" : "?";
+            return $"{url}{separator}embedded=unity";
+        }
+
+        private static string QuoteProcessArgument(string value)
+        {
+            return $"\"{(value ?? string.Empty).Replace("\"", "\\\"")}\"";
+        }
+
+        private bool TryOpenEmbeddedAdmin(string adminUrl, bool showAdmin = true)
+        {
+            var executable = ResolveAdminHostExecutable();
+            if (string.IsNullOrWhiteSpace(executable)) return false;
+
+            try
+            {
+                var currentProcess = Process.GetCurrentProcess();
+                var arguments = string.Join(" ", new[]
+                {
+                    "--url", QuoteProcessArgument(AppendEmbeddedFlag(adminUrl)),
+                    "--parent-pid", currentProcess.Id.ToString(),
+                    "--parent-hwnd", currentProcess.MainWindowHandle.ToInt64().ToString(),
+                    "--user-data", QuoteProcessArgument(Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                        "heat-treatment-digital-twin-desktop",
+                        "webview2"
+                    ))
+                });
+                if (!string.IsNullOrWhiteSpace(_settings?.adminHostFixedRuntimeFolder))
+                {
+                    arguments += " --fixed-runtime " + QuoteProcessArgument(_settings.adminHostFixedRuntimeFolder);
+                }
+                if (!showAdmin) arguments += " --dashboard-mode";
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = executable,
+                    Arguments = arguments,
+                    WorkingDirectory = Path.GetDirectoryName(executable) ?? string.Empty,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                });
+                Debug.Log(showAdmin
+                    ? "[FactoryRuntime] Embedded admin tab requested"
+                    : "[FactoryRuntime] Application tab chrome requested");
+                return true;
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning($"[FactoryRuntime] Embedded admin panel failed: {exception.Message}");
+                return false;
+            }
+        }
+
+        private IEnumerator StartApplicationChromeCoroutine()
+        {
+#if UNITY_STANDALONE_WIN && !UNITY_EDITOR
+            yield return new WaitForSecondsRealtime(0.35f);
+            var adminUrl = string.IsNullOrWhiteSpace(_settings?.adminUrl)
+                ? $"{_settings?.backendHttpUrl?.TrimEnd('/')}/admin"
+                : _settings.adminUrl;
+            if (!TryOpenEmbeddedAdmin(adminUrl, false))
+            {
+                Debug.LogWarning("[FactoryRuntime] Application tab chrome could not be started; press F10 to retry.");
+            }
+#else
+            yield break;
+#endif
+        }
+
+        private IEnumerator OpenAdminSettingsCoroutine()
+        {
+            var adminUrl = string.IsNullOrWhiteSpace(_settings?.adminUrl)
+                ? $"{_settings?.backendHttpUrl?.TrimEnd('/')}/admin"
+                : _settings.adminUrl;
+            if (TryOpenEmbeddedAdmin(adminUrl, true))
+            {
+                yield break;
+            }
+            if (string.IsNullOrWhiteSpace(_settings?.desktopControlUrl))
+            {
+                Debug.Log("[FactoryRuntime] Opening admin in the default browser (development mode)");
+                Application.OpenURL(adminUrl);
+                yield break;
+            }
+
+            var endpoint = $"{_settings.desktopControlUrl.TrimEnd('/')}/open-admin";
+            var requestTask = PostDesktopControlAsync(endpoint, _settings.desktopControlToken);
+            while (!requestTask.IsCompleted) yield return null;
+            if (requestTask.Status == TaskStatus.RanToCompletion && requestTask.Result)
+            {
+                Debug.Log("[FactoryRuntime] Desktop settings window requested");
+                yield break;
+            }
+
+            if (requestTask.IsFaulted)
+            {
+                Debug.LogWarning($"[FactoryRuntime] Desktop settings request failed: {requestTask.Exception?.GetBaseException().Message}");
+            }
+            Application.OpenURL(adminUrl);
+        }
+
+        private static async Task<bool> PostDesktopControlAsync(string endpoint, string token)
+        {
+            using (var handler = new HttpClientHandler { UseProxy = false })
+            using (var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) })
+            using (var request = new HttpRequestMessage(HttpMethod.Post, endpoint))
+            {
+                request.Headers.TryAddWithoutValidation("x-desktop-control-token", token ?? string.Empty);
+                using (var response = await client.SendAsync(request))
+                {
+                    return response.IsSuccessStatusCode;
+                }
+            }
+        }
+
+        private string FindWorkshopForLine(string lineId)
+        {
+            foreach (var workshop in _config?.Workshops ?? new List<WorkshopDto>())
+            {
+                if ((workshop.Lines ?? new List<LineDto>()).Any(line => line.Id == lineId)) return workshop.Id;
+            }
+            return string.Empty;
+        }
+
+        private static IEnumerable<DeviceDto> EnumerateConfigDevices(FactoryConfigDto config)
+        {
+            foreach (var workshop in config?.Workshops ?? new List<WorkshopDto>())
+            {
+                foreach (var line in workshop.Lines ?? new List<LineDto>())
+                {
+                    foreach (var device in line.Devices ?? new List<DeviceDto>()) yield return device;
+                }
+                foreach (var device in workshop.Devices ?? new List<DeviceDto>()) yield return device;
+            }
         }
 
         private void ApplyLiveSettings(JObject payload)
@@ -274,6 +680,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             }
             if (_config != null) _config.Settings = merged;
             _dashboard.ApplySettings(merged);
+            _environment.ApplySettings(merged);
 
             if (merged.TryGetValue("native_quality_profile", out var qualityProfile)
                 && !string.IsNullOrWhiteSpace(qualityProfile)
@@ -296,6 +703,11 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             _drivers.Clear();
             _visuals.Clear();
+            _deviceRoots.Clear();
+            _deviceModelTypes.Clear();
+            _deviceLineIds.Clear();
+            _deviceWorkshopIds.Clear();
+            _previewModelVersions.Clear();
             _dashboard?.ClearFactory();
             if (_factoryRoot != null) Destroy(_factoryRoot.gameObject);
             _factoryRoot = null;
@@ -310,6 +722,20 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private static Bounds CalculateRendererBounds(Transform root)
         {
             var renderers = root.GetComponentsInChildren<Renderer>(false)
+                .Where(renderer => renderer.enabled)
+                .ToArray();
+            if (renderers.Length == 0) return new Bounds(Vector3.zero, new Vector3(40f, 10f, 30f));
+            var bounds = renderers[0].bounds;
+            for (var index = 1; index < renderers.Length; index += 1) bounds.Encapsulate(renderers[index].bounds);
+            bounds.Expand(new Vector3(4f, 2f, 4f));
+            return bounds;
+        }
+
+        private static Bounds CalculateRendererBounds(IEnumerable<Transform> roots)
+        {
+            var renderers = (roots ?? Enumerable.Empty<Transform>())
+                .Where(root => root != null)
+                .SelectMany(root => root.GetComponentsInChildren<Renderer>(false))
                 .Where(renderer => renderer.enabled)
                 .ToArray();
             if (renderers.Length == 0) return new Bounds(Vector3.zero, new Vector3(40f, 10f, 30f));
@@ -339,6 +765,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 _webSocket.ConnectionStateChanged -= OnConnectionStateChanged;
                 _webSocket.StopClient();
             }
+            if (_windowMenu != null) _windowMenu.SettingsRequested -= OpenAdminSettings;
             _reload?.Cancel();
             _reload?.Dispose();
             _lifetime?.Cancel();

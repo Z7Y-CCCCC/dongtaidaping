@@ -50,6 +50,7 @@ namespace HeatTreatment.DigitalTwin.Backend
                     _socket.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
                     QueueState("connecting");
                     await _socket.ConnectAsync(_endpoint, cancellationToken);
+                    await SendHelloAsync(_socket, cancellationToken);
                     QueueState("connected");
                     await ReceiveLoopAsync(_socket, cancellationToken);
                 }
@@ -77,6 +78,22 @@ namespace HeatTreatment.DigitalTwin.Backend
                 }
             }
             QueueState("stopped");
+        }
+
+        private static Task SendHelloAsync(ClientWebSocket socket, CancellationToken cancellationToken)
+        {
+            var payload = Encoding.UTF8.GetBytes(new JObject
+            {
+                ["type"] = "client_hello",
+                ["role"] = "unity",
+                ["client"] = "heat-treatment-digital-twin"
+            }.ToString(Newtonsoft.Json.Formatting.None));
+            return socket.SendAsync(
+                new ArraySegment<byte>(payload),
+                WebSocketMessageType.Text,
+                true,
+                cancellationToken
+            );
         }
 
         private async Task ReceiveLoopAsync(ClientWebSocket socket, CancellationToken cancellationToken)

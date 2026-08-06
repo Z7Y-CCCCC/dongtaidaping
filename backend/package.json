@@ -11,7 +11,8 @@
     "test:site-backup": "node scripts/site-backup-test.cjs",
     "test:voice": "node scripts/voice-feature-test.cjs",
     "test:runtime": "node scripts/runtime-display-test.cjs",
-    "test:native-dashboard": "node scripts/native-dashboard-config-test.cjs"
+    "test:native-dashboard": "node scripts/native-dashboard-config-test.cjs",
+    "test:native-preview": "node scripts/native-scene-preview-test.cjs"
   },
   "dependencies": {
     "archiver": "^7.0.1",
