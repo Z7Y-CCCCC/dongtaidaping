@@ -56,6 +56,7 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        EnablePerMonitorDpiAwareness();
         var options = HostOptions.Parse(args);
         using var mutex = new Mutex(true, options.MutexName, out var isOwner);
         if (!isOwner)
@@ -67,6 +68,22 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         using var form = new AdminPanelForm(options);
         Application.Run(form);
+    }
+
+    private static void EnablePerMonitorDpiAwareness()
+    {
+        // Must run before the first window is created. Unity's player window is
+        // per-monitor DPI aware; a system-aware child gets bitmap-stretched into it
+        // on scaled displays, which pushes the bottom of the admin page out of view
+        // with no way to scroll to it.
+        try
+        {
+            NativeMethods.SetProcessDpiAwarenessContext(NativeMethods.DpiAwarenessContextPerMonitorAwareV2);
+        }
+        catch
+        {
+            // Older Windows builds fall back to the manifest-declared awareness.
+        }
     }
 
     private static void SignalExistingHost(string pipeName, string command)

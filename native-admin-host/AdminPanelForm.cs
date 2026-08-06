@@ -675,7 +675,7 @@ internal sealed class AdminPanelForm : Form
 
     private void ClampEmbeddedBounds()
     {
-        var client = GetParentClientSize();
+        var client = GetVisibleParentClientSize();
         var minimumWidth = _adminVisible ? Math.Min(MinimumPanelWidth, client.Width) : 1;
         var minimumHeight = _adminVisible ? Math.Min(MinimumPanelHeight, client.Height) : HeaderHeight;
         var width = Math.Min(Math.Max(minimumWidth, _embeddedBounds.Width), client.Width);
@@ -683,6 +683,30 @@ internal sealed class AdminPanelForm : Form
         var x = Math.Clamp(_embeddedBounds.X, 0, Math.Max(0, client.Width - width));
         var y = Math.Clamp(_embeddedBounds.Y, 0, Math.Max(0, client.Height - height));
         _embeddedBounds = new Rectangle(x, y, width, height);
+    }
+
+    /// <summary>
+    /// The Unity parent can extend past the visible desktop (taskbar overlap, a
+    /// restored window dragged partly off-screen, a monitor that was disconnected).
+    /// Sizing the embedded panel to the raw client rect then pushes the bottom of the
+    /// admin page off-screen permanently: the page believes it fits, so it never shows
+    /// a scrollbar and the last cards can never be reached. Clamp to the part of the
+    /// parent that is actually on a monitor's working area.
+    /// </summary>
+    private Size GetVisibleParentClientSize()
+    {
+        var client = GetParentClientSize();
+        var screenBounds = GetParentClientScreenBounds();
+        if (screenBounds == Rectangle.Empty) return client;
+
+        var workingArea = Screen.FromRectangle(screenBounds).WorkingArea;
+        var visible = Rectangle.Intersect(screenBounds, workingArea);
+        if (visible.Width <= 0 || visible.Height <= 0) return client;
+
+        return new Size(
+            Math.Max(1, Math.Min(client.Width, visible.Width)),
+            Math.Max(1, Math.Min(client.Height, visible.Height))
+        );
     }
 
     private void ShowPanel(bool focus = true)

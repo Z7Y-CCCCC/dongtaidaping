@@ -6135,6 +6135,195 @@ const mainTabs = [
                         @reset="resetNativeEnvironmentConfig"
                     />
 
+                    <!-- ===== Unity 原生大屏组件 ===== -->
+                    <div class="settings-section native-dashboard-settings">
+                        <div class="native-dashboard-heading">
+                            <div>
+                                <h3 class="section-title">Unity 原生大屏组件</h3>
+                                <p>调整总览左右栏、详情参数/状态栏和底部趋势。保存后通过 WebSocket 直接更新正在运行的 Unity，不重载模型。</p>
+                            </div>
+                            <div class="native-dashboard-actions">
+                                <button type="button" class="btn" @click="resetNativeDashboardConfig">恢复默认</button>
+                                <button type="button" class="btn btn-primary" :disabled="nativeDashboardSaving" @click="saveNativeDashboardSettings()">
+                                    {{ nativeDashboardSaving ? '应用中...' : '立即应用到 Unity' }}
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="native-dashboard-global-grid">
+                            <label>整体界面缩放
+                                <div class="native-dashboard-range-row">
+                                    <input v-model.number="nativeDashboardConfig.uiScale" type="range" min="0.8" max="1.2" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
+                                    <span>{{ Math.round(nativeDashboardConfig.uiScale * 100) }}%</span>
+                                </div>
+                            </label>
+                            <label>左右边距
+                                <input v-model.number="nativeDashboardConfig.sideMargin" type="number" min="8" max="100" step="2" class="input" @change="saveNativeDashboardSettings({ silent: true })" />
+                            </label>
+                            <label class="checkbox-line"><input v-model="nativeDashboardConfig.showHeader" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" /> 显示顶部标题栏</label>
+                            <label class="checkbox-line"><input v-model="nativeDashboardConfig.showWorldLabels" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" /> 显示设备悬浮标签</label>
+                            <label class="checkbox-line"><input v-model="nativeDashboardConfig.showBottomHints" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" /> 显示底部操作提示</label>
+                        </div>
+
+                        <div class="native-dashboard-panel-grid">
+                            <section class="native-dashboard-card">
+                                <div class="native-dashboard-card-title">
+                                    <strong>总览左侧统计栏</strong>
+                                    <label class="runtime-toggle-row">
+                                        <input v-model="nativeDashboardConfig.overview.left.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
+                                        <span class="runtime-toggle-track"><span></span></span>
+                                    </label>
+                                </div>
+                                <div class="native-dashboard-card-fields">
+                                    <label>宽度<input v-model.number="nativeDashboardConfig.overview.left.width" class="input" type="number" min="260" max="520" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label>高度<input v-model.number="nativeDashboardConfig.overview.left.height" class="input" type="number" min="800" max="900" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label class="native-dashboard-opacity">透明度
+                                        <div class="native-dashboard-range-row">
+                                            <input v-model.number="nativeDashboardConfig.overview.left.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
+                                            <span>{{ Math.round(nativeDashboardConfig.overview.left.opacity * 100) }}%</span>
+                                        </div>
+                                    </label>
+                                </div>
+                            </section>
+
+                            <section class="native-dashboard-card">
+                                <div class="native-dashboard-card-title">
+                                    <strong>总览右侧设备列表</strong>
+                                    <label class="runtime-toggle-row">
+                                        <input v-model="nativeDashboardConfig.overview.right.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
+                                        <span class="runtime-toggle-track"><span></span></span>
+                                    </label>
+                                </div>
+                                <div class="native-dashboard-card-fields">
+                                    <label>宽度<input v-model.number="nativeDashboardConfig.overview.right.width" class="input" type="number" min="260" max="520" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label>高度<input v-model.number="nativeDashboardConfig.overview.right.height" class="input" type="number" min="420" max="900" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label>最多设备<input v-model.number="nativeDashboardConfig.overview.right.maxDevices" class="input" type="number" min="1" max="100" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label class="native-dashboard-opacity">透明度
+                                        <div class="native-dashboard-range-row">
+                                            <input v-model.number="nativeDashboardConfig.overview.right.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
+                                            <span>{{ Math.round(nativeDashboardConfig.overview.right.opacity * 100) }}%</span>
+                                        </div>
+                                    </label>
+                                </div>
+                            </section>
+
+                            <section class="native-dashboard-card">
+                                <div class="native-dashboard-card-title">
+                                    <strong>详情左侧参数栏</strong>
+                                    <label class="runtime-toggle-row">
+                                        <input v-model="nativeDashboardConfig.detail.left.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
+                                        <span class="runtime-toggle-track"><span></span></span>
+                                    </label>
+                                </div>
+                                <div class="native-dashboard-card-fields">
+                                    <label>宽度<input v-model.number="nativeDashboardConfig.detail.left.width" class="input" type="number" min="260" max="520" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label>高度<input v-model.number="nativeDashboardConfig.detail.left.height" class="input" type="number" min="520" max="830" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label>参数数量<input v-model.number="nativeDashboardConfig.detail.left.maxPoints" class="input" type="number" min="1" max="12" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label class="native-dashboard-opacity">透明度
+                                        <div class="native-dashboard-range-row">
+                                            <input v-model.number="nativeDashboardConfig.detail.left.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
+                                            <span>{{ Math.round(nativeDashboardConfig.detail.left.opacity * 100) }}%</span>
+                                        </div>
+                                    </label>
+                                </div>
+                            </section>
+
+                            <section class="native-dashboard-card">
+                                <div class="native-dashboard-card-title">
+                                    <strong>详情右侧状态 / 联锁栏</strong>
+                                    <label class="runtime-toggle-row">
+                                        <input v-model="nativeDashboardConfig.detail.right.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
+                                        <span class="runtime-toggle-track"><span></span></span>
+                                    </label>
+                                </div>
+                                <div class="native-dashboard-card-fields">
+                                    <label>宽度<input v-model.number="nativeDashboardConfig.detail.right.width" class="input" type="number" min="260" max="520" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label>高度<input v-model.number="nativeDashboardConfig.detail.right.height" class="input" type="number" min="420" max="830" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label>状态数量<input v-model.number="nativeDashboardConfig.detail.right.maxPoints" class="input" type="number" min="1" max="100" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label class="native-dashboard-opacity">透明度
+                                        <div class="native-dashboard-range-row">
+                                            <input v-model.number="nativeDashboardConfig.detail.right.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
+                                            <span>{{ Math.round(nativeDashboardConfig.detail.right.opacity * 100) }}%</span>
+                                        </div>
+                                    </label>
+                                </div>
+                            </section>
+
+                            <section class="native-dashboard-card native-dashboard-trend-card">
+                                <div class="native-dashboard-card-title">
+                                    <strong>详情底部实时趋势</strong>
+                                    <label class="runtime-toggle-row">
+                                        <input v-model="nativeDashboardConfig.detail.trends.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
+                                        <span class="runtime-toggle-track"><span></span></span>
+                                    </label>
+                                </div>
+                                <div class="native-dashboard-card-fields">
+                                    <label>高度<input v-model.number="nativeDashboardConfig.detail.trends.height" class="input" type="number" min="140" max="320" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label>趋势数量<input v-model.number="nativeDashboardConfig.detail.trends.maxCharts" class="input" type="number" min="1" max="4" @change="saveNativeDashboardSettings({ silent: true })" /></label>
+                                    <label class="native-dashboard-opacity">透明度
+                                        <div class="native-dashboard-range-row">
+                                            <input v-model.number="nativeDashboardConfig.detail.trends.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
+                                            <span>{{ Math.round(nativeDashboardConfig.detail.trends.opacity * 100) }}%</span>
+                                        </div>
+                                    </label>
+                                </div>
+                            </section>
+                        </div>
+
+                        <div class="native-dashboard-point-config">
+                            <div class="native-dashboard-point-heading">
+                                <div>
+                                    <strong>按设备指定展示点位</strong>
+                                    <p>不勾选时按后台顺序自动取前 N 个；勾选后按这里的顺序精确展示。</p>
+                                </div>
+                                <label>设备
+                                    <select v-model="nativeDashboardSelectedDeviceId" class="input">
+                                        <option v-for="device in devices" :key="device.id" :value="device.id">{{ device.name }}（{{ device.id }}）</option>
+                                    </select>
+                                </label>
+                            </div>
+                            <p v-if="nativeDashboardPointsLoading" class="native-dashboard-point-message">正在读取点位...</p>
+                            <p v-else-if="nativeDashboardPointsMessage" class="native-dashboard-point-message is-error">{{ nativeDashboardPointsMessage }}</p>
+                            <div v-else class="native-dashboard-point-grid">
+                                <section>
+                                    <div class="native-dashboard-point-list-title">
+                                        <strong>左侧核心参数</strong>
+                                        <button type="button" @click="clearNativeDashboardPointSelection('analogPointIds')">恢复自动</button>
+                                    </div>
+                                    <label v-for="point in nativeDashboardAnalogPoints" :key="`analog-${point.id}`" class="native-dashboard-point-option">
+                                        <input type="checkbox" :checked="nativeDashboardPointSelected('analogPointIds', point.id)" @change="toggleNativeDashboardPoint('analogPointIds', point.id, $event.target.checked)" />
+                                        <span>{{ nativeDashboardPointText(point) }}</span>
+                                    </label>
+                                    <p v-if="nativeDashboardAnalogPoints.length === 0" class="empty-hint">该设备没有模拟量点位</p>
+                                </section>
+                                <section>
+                                    <div class="native-dashboard-point-list-title">
+                                        <strong>右侧状态 / 联锁</strong>
+                                        <button type="button" @click="clearNativeDashboardPointSelection('statusPointIds')">恢复自动</button>
+                                    </div>
+                                    <label v-for="point in nativeDashboardStatusPoints" :key="`status-${point.id}`" class="native-dashboard-point-option">
+                                        <input type="checkbox" :checked="nativeDashboardPointSelected('statusPointIds', point.id)" @change="toggleNativeDashboardPoint('statusPointIds', point.id, $event.target.checked)" />
+                                        <span>{{ nativeDashboardPointText(point) }}</span>
+                                    </label>
+                                    <p v-if="nativeDashboardStatusPoints.length === 0" class="empty-hint">该设备没有状态点位</p>
+                                </section>
+                                <section>
+                                    <div class="native-dashboard-point-list-title">
+                                        <strong>底部趋势</strong>
+                                        <button type="button" @click="clearNativeDashboardPointSelection('trendPointIds')">恢复自动</button>
+                                    </div>
+                                    <label v-for="point in nativeDashboardAnalogPoints" :key="`trend-${point.id}`" class="native-dashboard-point-option">
+                                        <input type="checkbox" :checked="nativeDashboardPointSelected('trendPointIds', point.id)" @change="toggleNativeDashboardPoint('trendPointIds', point.id, $event.target.checked)" />
+                                        <span>{{ nativeDashboardPointText(point) }}</span>
+                                    </label>
+                                    <p v-if="nativeDashboardAnalogPoints.length === 0" class="empty-hint">该设备没有可绘制趋势的点位</p>
+                                </section>
+                            </div>
+                        </div>
+
+                        <p v-if="nativeDashboardMessage" class="native-dashboard-message">{{ nativeDashboardMessage }}</p>
+                    </div>
+
                     <div class="settings-section" style="margin-top:24px;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
                             <h3 class="section-title" style="margin: 0;">组件布局</h3>
@@ -7043,197 +7232,8 @@ const mainTabs = [
                                 <template v-else>
                                     <p><strong>自动识别：</strong>按显卡名称和显存选择档位；工程师也可在客户端按 F1 / F2 / F3 临时切换。</p>
                                 </template>
-                                <p>保存后通过 WebSocket 实时切换画质，无需按 F5；所有档位都不会自动减面。场景光效请在“组件配置”页面调整。</p>
+                                <p>保存后通过 WebSocket 实时切换画质，无需按 F5；所有档位都不会自动减面。场景光效与大屏组件请在“组件配置”页面调整。</p>
                             </div>
-                        </div>
-
-                        <!-- ===== Unity 原生大屏组件 ===== -->
-                        <div class="settings-section native-dashboard-settings">
-                            <div class="native-dashboard-heading">
-                                <div>
-                                    <h3 class="section-title">Unity 原生大屏组件</h3>
-                                    <p>调整总览左右栏、详情参数/状态栏和底部趋势。保存后通过 WebSocket 直接更新正在运行的 Unity，不重载模型。</p>
-                                </div>
-                                <div class="native-dashboard-actions">
-                                    <button type="button" class="btn" @click="resetNativeDashboardConfig">恢复默认</button>
-                                    <button type="button" class="btn btn-primary" :disabled="nativeDashboardSaving" @click="saveNativeDashboardSettings()">
-                                        {{ nativeDashboardSaving ? '应用中...' : '立即应用到 Unity' }}
-                                    </button>
-                                </div>
-                            </div>
-
-                            <div class="native-dashboard-global-grid">
-                                <label>整体界面缩放
-                                    <div class="native-dashboard-range-row">
-                                        <input v-model.number="nativeDashboardConfig.uiScale" type="range" min="0.8" max="1.2" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
-                                        <span>{{ Math.round(nativeDashboardConfig.uiScale * 100) }}%</span>
-                                    </div>
-                                </label>
-                                <label>左右边距
-                                    <input v-model.number="nativeDashboardConfig.sideMargin" type="number" min="8" max="100" step="2" class="input" @change="saveNativeDashboardSettings({ silent: true })" />
-                                </label>
-                                <label class="checkbox-line"><input v-model="nativeDashboardConfig.showHeader" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" /> 显示顶部标题栏</label>
-                                <label class="checkbox-line"><input v-model="nativeDashboardConfig.showWorldLabels" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" /> 显示设备悬浮标签</label>
-                                <label class="checkbox-line"><input v-model="nativeDashboardConfig.showBottomHints" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" /> 显示底部操作提示</label>
-                            </div>
-
-                            <div class="native-dashboard-panel-grid">
-                                <section class="native-dashboard-card">
-                                    <div class="native-dashboard-card-title">
-                                        <strong>总览左侧统计栏</strong>
-                                        <label class="runtime-toggle-row">
-                                            <input v-model="nativeDashboardConfig.overview.left.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
-                                            <span class="runtime-toggle-track"><span></span></span>
-                                        </label>
-                                    </div>
-                                    <div class="native-dashboard-card-fields">
-                                        <label>宽度<input v-model.number="nativeDashboardConfig.overview.left.width" class="input" type="number" min="260" max="520" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label>高度<input v-model.number="nativeDashboardConfig.overview.left.height" class="input" type="number" min="800" max="900" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label class="native-dashboard-opacity">透明度
-                                            <div class="native-dashboard-range-row">
-                                                <input v-model.number="nativeDashboardConfig.overview.left.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
-                                                <span>{{ Math.round(nativeDashboardConfig.overview.left.opacity * 100) }}%</span>
-                                            </div>
-                                        </label>
-                                    </div>
-                                </section>
-
-                                <section class="native-dashboard-card">
-                                    <div class="native-dashboard-card-title">
-                                        <strong>总览右侧设备列表</strong>
-                                        <label class="runtime-toggle-row">
-                                            <input v-model="nativeDashboardConfig.overview.right.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
-                                            <span class="runtime-toggle-track"><span></span></span>
-                                        </label>
-                                    </div>
-                                    <div class="native-dashboard-card-fields">
-                                        <label>宽度<input v-model.number="nativeDashboardConfig.overview.right.width" class="input" type="number" min="260" max="520" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label>高度<input v-model.number="nativeDashboardConfig.overview.right.height" class="input" type="number" min="420" max="900" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label>最多设备<input v-model.number="nativeDashboardConfig.overview.right.maxDevices" class="input" type="number" min="1" max="100" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label class="native-dashboard-opacity">透明度
-                                            <div class="native-dashboard-range-row">
-                                                <input v-model.number="nativeDashboardConfig.overview.right.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
-                                                <span>{{ Math.round(nativeDashboardConfig.overview.right.opacity * 100) }}%</span>
-                                            </div>
-                                        </label>
-                                    </div>
-                                </section>
-
-                                <section class="native-dashboard-card">
-                                    <div class="native-dashboard-card-title">
-                                        <strong>详情左侧参数栏</strong>
-                                        <label class="runtime-toggle-row">
-                                            <input v-model="nativeDashboardConfig.detail.left.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
-                                            <span class="runtime-toggle-track"><span></span></span>
-                                        </label>
-                                    </div>
-                                    <div class="native-dashboard-card-fields">
-                                        <label>宽度<input v-model.number="nativeDashboardConfig.detail.left.width" class="input" type="number" min="260" max="520" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label>高度<input v-model.number="nativeDashboardConfig.detail.left.height" class="input" type="number" min="520" max="830" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label>参数数量<input v-model.number="nativeDashboardConfig.detail.left.maxPoints" class="input" type="number" min="1" max="12" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label class="native-dashboard-opacity">透明度
-                                            <div class="native-dashboard-range-row">
-                                                <input v-model.number="nativeDashboardConfig.detail.left.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
-                                                <span>{{ Math.round(nativeDashboardConfig.detail.left.opacity * 100) }}%</span>
-                                            </div>
-                                        </label>
-                                    </div>
-                                </section>
-
-                                <section class="native-dashboard-card">
-                                    <div class="native-dashboard-card-title">
-                                        <strong>详情右侧状态 / 联锁栏</strong>
-                                        <label class="runtime-toggle-row">
-                                            <input v-model="nativeDashboardConfig.detail.right.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
-                                            <span class="runtime-toggle-track"><span></span></span>
-                                        </label>
-                                    </div>
-                                    <div class="native-dashboard-card-fields">
-                                        <label>宽度<input v-model.number="nativeDashboardConfig.detail.right.width" class="input" type="number" min="260" max="520" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label>高度<input v-model.number="nativeDashboardConfig.detail.right.height" class="input" type="number" min="420" max="830" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label>状态数量<input v-model.number="nativeDashboardConfig.detail.right.maxPoints" class="input" type="number" min="1" max="100" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label class="native-dashboard-opacity">透明度
-                                            <div class="native-dashboard-range-row">
-                                                <input v-model.number="nativeDashboardConfig.detail.right.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
-                                                <span>{{ Math.round(nativeDashboardConfig.detail.right.opacity * 100) }}%</span>
-                                            </div>
-                                        </label>
-                                    </div>
-                                </section>
-
-                                <section class="native-dashboard-card native-dashboard-trend-card">
-                                    <div class="native-dashboard-card-title">
-                                        <strong>详情底部实时趋势</strong>
-                                        <label class="runtime-toggle-row">
-                                            <input v-model="nativeDashboardConfig.detail.trends.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
-                                            <span class="runtime-toggle-track"><span></span></span>
-                                        </label>
-                                    </div>
-                                    <div class="native-dashboard-card-fields">
-                                        <label>高度<input v-model.number="nativeDashboardConfig.detail.trends.height" class="input" type="number" min="140" max="320" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label>趋势数量<input v-model.number="nativeDashboardConfig.detail.trends.maxCharts" class="input" type="number" min="1" max="4" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                        <label class="native-dashboard-opacity">透明度
-                                            <div class="native-dashboard-range-row">
-                                                <input v-model.number="nativeDashboardConfig.detail.trends.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
-                                                <span>{{ Math.round(nativeDashboardConfig.detail.trends.opacity * 100) }}%</span>
-                                            </div>
-                                        </label>
-                                    </div>
-                                </section>
-                            </div>
-
-                            <div class="native-dashboard-point-config">
-                                <div class="native-dashboard-point-heading">
-                                    <div>
-                                        <strong>按设备指定展示点位</strong>
-                                        <p>不勾选时按后台顺序自动取前 N 个；勾选后按这里的顺序精确展示。</p>
-                                    </div>
-                                    <label>设备
-                                        <select v-model="nativeDashboardSelectedDeviceId" class="input">
-                                            <option v-for="device in devices" :key="device.id" :value="device.id">{{ device.name }}（{{ device.id }}）</option>
-                                        </select>
-                                    </label>
-                                </div>
-                                <p v-if="nativeDashboardPointsLoading" class="native-dashboard-point-message">正在读取点位...</p>
-                                <p v-else-if="nativeDashboardPointsMessage" class="native-dashboard-point-message is-error">{{ nativeDashboardPointsMessage }}</p>
-                                <div v-else class="native-dashboard-point-grid">
-                                    <section>
-                                        <div class="native-dashboard-point-list-title">
-                                            <strong>左侧核心参数</strong>
-                                            <button type="button" @click="clearNativeDashboardPointSelection('analogPointIds')">恢复自动</button>
-                                        </div>
-                                        <label v-for="point in nativeDashboardAnalogPoints" :key="`analog-${point.id}`" class="native-dashboard-point-option">
-                                            <input type="checkbox" :checked="nativeDashboardPointSelected('analogPointIds', point.id)" @change="toggleNativeDashboardPoint('analogPointIds', point.id, $event.target.checked)" />
-                                            <span>{{ nativeDashboardPointText(point) }}</span>
-                                        </label>
-                                        <p v-if="nativeDashboardAnalogPoints.length === 0" class="empty-hint">该设备没有模拟量点位</p>
-                                    </section>
-                                    <section>
-                                        <div class="native-dashboard-point-list-title">
-                                            <strong>右侧状态 / 联锁</strong>
-                                            <button type="button" @click="clearNativeDashboardPointSelection('statusPointIds')">恢复自动</button>
-                                        </div>
-                                        <label v-for="point in nativeDashboardStatusPoints" :key="`status-${point.id}`" class="native-dashboard-point-option">
-                                            <input type="checkbox" :checked="nativeDashboardPointSelected('statusPointIds', point.id)" @change="toggleNativeDashboardPoint('statusPointIds', point.id, $event.target.checked)" />
-                                            <span>{{ nativeDashboardPointText(point) }}</span>
-                                        </label>
-                                        <p v-if="nativeDashboardStatusPoints.length === 0" class="empty-hint">该设备没有状态点位</p>
-                                    </section>
-                                    <section>
-                                        <div class="native-dashboard-point-list-title">
-                                            <strong>底部趋势</strong>
-                                            <button type="button" @click="clearNativeDashboardPointSelection('trendPointIds')">恢复自动</button>
-                                        </div>
-                                        <label v-for="point in nativeDashboardAnalogPoints" :key="`trend-${point.id}`" class="native-dashboard-point-option">
-                                            <input type="checkbox" :checked="nativeDashboardPointSelected('trendPointIds', point.id)" @change="toggleNativeDashboardPoint('trendPointIds', point.id, $event.target.checked)" />
-                                            <span>{{ nativeDashboardPointText(point) }}</span>
-                                        </label>
-                                        <p v-if="nativeDashboardAnalogPoints.length === 0" class="empty-hint">该设备没有可绘制趋势的点位</p>
-                                    </section>
-                                </div>
-                            </div>
-
-                            <p v-if="nativeDashboardMessage" class="native-dashboard-message">{{ nativeDashboardMessage }}</p>
                         </div>
 
                         <!-- ===== 渲染性能 ===== -->
@@ -7332,7 +7332,7 @@ const mainTabs = [
 * { box-sizing: border-box; }
 
 .admin-container {
-    width: 100vw; height: 100vh;
+    width: 100vw; height: 100vh; height: 100dvh; min-height: 0;
     background: #f5f5f7; color: #1d1d1f;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
     display: flex; flex-direction: column;
@@ -7493,6 +7493,7 @@ const mainTabs = [
 
 .admin-header {
     display: flex; justify-content: space-between; align-items: center;
+    flex: 0 0 auto;
     height: 64px; padding: 0 32px; background: rgba(255, 255, 255, 0.85);
     border-bottom: 1px solid rgba(0, 0, 0, 0.08); z-index: 100;
 }
@@ -7672,7 +7673,7 @@ const mainTabs = [
 }
 
 .admin-content {
-    flex: 1; min-width: 0; min-height: 0; padding: 32px; overflow-y: auto; overflow-x: hidden;
+    flex: 1 1 auto; min-width: 0; min-height: 0; padding: 32px 32px 72px; overflow-y: auto; overflow-x: hidden;
     overscroll-behavior: contain; scrollbar-gutter: stable; background: #f5f5f7;
 }
 .admin-container.composer-active .admin-content {
@@ -7813,10 +7814,26 @@ const mainTabs = [
 }
 .line-planner-editor {
     min-width: 0;
-    overflow: visible;
+    align-self: start;
+    max-height: calc(100vh - 220px);
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     padding: 16px;
     background: #f5f7f8;
     border-right: 1px solid rgba(25, 33, 38, 0.08);
+}
+/* The embedded host adds a 46px window-chrome strip above the header, so every
+   viewport-relative height in this tab has that much less room to work with. */
+.admin-container.unity-embedded .line-planner-tab,
+.admin-container.unity-embedded .line-planner-shell {
+    min-height: calc(100vh - 132px);
+}
+.admin-container.unity-embedded .line-planner-layout {
+    min-height: calc(100vh - 266px);
+}
+.admin-container.unity-embedded .line-planner-editor {
+    max-height: calc(100vh - 266px);
 }
 .line-editor-panel,
 .line-basic-grid,
@@ -10593,7 +10610,7 @@ button:enabled:active {
 .render-custom-grid { margin-top: 18px; padding-top: 18px; border-top: 1px solid #e5e5e7; }
 .checkbox-line { display: flex; align-items: center; gap: 8px; min-height: 38px; font-weight: 400; }
 .database-production-notice { margin: 16px 0 0; padding: 11px 13px; color: #173f2b; background: #edf8f1; border-left: 3px solid #24834f; font-size: 13px; line-height: 1.55; }
-.native-dashboard-settings { background: linear-gradient(180deg, #f8fbfd 0%, #fbfbfd 100%); }
+.native-dashboard-settings { margin-top: 24px; background: linear-gradient(180deg, #f8fbfd 0%, #fbfbfd 100%); }
 .native-dashboard-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
 .native-dashboard-heading .section-title { margin-bottom: 8px; }
 .native-dashboard-heading p { max-width: 720px; margin: 0; color: #6e6e73; font-size: 13px; line-height: 1.6; }

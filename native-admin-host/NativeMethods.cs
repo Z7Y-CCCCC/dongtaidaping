@@ -34,6 +34,11 @@ internal static class NativeMethods
 
     internal static readonly IntPtr HwndTop = IntPtr.Zero;
 
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2. Without this the host is only
+    // system-DPI aware, so on a scaled display Windows stretches the child window
+    // inside the per-monitor-aware Unity parent and crops whatever does not fit.
+    internal static readonly IntPtr DpiAwarenessContextPerMonitorAwareV2 = new(-4);
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct Rect
     {
