@@ -431,11 +431,41 @@ const nativeScenePreviewSessionId = globalThis.crypto?.randomUUID?.()
 const nativeScenePreviewStatus = ref('正在检测 Unity...')
 const nativeScenePreviewConnected = ref(false)
 const nativeScenePreviewBusy = ref(false)
+const nativeScenePreviewChecked = ref(false)
 const nativeScenePreviewStatusClass = computed(() => ({
     'is-online': nativeScenePreviewConnected.value,
     'is-busy': nativeScenePreviewBusy.value,
-    'is-offline': !nativeScenePreviewConnected.value && !nativeScenePreviewBusy.value
+    'is-checking': !nativeScenePreviewChecked.value && !nativeScenePreviewBusy.value,
+    'is-offline': nativeScenePreviewChecked.value && !nativeScenePreviewConnected.value && !nativeScenePreviewBusy.value
 }))
+const nativeSceneHeaderLabel = computed(() => {
+    if (nativeScenePreviewBusy.value) return 'Unity 同步中'
+    if (!nativeScenePreviewChecked.value) return 'Unity 检测中'
+    return nativeScenePreviewConnected.value ? 'Unity 已连接' : 'Unity 未连接'
+})
+const deviceConnectionSummary = computed(() => {
+    const statuses = Array.isArray(engineStatus.plcStatus?.devices)
+        ? engineStatus.plcStatus.devices
+        : []
+    const fallbackTotal = devices.value.filter(device => Number(device.plc_enabled || 0) > 0).length
+    const total = statuses.length || fallbackTotal
+    const online = statuses.filter(status => status.status === 'connected').length
+    const connecting = statuses.filter(status => ['connecting', 'retrying'].includes(status.status)).length
+    const tone = total <= 0
+        ? 'is-unknown'
+        : online === total
+            ? 'is-online'
+            : (online > 0 || connecting > 0)
+                ? 'is-partial'
+                : 'is-offline'
+    return {
+        total,
+        online,
+        tone,
+        label: total > 0 ? `设备 ${online}/${total} 在线` : '设备状态未知',
+        detail: engineStatus.plcStatus?.message || '尚未取得设备连接状态'
+    }
+})
 let nativeScenePreviewTimer = null
 let nativeScenePreviewStatusTimer = null
 let nativeScenePreviewSequence = 0
@@ -519,7 +549,16 @@ async function refreshNativeScenePreviewStatus() {
     } catch (error) {
         nativeScenePreviewConnected.value = false
         nativeScenePreviewStatus.value = 'Unity 实时连接检测失败'
+    } finally {
+        nativeScenePreviewChecked.value = true
     }
+}
+
+async function refreshAdminConnectionStatus() {
+    await Promise.allSettled([
+        refreshNativeScenePreviewStatus(),
+        loadEngineStatus()
+    ])
 }
 
 async function sendNativeScenePreview(payload, { quiet = false } = {}) {
@@ -3937,8 +3976,8 @@ onMounted(async () => {
     syncComposerDraftFromSelection()
     await nextTick()
     scheduleComposerPreview()
-    await refreshNativeScenePreviewStatus()
-    nativeScenePreviewStatusTimer = setInterval(refreshNativeScenePreviewStatus, 3000)
+    await refreshAdminConnectionStatus()
+    nativeScenePreviewStatusTimer = setInterval(refreshAdminConnectionStatus, 3000)
     if (activeTab.value === 'composer') scheduleNativeScenePreview({ source: 'composer' })
     if (activeTab.value === 'lines') scheduleNativeScenePreview({ source: 'lines', includeLayout: true })
 })
@@ -3947,8 +3986,8 @@ onActivated(async () => {
     await nextTick()
     if (activeTab.value === 'composer') scheduleComposerPreview()
     if (!nativeScenePreviewStatusTimer) {
-        refreshNativeScenePreviewStatus()
-        nativeScenePreviewStatusTimer = setInterval(refreshNativeScenePreviewStatus, 3000)
+        refreshAdminConnectionStatus()
+        nativeScenePreviewStatusTimer = setInterval(refreshAdminConnectionStatus, 3000)
     }
     if (activeTab.value === 'models') await renderSelectedModelPreview()
     if (activeTab.value === 'point-monitor') startPointMonitor()
@@ -5097,6 +5136,24 @@ const mainTabs = [
                 </span>
                 <h1>数字孪生后台配置管理</h1>
             </div>
+            <div class="admin-connection-strip" aria-label="系统连接状态" aria-live="polite">
+                <span
+                    class="admin-connection-pill"
+                    :class="nativeScenePreviewStatusClass"
+                    :title="nativeScenePreviewStatus"
+                >
+                    <i aria-hidden="true"></i>
+                    {{ nativeSceneHeaderLabel }}
+                </span>
+                <span
+                    class="admin-connection-pill"
+                    :class="deviceConnectionSummary.tone"
+                    :title="deviceConnectionSummary.detail"
+                >
+                    <i aria-hidden="true"></i>
+                    {{ deviceConnectionSummary.label }}
+                </span>
+            </div>
         </header>
 
         <div class="admin-body">
@@ -5231,7 +5288,6 @@ const mainTabs = [
                             <h2>现场编排器</h2>
                             <p class="desc">这里现在直接控制正在运行的 Unity。左侧调整会实时生效，右侧 Web 画面仅用于快速选取和操作定位。</p>
                             <div class="native-live-row">
-                                <span class="native-live-status" :class="nativeScenePreviewStatusClass">{{ nativeScenePreviewStatus }}</span>
                                 <button type="button" class="btn btn-sm" @click="restoreSavedNativeScenePreview">恢复已保存布局</button>
                             </div>
                             <div class="composer-stat-grid">
@@ -5410,7 +5466,6 @@ const mainTabs = [
                         <div ref="composerPreviewRef" class="composer-preview-stage"></div>
                         <div class="composer-preview-footer">
                             <span>{{ composerPreviewStatus }} · Web 操作辅助</span>
-                            <span>{{ nativeScenePreviewConnected ? '修改已实时作用于 Unity，保存后永久生效' : 'Unity 未连接，当前仅保留编辑草稿' }}</span>
                         </div>
                     </section>
                 </div>
@@ -5457,7 +5512,6 @@ const mainTabs = [
                                 <p>世界位置决定整个车间放在工厂中的位置；边界决定车间地面、围墙编辑范围及工程师可用空间。</p>
                             </div>
                             <div class="line-native-actions">
-                                <span class="native-live-status" :class="nativeScenePreviewStatusClass">{{ nativeScenePreviewStatus }}</span>
                                 <button type="button" class="btn" @click="restoreSavedNativeScenePreview">撤销未保存预览</button>
                                 <button type="button" class="btn btn-primary" :disabled="workshopSavingId === selectedWorkshopEditor.id" @click="saveWorkshopSpatialLayout()">
                                     {{ workshopSavingId === selectedWorkshopEditor.id ? '保存中...' : '保存车间空间' }}
@@ -5486,7 +5540,6 @@ const mainTabs = [
                                 <p class="desc">拖动设备线、导轨和设备时会实时改变 Unity 场景；保存后固化到数据库。</p>
                             </div>
                             <div class="line-native-actions">
-                                <span class="native-live-status" :class="nativeScenePreviewStatusClass">{{ nativeScenePreviewStatus }}</span>
                                 <button type="button" class="btn" @click="restoreSavedNativeScenePreview">恢复已保存布局</button>
                                 <button class="btn btn-primary" @click="saveSelectedLineLayout" :disabled="lineLayoutSaving || !selectedLineEditor">
                                     {{ lineLayoutSaving ? '保存中...' : '保存产线结构' }}
@@ -7850,6 +7903,7 @@ const mainTabs = [
     display: flex;
     align-items: center;
     gap: 10px;
+    min-width: 0;
 }
 .header-logo-mark {
     width: 30px;
@@ -7872,6 +7926,42 @@ const mainTabs = [
     stroke-linejoin: round;
 }
 .admin-header h1 { margin: 0; font-size: 19px; color: #1d1d1f; font-weight: 600; letter-spacing: -0.2px; }
+.admin-connection-strip {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    min-width: 0;
+    margin-left: 20px;
+}
+.admin-connection-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 30px;
+    padding: 5px 11px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    color: #515154;
+    background: #f3f4f6;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+}
+.admin-connection-pill i {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 7px;
+    border-radius: 50%;
+    background: currentColor;
+}
+.admin-connection-pill.is-online { color: #176b3a; background: #e8f7ee; border-color: #bfe6cd; }
+.admin-connection-pill.is-busy,
+.admin-connection-pill.is-checking { color: #17628a; background: #eaf5fb; border-color: #bedfed; }
+.admin-connection-pill.is-partial { color: #8a5a0f; background: #fff7df; border-color: #ead29b; }
+.admin-connection-pill.is-offline { color: #9b3b32; background: #fff0ee; border-color: #efc4bf; }
+.admin-connection-pill.is-unknown { color: #667085; background: #f2f4f7; border-color: #dfe3e8; }
 .admin-body { display: flex; flex: 1; min-height: 0; overflow: hidden; position: relative; }
 .admin-container.line-planner-active .admin-body {
     min-height: 0;
@@ -8101,28 +8191,6 @@ const mainTabs = [
     gap: 10px;
     flex-wrap: wrap;
 }
-.native-live-status {
-    display: inline-flex;
-    align-items: center;
-    min-height: 30px;
-    padding: 5px 10px;
-    border: 1px solid transparent;
-    border-radius: 999px;
-    font-size: 12px;
-    font-weight: 600;
-    white-space: nowrap;
-}
-.native-live-status::before {
-    content: '';
-    width: 7px;
-    height: 7px;
-    margin-right: 7px;
-    border-radius: 50%;
-    background: currentColor;
-}
-.native-live-status.is-online { color: #176b3a; background: #e8f7ee; border-color: #bfe6cd; }
-.native-live-status.is-busy { color: #17628a; background: #eaf5fb; border-color: #bedfed; }
-.native-live-status.is-offline { color: #8a4b0f; background: #fff4e8; border-color: #efd2b4; }
 .line-planner-steps {
     display: flex;
     gap: 8px;
@@ -11176,6 +11244,10 @@ button:enabled:active {
 }
 
 @media (max-width: 900px) {
+    .admin-header { padding: 0 16px; }
+    .admin-header h1 { font-size: 16px; }
+    .admin-connection-strip { gap: 6px; margin-left: 10px; }
+    .admin-connection-pill { padding: 5px 8px; font-size: 11px; }
     .admin-container.line-planner-active .admin-content {
         padding: 8px;
     }
