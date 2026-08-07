@@ -72,6 +72,9 @@ internal static class Program
     private static void Main(string[] args)
     {
         EnablePerMonitorDpiAwareness();
+        // Prevent the transparent overlay WebView from flashing white before its
+        // controller-level background color is applied. Admin pages remain opaque.
+        Environment.SetEnvironmentVariable("WEBVIEW2_DEFAULT_BACKGROUND_COLOR", "00000000");
         var options = HostOptions.Parse(args);
         using var mutex = new Mutex(true, options.MutexName, out var isOwner);
         if (!isOwner)

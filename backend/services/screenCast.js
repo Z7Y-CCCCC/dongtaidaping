@@ -5,8 +5,9 @@
  * 把大屏画面实时编码成视频流，再把流地址交给电视。本服务负责：
  *   1. 找到可用的 ffmpeg；
  *   2. 起一个只在局域网内可访问的 HTTP 流服务（/cast/<token>/live.ts）；
- *   3. 电视来拉流时，为它单独拉起一路 ffmpeg（gdigrab 只抓 Unity 窗口），断开即回收；
- *   4. 通过 AVTransport 让电视开始/停止播放。
+ *   3. 将 Unity 窗口切回实时大屏，并读取它在桌面的物理像素范围；
+ *   4. 电视来拉流时，为它单独拉起一路 ffmpeg（桌面捕获后只裁剪 Unity 区域），断开即回收；
+ *   5. 通过 AVTransport 让电视开始/停止播放。
  *
  * 正式安装包内置固定版本的 LGPL FFmpeg；开发环境未准备资源时会明确提示。
  */
@@ -23,6 +24,48 @@ const { ipv4ToLong, isPrivateIpv4, listLanIpv4Interfaces } = require('../utils/l
 const DEFAULT_STREAM_PORT = 8788;
 const STREAM_TITLE = '热处理数字孪生大屏';
 const DEFAULT_WINDOW_TITLE = 'Heat Treatment Digital Twin';
+const WINDOW_BOUNDS_SCRIPT = `
+$ProgressPreference = 'SilentlyContinue'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class CastWindowProbe {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr handle, out RECT rect);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr handle);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr handle, uint command);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr handle);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+}
+"@
+[void][CastWindowProbe]::SetProcessDpiAwarenessContext([IntPtr](-4))
+$target = Get-Process | Where-Object {
+    $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -eq $env:CAST_WINDOW_TITLE
+} | Select-Object -First 1
+if ($null -eq $target) { exit 2 }
+if ([CastWindowProbe]::IsIconic($target.MainWindowHandle)) {
+    [void][CastWindowProbe]::ShowWindow($target.MainWindowHandle, 9)
+}
+[void][CastWindowProbe]::SetForegroundWindow($target.MainWindowHandle)
+Start-Sleep -Milliseconds 220
+$rect = New-Object CastWindowProbe+RECT
+if (-not [CastWindowProbe]::GetWindowRect($target.MainWindowHandle, [ref]$rect)) { exit 3 }
+$virtualLeft = [CastWindowProbe]::GetSystemMetrics(76)
+$virtualTop = [CastWindowProbe]::GetSystemMetrics(77)
+$virtualRight = $virtualLeft + [CastWindowProbe]::GetSystemMetrics(78)
+$virtualBottom = $virtualTop + [CastWindowProbe]::GetSystemMetrics(79)
+$left = [Math]::Max($rect.Left, $virtualLeft)
+$top = [Math]::Max($rect.Top, $virtualTop)
+$right = [Math]::Min($rect.Right, $virtualRight)
+$bottom = [Math]::Min($rect.Bottom, $virtualBottom)
+$width = $right - $left
+$height = $bottom - $top
+if ($width -lt 64 -or $height -lt 64) { exit 4 }
+[Console]::Out.Write(("{0},{1},{2},{3}" -f $left,$top,$width,$height))
+`;
+const WINDOW_BOUNDS_SCRIPT_BASE64 = Buffer.from(WINDOW_BOUNDS_SCRIPT, 'utf16le').toString('base64');
 
 function candidateFfmpegPaths() {
     const root = path.resolve(__dirname, '..', '..');
@@ -46,6 +89,76 @@ function runFfmpegCommand(command, args, timeout = 5000) {
     });
 }
 
+function resolveWindowBounds(windowTitle, timeout = 6000) {
+    return new Promise((resolve, reject) => {
+        execFile('powershell.exe', [
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-EncodedCommand', WINDOW_BOUNDS_SCRIPT_BASE64
+        ], {
+            timeout,
+            windowsHide: true,
+            encoding: 'utf8',
+            env: { ...process.env, CAST_WINDOW_TITLE: windowTitle },
+            maxBuffer: 1024 * 1024
+        }, (error, stdout = '', stderr = '') => {
+            if (error) {
+                const exitCode = Number(error.code);
+                if (exitCode === 2) {
+                    reject(new Error(`没有找到 Unity 大屏窗口“${windowTitle}”。请先启动原生大屏，再点击投屏`));
+                    return;
+                }
+                if (exitCode === 3) {
+                    reject(new Error(`无法读取 Unity 大屏窗口“${windowTitle}”的位置`));
+                    return;
+                }
+                if (exitCode === 4) {
+                    reject(new Error(`Unity 大屏窗口“${windowTitle}”当前不在可见桌面范围内`));
+                    return;
+                }
+                const detail = String(stderr || error.message || '').trim().replace(/\s+/g, ' ');
+                reject(new Error(detail || `没有找到 Unity 大屏窗口“${windowTitle}”`));
+                return;
+            }
+            const match = String(stdout).trim().match(/^(-?\d+),(-?\d+),(\d+),(\d+)$/);
+            if (!match) {
+                reject(new Error(`Unity 大屏窗口坐标无效：${String(stdout).trim() || 'empty'}`));
+                return;
+            }
+            resolve({
+                left: Number(match[1]),
+                top: Number(match[2]),
+                width: Number(match[3]),
+                height: Number(match[4])
+            });
+        });
+    });
+}
+
+function requestDashboardView(timeout = 2500) {
+    const origin = String(process.env.DESKTOP_CONTROL_URL || '').trim();
+    const token = String(process.env.DESKTOP_CONTROL_TOKEN || '').trim();
+    if (!origin || !token) return Promise.resolve(false);
+    return new Promise(resolve => {
+        let endpoint;
+        try {
+            endpoint = new URL('/show-dashboard', origin);
+        } catch (error) {
+            resolve(false);
+            return;
+        }
+        const request = http.request(endpoint, {
+            method: 'POST',
+            headers: { 'x-desktop-control-token': token }
+        }, response => {
+            response.resume();
+            response.on('end', () => resolve(response.statusCode >= 200 && response.statusCode < 300));
+        });
+        request.setTimeout(timeout, () => request.destroy());
+        request.on('error', () => resolve(false));
+        request.end();
+    });
+}
+
 async function probeFfmpeg(command) {
     const version = await runFfmpegCommand(command, ['-version']);
     if (version.error) {
@@ -64,13 +177,24 @@ async function probeFfmpeg(command) {
     };
 }
 
-function buildEncoderArgs(options, windowTitle) {
+function buildCaptureInputArgs(options, captureBounds) {
+    if (!captureBounds || captureBounds.width < 1 || captureBounds.height < 1) {
+        throw new Error('Unity 大屏捕获区域无效');
+    }
+    return [
+        '-thread_queue_size', '512',
+        '-f', 'gdigrab', '-framerate', String(options.frameRate), '-draw_mouse', '0',
+        '-offset_x', String(captureBounds.left), '-offset_y', String(captureBounds.top),
+        '-video_size', `${captureBounds.width}x${captureBounds.height}`,
+        '-rtbufsize', '256M', '-i', 'desktop'
+    ];
+}
+
+function buildEncoderArgs(options, captureBounds) {
     const { frameRate, width, height, bitrateKbps } = options;
     return [
         '-hide_banner', '-loglevel', 'error',
-        '-thread_queue_size', '512',
-        '-f', 'gdigrab', '-framerate', String(frameRate), '-draw_mouse', '0',
-        '-rtbufsize', '256M', '-i', `title=${windowTitle}`,
+        ...buildCaptureInputArgs({ frameRate }, captureBounds),
         // 电视对纯视频的 TS 容错参差不齐，补一路静音音轨兼容性最好。
         '-thread_queue_size', '512',
         '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
@@ -128,6 +252,7 @@ class ScreenCastService {
         this.streamToken = '';
         this.session = null;
         this.encoders = new Set();
+        this.captureBounds = null;
         this.error = '';
         this.options = {
             frameRate: 20,
@@ -174,19 +299,18 @@ class ScreenCastService {
         if (process.platform !== 'win32') {
             throw new Error('Unity 原生大屏投屏目前只支持 Windows');
         }
+        const dashboardRequested = await requestDashboardView();
+        if (dashboardRequested) await new Promise(resolve => setTimeout(resolve, 450));
+        this.captureBounds = await resolveWindowBounds(this.windowTitle);
         const result = await runFfmpegCommand(this.ffmpegPath, [
             '-hide_banner', '-loglevel', 'error',
-            '-f', 'gdigrab', '-framerate', '1', '-draw_mouse', '0',
-            '-i', `title=${this.windowTitle}`,
+            ...buildCaptureInputArgs({ frameRate: 1 }, this.captureBounds),
             '-frames:v', '1', '-f', 'null', 'NUL'
         ], 8000);
         if (!result.error) return;
 
         const detail = String(result.stderr || result.error.message || '').trim().replace(/\s+/g, ' ');
-        if (/find window|window.*not found|can't find|could not find/i.test(detail)) {
-            throw new Error(`没有找到 Unity 大屏窗口“${this.windowTitle}”。请先启动原生大屏，再点击投屏`);
-        }
-        throw new Error(`无法读取 Unity 大屏窗口“${this.windowTitle}”：${detail || result.error.message}`);
+        throw new Error(`无法读取 Unity 大屏画面“${this.windowTitle}”：${detail || result.error.message}`);
     }
 
     async ensureStreamServer() {
@@ -293,8 +417,8 @@ class ScreenCastService {
     }
 
     spawnEncoder() {
-        if (!this.ffmpegPath) return null;
-        const args = buildEncoderArgs(this.options, this.windowTitle);
+        if (!this.ffmpegPath || !this.captureBounds) return null;
+        const args = buildEncoderArgs(this.options, this.captureBounds);
         const child = spawn(this.ffmpegPath, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
         child.castExpectedStop = false;
         let latestError = '';
@@ -471,7 +595,9 @@ class ScreenCastService {
             ffmpegVersion: this.ffmpegVersion,
             ffmpegError: this.ffmpegProbeError,
             encoder: 'h264_mf',
+            captureMode: 'desktop_window_region',
             captureWindowTitle: this.windowTitle,
+            captureBounds: this.captureBounds,
             streamPort: this.port,
             casting: Boolean(this.session),
             session: this.session
@@ -500,4 +626,6 @@ class ScreenCastService {
 module.exports = ScreenCastService;
 module.exports.pickLocalAddressFor = pickLocalAddressFor;
 module.exports.buildEncoderArgs = buildEncoderArgs;
+module.exports.buildCaptureInputArgs = buildCaptureInputArgs;
+module.exports.resolveWindowBounds = resolveWindowBounds;
 module.exports.DEFAULT_WINDOW_TITLE = DEFAULT_WINDOW_TITLE;

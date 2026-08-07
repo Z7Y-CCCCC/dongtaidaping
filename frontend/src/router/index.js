@@ -8,6 +8,12 @@ const routes = [
         path: '/admin',
         component: () => import('../views/AdminPanel.vue'),
         meta: { title: '热处理大屏后台', keepAlive: true }
+    },
+    {
+        name: 'dashboard-overlay',
+        path: '/overlay',
+        component: () => import('../views/DashboardOverlay.vue'),
+        meta: { title: '数字孪生透明数据层' }
     }
 ]
 

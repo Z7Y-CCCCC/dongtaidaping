@@ -685,7 +685,9 @@ namespace HeatTreatment.DigitalTwin.Runtime
             var adminUrl = string.IsNullOrWhiteSpace(_settings?.adminUrl)
                 ? $"{_settings?.backendHttpUrl?.TrimEnd('/')}/admin"
                 : _settings.adminUrl;
-            if (!TryOpenEmbeddedAdmin(adminUrl, false))
+            var overlayStarted = TryOpenEmbeddedAdmin(adminUrl, false);
+            _dashboard?.SetWebOverlayActive(overlayStarted);
+            if (!overlayStarted)
             {
                 Debug.LogWarning("[FactoryRuntime] Application tab chrome could not be started; press F10 to retry.");
             }
@@ -701,6 +703,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 : _settings.adminUrl;
             if (TryOpenEmbeddedAdmin(adminUrl, true))
             {
+                _dashboard?.SetWebOverlayActive(true);
                 yield break;
             }
             if (string.IsNullOrWhiteSpace(_settings?.desktopControlUrl))

@@ -30,6 +30,7 @@ internal sealed class AdminPanelForm : Form
     private readonly System.Windows.Forms.Timer _parentTimer = new() { Interval = 33 };
     private readonly CancellationTokenSource _pipeCancellation = new();
     private DashboardChromeForm? _dashboardChrome;
+    private DashboardOverlayForm? _dashboardOverlay;
     private readonly Rectangle _defaultDetachedBounds;
     private Rectangle _embeddedBounds;
     private Rectangle _savedDetachedBounds;
@@ -208,6 +209,17 @@ internal sealed class AdminPanelForm : Form
             _webView.CoreWebView2.NavigationCompleted += (_, _) => SendHostState();
             _webView.CoreWebView2.Navigate(_options.Url);
             _webView.Visible = true;
+            try
+            {
+                _dashboardOverlay = new DashboardOverlayForm(_options);
+                await _dashboardOverlay.InitializeAsync(environment);
+            }
+            catch (Exception overlayException)
+            {
+                WriteHostError("透明 WebView2 数据层初始化失败", overlayException);
+                _dashboardOverlay?.Dispose();
+                _dashboardOverlay = null;
+            }
             _status.Text = "已嵌入 Unity 大屏 · 可拖动后台管理页签";
         }
         catch (Exception exception)
@@ -390,12 +402,15 @@ internal sealed class AdminPanelForm : Form
             return;
         }
         RefreshParentWindowState();
+        _dashboardOverlay?.UpdateParentBounds();
         if (!_attached)
         {
             _dashboardChrome?.UpdateParentBounds();
+            SyncDashboardOverlay();
             return;
         }
         SetEmbeddedBounds(_adminVisible ? GetDefaultEmbeddedBounds() : GetDashboardChromeBounds());
+        SyncDashboardOverlay();
     }
 
     private void RefreshParentWindowState()
@@ -530,6 +545,7 @@ internal sealed class AdminPanelForm : Form
         MinimumSize = Size.Empty;
         SetEmbeddedBounds(GetDashboardChromeBounds());
         ShowPanel(false);
+        SyncDashboardOverlay();
         SendHostState();
     }
 
@@ -546,7 +562,28 @@ internal sealed class AdminPanelForm : Form
             MinimumSize = new Size(MinimumPanelWidth, MinimumPanelHeight);
         }
         ShowPanel();
+        SyncDashboardOverlay();
         SendHostState();
+    }
+
+    private void SyncDashboardOverlay()
+    {
+        if (_dashboardOverlay == null || _dashboardOverlay.IsDisposed) return;
+        if (!TryResolveParentWindow())
+        {
+            _dashboardOverlay.HideOverlay();
+            return;
+        }
+
+        var dashboardExposed = !_attached || !_adminVisible || _panelHidden;
+        if (dashboardExposed)
+        {
+            _dashboardOverlay.ShowForParent(_parentHandle);
+        }
+        else
+        {
+            _dashboardOverlay.HideOverlay();
+        }
     }
 
     private async void HandleCloseRequest()
@@ -674,6 +711,7 @@ internal sealed class AdminPanelForm : Form
         UpdateDetachedWindowAppearance();
         SetEmbeddedBounds(_adminVisible ? GetDefaultEmbeddedBounds() : GetDashboardChromeBounds(), force: true);
         ShowPanel(_adminVisible);
+        SyncDashboardOverlay();
         SendHostState();
     }
 
@@ -719,6 +757,7 @@ internal sealed class AdminPanelForm : Form
             _webView.Focus();
         }
         ShowDetachedDashboardChrome();
+        SyncDashboardOverlay();
         SendHostState();
     }
 
@@ -870,6 +909,7 @@ internal sealed class AdminPanelForm : Form
     {
         _panelHidden = true;
         HideDetachedDashboardChrome();
+        _dashboardOverlay?.HideOverlay();
         NativeMethods.ShowWindow(Handle, NativeMethods.SwHide);
         Hide();
         if (TryResolveParentWindow()) NativeMethods.ShowWindow(_parentHandle, NativeMethods.SwHide);
@@ -881,6 +921,7 @@ internal sealed class AdminPanelForm : Form
         NativeMethods.ShowWindow(_parentHandle, NativeMethods.SwRestore);
         NativeMethods.ShowWindow(_parentHandle, NativeMethods.SwShow);
         ShowDashboard();
+        SyncDashboardOverlay();
         NativeMethods.SetForegroundWindow(_parentHandle);
     }
 
@@ -942,6 +983,7 @@ internal sealed class AdminPanelForm : Form
             NativeMethods.SetForegroundWindow(Handle);
             _webView.Focus();
         }
+        SyncDashboardOverlay();
         SendHostState();
     }
 
@@ -950,6 +992,7 @@ internal sealed class AdminPanelForm : Form
         _panelHidden = true;
         NativeMethods.ShowWindow(Handle, NativeMethods.SwHide);
         Hide();
+        SyncDashboardOverlay();
     }
 
     private void BeginDrag(object? sender, MouseEventArgs e)
@@ -1473,6 +1516,7 @@ internal sealed class AdminPanelForm : Form
         _parentTimer.Stop();
         _pipeCancellation.Cancel();
         if (_dashboardChrome != null && !_dashboardChrome.IsDisposed) _dashboardChrome.Close();
+        if (_dashboardOverlay != null && !_dashboardOverlay.IsDisposed) _dashboardOverlay.Close();
         base.OnFormClosing(e);
     }
 }

@@ -144,6 +144,9 @@ internal static class NativeMethods
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern bool SetProcessDpiAwarenessContext(IntPtr value);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern uint GetDpiForWindow(IntPtr handle);
+
     [DllImport("dwmapi.dll", PreserveSig = true)]
     internal static extern int DwmSetWindowAttribute(
         IntPtr handle,

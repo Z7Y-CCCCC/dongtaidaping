@@ -18,7 +18,7 @@ const ScreenCastService = require('../services/screenCast');
 const dlna = require('../services/dlnaClient');
 const { listLanIpv4Interfaces } = require('../utils/lanNetwork');
 
-const { pickLocalAddressFor, buildEncoderArgs, DEFAULT_WINDOW_TITLE } = ScreenCastService;
+const { pickLocalAddressFor, buildEncoderArgs } = ScreenCastService;
 const { ignoredDeviceReason } = CastDiscoveryService;
 
 const DEVICE_DESCRIPTION = `<?xml version="1.0"?>
@@ -287,17 +287,21 @@ check('缺少 ffmpeg 时投屏必须明确失败而不是静默假成功', async
     assert.strictEqual(service.status().ffmpegAvailable, false);
 });
 
-check('编码器只捕获 Unity 窗口并使用 LGPL 兼容的 h264_mf', () => {
+check('编码器只裁剪 Unity 窗口区域并使用 LGPL 兼容的 h264_mf', () => {
+    const bounds = { left: 100, top: 50, width: 1600, height: 900 };
     const args = buildEncoderArgs({
         frameRate: 20,
         width: 1920,
         height: 1080,
         bitrateKbps: 8000
-    }, DEFAULT_WINDOW_TITLE);
+    }, bounds);
     const inputIndex = args.indexOf('-i');
     const encoderIndex = args.indexOf('-c:v');
-    assert.strictEqual(args[inputIndex + 1], `title=${DEFAULT_WINDOW_TITLE}`, '必须按 Unity 窗口标题捕获');
-    assert.ok(!args.includes('desktop'), '不能把后台、桌面或其他窗口一起投到电视');
+    assert.strictEqual(args[inputIndex + 1], 'desktop', 'DirectX 与 WebView2 合成画面必须从桌面捕获');
+    assert.strictEqual(args[args.indexOf('-offset_x') + 1], '100');
+    assert.strictEqual(args[args.indexOf('-offset_y') + 1], '50');
+    assert.strictEqual(args[args.indexOf('-video_size') + 1], '1600x900');
+    assert.ok(!args.some(value => String(value).startsWith('title=')), '不能再使用抓不到 DirectX 的 title 模式');
     assert.strictEqual(args[encoderIndex + 1], 'h264_mf', 'Windows 无独显电脑应使用 Media Foundation');
     assert.strictEqual(args[args.indexOf('-profile:v') + 1], '77', '电视兼容档应固定为 H.264 Main Profile');
     assert.strictEqual(args[args.indexOf('-level:v') + 1], '41', '1080p 直播应限制在常见电视支持的 Level 4.1');

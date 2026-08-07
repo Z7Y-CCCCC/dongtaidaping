@@ -118,6 +118,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private Vector2 _deviceScroll;
         private Vector2 _pointScroll;
         private float _uiBlend = 1f;
+        private bool _webOverlayActive;
         private NativeDashboardConfig _dashboardConfig = new NativeDashboardConfig();
 
         private Texture2D _whiteTexture;
@@ -229,6 +230,12 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _dashboardConfig = NormalizeDashboardConfig(next);
         }
 
+        public void SetWebOverlayActive(bool active)
+        {
+            _webOverlayActive = active;
+            if (_orbit != null && active) _orbit.PointerInputBlocked = false;
+        }
+
         public void RegisterDevice(DeviceDto device, GameObject root)
         {
             if (device == null || root == null || string.IsNullOrWhiteSpace(device.Id)) return;
@@ -328,7 +335,8 @@ namespace HeatTreatment.DigitalTwin.Runtime
             UpdateCanvasMetrics();
             _uiBlend = Mathf.MoveTowards(_uiBlend, 1f, Time.unscaledDeltaTime * 4.2f);
             var pointer = ScreenToDesign(Input.mousePosition);
-            if (_orbit != null) _orbit.PointerInputBlocked = IsPointerOverDashboard(pointer);
+            var legacyDashboardBlocksPointer = !_webOverlayActive && IsPointerOverDashboard(pointer);
+            if (_orbit != null) _orbit.PointerInputBlocked = legacyDashboardBlocksPointer;
 
             if (_mode == DashboardMode.Detail
                 && (Input.GetKeyDown(KeyCode.Escape) || Input.GetKeyDown(KeyCode.Backspace)))
@@ -340,14 +348,14 @@ namespace HeatTreatment.DigitalTwin.Runtime
             if (_mode != DashboardMode.Overview) return;
             if (Input.GetMouseButtonDown(0)) _pointerDown = pointer;
             if (!Input.GetMouseButtonUp(0)) return;
-            if (IsPointerOverDashboard(pointer)) return;
+            if (legacyDashboardBlocksPointer) return;
             if (Vector2.Distance(_pointerDown, pointer) > 10f) return;
             SelectFromWorld(Input.mousePosition);
         }
 
         private void OnGUI()
         {
-            if (_camera == null) return;
+            if (_camera == null || _webOverlayActive) return;
             EnsureStyles();
             UpdateCanvasMetrics();
             var oldMatrix = GUI.matrix;

@@ -184,6 +184,13 @@ function startDesktopControlServer() {
             return;
         }
 
+        if (request.method === 'POST' && pathname === '/show-dashboard') {
+            response.writeHead(202, { 'content-type': 'application/json; charset=utf-8' });
+            response.end(JSON.stringify({ success: true }));
+            setImmediate(showNativeDashboard);
+            return;
+        }
+
         if (request.method === 'POST' && pathname === '/minimize-to-tray') {
             response.writeHead(202, { 'content-type': 'application/json; charset=utf-8' });
             response.end(JSON.stringify({ success: true }));
@@ -527,6 +534,8 @@ async function startBackend(port, writable) {
             SQLITE_RECOVERY_TEMPLATE: resourcePath('templates', 'factory-template.db'),
             SQLITE_UPGRADE_TEMPLATE: resourcePath('templates', 'factory-template.db'),
             DESKTOP_SHUTDOWN_TOKEN: backendShutdownToken,
+            DESKTOP_CONTROL_URL: desktopControlOrigin || '',
+            DESKTOP_CONTROL_TOKEN: desktopControlToken || '',
             FFMPEG_PATH: resourcePath('ffmpeg', 'ffmpeg.exe'),
             CAST_WINDOW_TITLE: process.env.CAST_WINDOW_TITLE || 'Heat Treatment Digital Twin',
             NODE_PATH: resourcePath('backend-dependencies')
@@ -773,10 +782,13 @@ async function launchApplication() {
     const port = await findAvailablePort();
     const origin = `http://127.0.0.1:${port}`;
     applicationOrigin = origin;
+    // The backend needs this loopback channel in its environment so a DLNA
+    // cast can switch the embedded host back to the Unity dashboard before
+    // the desktop region is captured.
+    await startDesktopControlServer();
     await startBackend(port, writable);
     await waitForHealth(`${origin}/api/health`);
     startDesktopSettingsSync();
-    await startDesktopControlServer();
     createTray();
     try {
         await startNativeClient(origin, writable);
