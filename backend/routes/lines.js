@@ -1,54 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { getDb } = require('../db/database');
-
-function defaultLineLayout() {
-    return {
-        version: 1,
-        flowDirection: 'right',
-        lanes: [{ id: 'lane_1', name: '设备线 1', type: 'device_lane', offsetZ: 0, length: 60, sort_order: 0 }],
-        rails: []
-    };
-}
-
-function safeJsonParse(value, fallback) {
-    if (!value) return fallback;
-    if (typeof value === 'object') return value;
-    try {
-        return JSON.parse(value);
-    } catch (e) {
-        return fallback;
-    }
-}
-
-function numberOrDefault(value, fallback) {
-    const next = Number(value);
-    return Number.isFinite(next) ? next : fallback;
-}
-
-function normalizeLayoutItems(items, type) {
-    const prefix = type === 'rail' ? 'rail' : 'lane';
-    const defaultName = type === 'rail' ? '小车导轨' : '设备线';
-    return (Array.isArray(items) ? items : [])
-        .map((item, index) => ({
-            id: String(item?.id || `${prefix}_${index + 1}`),
-            name: String(item?.name || `${defaultName} ${index + 1}`),
-            type: type === 'rail' ? 'cart_rail' : 'device_lane',
-            offsetZ: numberOrDefault(item?.offsetZ ?? item?.offset_z ?? item?.z, type === 'rail' ? 4 : 0),
-            length: Math.max(1, numberOrDefault(item?.length, 60)),
-            sort_order: numberOrDefault(item?.sort_order, index)
-        }))
-        .sort((a, b) => a.sort_order - b.sort_order);
-}
-
-function normalizeLineLayout(value) {
-    const parsed = safeJsonParse(value, defaultLineLayout());
-    const lanes = normalizeLayoutItems(parsed.lanes, 'lane');
-    const rails = normalizeLayoutItems(parsed.rails, 'rail');
-    const flowDirection = ['right', 'left', 'none'].includes(parsed.flowDirection) ? parsed.flowDirection : 'right';
-    if (lanes.length === 0) lanes.push(defaultLineLayout().lanes[0]);
-    return { version: 1, flowDirection, lanes, rails };
-}
+const { normalizeLineLayout } = require('../utils/spatialLayout');
 
 function normalizeLineRow(row) {
     const layout = normalizeLineLayout(row.layout_json || row.layout);

@@ -75,7 +75,7 @@ router.get('/:id', async (req, res) => {
 router.post('/', async (req, res) => {
     const {
         id, name, line_id, model_type, model_file, template_id, instance_config,
-        pos_x, pos_y, pos_z, rotation_y, scale, sort_order,
+        pos_x, pos_y, pos_z, rotation_y, scale, coordinate_space, sort_order,
         plc_enabled, plc_protocol, plc_ip, plc_port, plc_rack, plc_slot,
         plc_timeout, plc_retry_interval, plc_max_retries
     } = req.body;
@@ -90,10 +90,10 @@ router.post('/', async (req, res) => {
         const db = await getDb();
         await db.run(`INSERT INTO devices (
             id, name, line_id, model_type, model_file, template_id, instance_config,
-            pos_x, pos_y, pos_z, rotation_y, scale, sort_order,
+            pos_x, pos_y, pos_z, rotation_y, scale, coordinate_space, sort_order,
             plc_enabled, plc_protocol, plc_ip, plc_port, plc_rack, plc_slot,
             plc_timeout, plc_retry_interval, plc_max_retries
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
             id,
             name,
             line_id || null,
@@ -106,6 +106,9 @@ router.post('/', async (req, res) => {
             numberWithDefault(pos_z, 0),
             numberWithDefault(rotation_y, 0),
             numberWithDefault(scale, 1.0),
+            ['line_local', 'workshop_local'].includes(coordinate_space)
+                ? coordinate_space
+                : (line_id ? 'line_local' : 'workshop_local'),
             numberWithDefault(sort_order, 0),
             boolWithDefault(plc_enabled, 0),
             plc_protocol || 'S7',
@@ -127,35 +130,42 @@ router.post('/', async (req, res) => {
 router.put('/:id', async (req, res) => {
     const {
         name, line_id, model_type, model_file, template_id, instance_config,
-        pos_x, pos_y, pos_z, rotation_y, scale, sort_order,
+        pos_x, pos_y, pos_z, rotation_y, scale, coordinate_space, sort_order,
         plc_enabled, plc_protocol, plc_ip, plc_port, plc_rack, plc_slot,
         plc_timeout, plc_retry_interval, plc_max_retries
     } = req.body;
     if (!name) return res.status(400).json({ error: '设备名称不能为空' });
-    if (!isAuxiliaryDevice(model_type, instance_config) && !line_id) {
-        return res.status(400).json({ error: '普通设备必须选择所属产线' });
-    }
     try {
         const db = await getDb();
-        const existing = await db.get('SELECT id FROM devices WHERE id = ?', [req.params.id]);
+        const existing = await db.get('SELECT * FROM devices WHERE id = ?', [req.params.id]);
         if (!existing) return res.status(404).json({ error: '设备不存在，可能已经被删除或 ID 未正确编码' });
+        const nextLineId = line_id === undefined ? existing.line_id : (line_id || null);
+        const nextModelType = model_type ?? existing.model_type;
+        const nextInstanceConfig = instance_config ?? existing.instance_config;
+        if (!isAuxiliaryDevice(nextModelType, nextInstanceConfig) && !nextLineId) {
+            return res.status(400).json({ error: '普通设备必须选择所属产线' });
+        }
+        const nextCoordinateSpace = ['line_local', 'workshop_local'].includes(coordinate_space)
+            ? coordinate_space
+            : (nextLineId ? 'line_local' : 'workshop_local');
 
         await db.run(`UPDATE devices SET name=?, line_id=?, model_type=?, model_file=?,
             template_id=?, instance_config=?, pos_x=?, pos_y=?, pos_z=?,
-            rotation_y=?, scale=?, sort_order=?, plc_enabled=?, plc_protocol=?, plc_ip=?,
+            rotation_y=?, scale=?, coordinate_space=?, sort_order=?, plc_enabled=?, plc_protocol=?, plc_ip=?,
             plc_port=?, plc_rack=?, plc_slot=?, plc_timeout=?, plc_retry_interval=?,
             plc_max_retries=? WHERE id=?`, [
             name,
-            line_id || null,
-            model_type,
+            nextLineId,
+            nextModelType,
             model_file,
             template_id || '',
-            stringifyJson(instance_config),
+            stringifyJson(nextInstanceConfig),
             numberWithDefault(pos_x, 0),
             numberWithDefault(pos_y, 0),
             numberWithDefault(pos_z, 0),
             numberWithDefault(rotation_y, 0),
             numberWithDefault(scale, 1.0),
+            nextCoordinateSpace,
             numberWithDefault(sort_order, 0),
             boolWithDefault(plc_enabled, 0),
             plc_protocol || 'S7',

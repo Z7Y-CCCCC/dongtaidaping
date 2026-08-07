@@ -20,14 +20,29 @@ namespace HeatTreatment.DigitalTwin.Backend
     {
         [JsonProperty("id")] public string Id { get; set; }
         [JsonProperty("name")] public string Name { get; set; }
+        [JsonProperty("layout_json")] public JToken Layout { get; set; }
         [JsonProperty("lines")] public List<LineDto> Lines { get; set; } = new List<LineDto>();
         [JsonProperty("devices")] public List<DeviceDto> Devices { get; set; } = new List<DeviceDto>();
+
+        public JObject LayoutObject => JsonObject(Layout);
+
+        private static JObject JsonObject(JToken token)
+        {
+            if (token is JObject value) return value;
+            if (token?.Type == JTokenType.String)
+            {
+                try { return JObject.Parse(token.Value<string>() ?? "{}"); }
+                catch { return new JObject(); }
+            }
+            return new JObject();
+        }
     }
 
     public sealed class LineDto
     {
         [JsonProperty("id")] public string Id { get; set; }
         [JsonProperty("name")] public string Name { get; set; }
+        [JsonProperty("workshop_id")] public string WorkshopId { get; set; }
         [JsonProperty("layout_json")] public JToken Layout { get; set; }
         [JsonProperty("devices")] public List<DeviceDto> Devices { get; set; } = new List<DeviceDto>();
 
@@ -56,6 +71,7 @@ namespace HeatTreatment.DigitalTwin.Backend
         [JsonProperty("pos_z")] public float PositionZ { get; set; }
         [JsonProperty("rotation_y")] public float RotationY { get; set; }
         [JsonProperty("scale")] public float Scale { get; set; } = 1f;
+        [JsonProperty("coordinate_space")] public string CoordinateSpace { get; set; } = "line_local";
         [JsonProperty("instance_config")] public JToken InstanceConfig { get; set; }
         [JsonProperty("dataPoints")] public List<DataPointDto> DataPoints { get; set; } = new List<DataPointDto>();
 

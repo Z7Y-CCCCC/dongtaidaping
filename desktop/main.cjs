@@ -37,6 +37,8 @@ let desktopControlOrigin = null;
 let desktopControlToken = null;
 let isQuitting = false;
 let quitReady = false;
+let hasShownTrayHint = false;
+let mainWindowClosePromptActive = false;
 
 function resourcePath(...parts) {
     const root = app.isPackaged ? process.resourcesPath : path.join(__dirname, 'resources');
@@ -182,6 +184,20 @@ function startDesktopControlServer() {
             return;
         }
 
+        if (request.method === 'POST' && pathname === '/minimize-to-tray') {
+            response.writeHead(202, { 'content-type': 'application/json; charset=utf-8' });
+            response.end(JSON.stringify({ success: true }));
+            setImmediate(minimizeApplicationToTray);
+            return;
+        }
+
+        if (request.method === 'POST' && pathname === '/quit') {
+            response.writeHead(202, { 'content-type': 'application/json; charset=utf-8' });
+            response.end(JSON.stringify({ success: true }));
+            setImmediate(() => app.quit());
+            return;
+        }
+
         response.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
         response.end(JSON.stringify({ success: false, error: '未找到桌面控制命令' }));
     });
@@ -303,7 +319,7 @@ function nativeAdminHostExecutable() {
     return path.join(nativeClientDirectory(), 'AdminHost', 'HeatTreatmentAdminHost.exe');
 }
 
-function showNativeAdminPanel() {
+function launchNativeAdminHost(showAdmin) {
     const executable = nativeAdminHostExecutable();
     if (!nativeProcess || nativeProcess.killed || !applicationOrigin || !fs.existsSync(executable)) {
         showAdminWindow();
@@ -317,6 +333,9 @@ function showNativeAdminPanel() {
         '--user-data', path.join(app.getPath('userData'), 'webview2')
     ];
     if (fs.existsSync(fixedRuntime)) args.push('--fixed-runtime', fixedRuntime);
+    if (desktopControlOrigin) args.push('--desktop-control-url', desktopControlOrigin);
+    if (desktopControlToken) args.push('--desktop-control-token', desktopControlToken);
+    if (!showAdmin) args.push('--dashboard-mode');
     const child = spawn(executable, args, {
         cwd: path.dirname(executable),
         windowsHide: false,
@@ -331,10 +350,18 @@ function showNativeAdminPanel() {
         stdio: 'ignore'
     });
     child.once('error', error => {
-        logDesktopError('native-admin-panel', error);
+        logDesktopError(showAdmin ? 'native-admin-panel' : 'native-dashboard-restore', error);
         showAdminWindow();
     });
     child.unref();
+}
+
+function showNativeAdminPanel() {
+    launchNativeAdminHost(true);
+}
+
+function showNativeDashboard() {
+    launchNativeAdminHost(false);
 }
 
 function closeNativeLogStreams() {
@@ -500,6 +527,8 @@ async function startBackend(port, writable) {
             SQLITE_RECOVERY_TEMPLATE: resourcePath('templates', 'factory-template.db'),
             SQLITE_UPGRADE_TEMPLATE: resourcePath('templates', 'factory-template.db'),
             DESKTOP_SHUTDOWN_TOKEN: backendShutdownToken,
+            FFMPEG_PATH: resourcePath('ffmpeg', 'ffmpeg.exe'),
+            CAST_WINDOW_TITLE: process.env.CAST_WINDOW_TITLE || 'Heat Treatment Digital Twin',
             NODE_PATH: resourcePath('backend-dependencies')
         },
         stdio: ['ignore', 'pipe', 'pipe']
@@ -597,11 +626,30 @@ function showAdminWindow() {
     }, 800).unref?.();
 }
 
+function minimizeApplicationToTray() {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide();
+    if (!tray || hasShownTrayHint) return;
+    hasShownTrayHint = true;
+    try {
+        tray.displayBalloon({
+            title: APP_NAME,
+            content: '程序仍在后台运行。双击右下角托盘图标可恢复 Unity 实时大屏。',
+            iconType: 'info'
+        });
+    } catch (error) {
+        logDesktopError('tray-hint', error);
+    }
+}
+
 function updateTrayMenu() {
     if (!tray) return;
     tray.setContextMenu(Menu.buildFromTemplate([
         {
-            label: '显示内嵌后台',
+            label: '显示 Unity 实时大屏',
+            click: showNativeDashboard
+        },
+        {
+            label: '打开后台管理',
             click: showNativeAdminPanel
         },
         {
@@ -630,7 +678,7 @@ function createTray() {
     if (tray) return;
     tray = new Tray(path.join(__dirname, 'assets', 'icon.ico'));
     tray.setToolTip(APP_NAME);
-    tray.on('double-click', showAdminWindow);
+    tray.on('double-click', showNativeDashboard);
     updateTrayMenu();
 }
 
@@ -689,10 +737,26 @@ function createMainWindow(origin, showInitially = false) {
     mainWindow.once('ready-to-show', () => {
         if (showInitially) showAdminWindow();
     });
-    mainWindow.on('close', event => {
+    mainWindow.on('close', async event => {
         if (isQuitting) return;
         event.preventDefault();
-        mainWindow.hide();
+        if (mainWindowClosePromptActive) return;
+        mainWindowClosePromptActive = true;
+        try {
+            const result = await dialog.showMessageBox(mainWindow, {
+                type: 'question',
+                title: APP_NAME,
+                message: '请选择关闭方式',
+                buttons: ['最小化到系统托盘（推荐）', '完全退出程序'],
+                defaultId: 0,
+                cancelId: 0,
+                noLink: true
+            });
+            if (result.response === 1) app.quit();
+            else minimizeApplicationToTray();
+        } finally {
+            mainWindowClosePromptActive = false;
+        }
     });
     mainWindow.on('closed', () => { mainWindow = null; });
     mainWindow.loadURL(adminUrl);

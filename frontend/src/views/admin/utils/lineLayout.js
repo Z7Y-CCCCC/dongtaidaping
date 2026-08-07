@@ -2,6 +2,7 @@
 // 依赖 common 的基础数值/JSON 解析工具。
 
 import { numberOrDefault, parseInstanceConfig } from './common.js'
+import { normalizeSpatialTransform } from '../../../utils/spatialLayout.js'
 
 export function makeLineLayoutItem(type, index = 0) {
     const isRail = type === 'rail'
@@ -19,7 +20,9 @@ export function makeLineLayoutItem(type, index = 0) {
 
 export function defaultLineLayout() {
     return {
-        version: 1,
+        version: 2,
+        coordinateSpace: 'workshop_local',
+        transform: { x: 0, y: 0, z: 0, rotationY: 0 },
         flowDirection: 'right',
         lanes: [{ ...makeLineLayoutItem('lane', 0), id: 'lane_1' }],
         rails: []
@@ -46,7 +49,14 @@ export function normalizeLineLayout(value) {
     const rails = normalizeLineLayoutItems(source.rails, 'rail')
     const flowDirection = ['right', 'left', 'none'].includes(source.flowDirection) ? source.flowDirection : 'right'
     if (!lanes.length) lanes.push(defaultLineLayout().lanes[0])
-    return { version: 1, flowDirection, lanes, rails }
+    return {
+        version: 2,
+        coordinateSpace: 'workshop_local',
+        transform: normalizeSpatialTransform(source.transform),
+        flowDirection,
+        lanes,
+        rails
+    }
 }
 
 export function serializeLineLayout(layout) {

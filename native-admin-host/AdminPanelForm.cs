@@ -1,6 +1,6 @@
 using System.Diagnostics;
-using System.Drawing.Drawing2D;
 using System.IO.Pipes;
+using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Web.WebView2.Core;
@@ -14,7 +14,11 @@ internal sealed class AdminPanelForm : Form
     private const int MinimumPanelWidth = 860;
     private const int MinimumPanelHeight = 560;
     private const int DragDetachDistance = 34;
+    private const int WindowMoveStartDistance = 5;
     private const int ParentDockStripHeight = 92;
+    private const int ResizeBorderThickness = 8;
+    private const int RoundedCornerRadius = 12;
+    private static readonly HttpClient DesktopControlClient = new() { Timeout = TimeSpan.FromSeconds(3) };
     private readonly HostOptions _options;
     private readonly WebView2 _webView = new();
     private readonly Panel _header = new();
@@ -23,7 +27,7 @@ internal sealed class AdminPanelForm : Form
     private readonly Button _maximizeButton = new();
     private readonly Button _closeButton = new();
     private readonly Panel _resizeGrip = new();
-    private readonly System.Windows.Forms.Timer _parentTimer = new() { Interval = 250 };
+    private readonly System.Windows.Forms.Timer _parentTimer = new() { Interval = 33 };
     private readonly CancellationTokenSource _pipeCancellation = new();
     private DashboardChromeForm? _dashboardChrome;
     private readonly Rectangle _defaultDetachedBounds;
@@ -36,8 +40,12 @@ internal sealed class AdminPanelForm : Form
     private bool _maximized;
     private bool _panelHidden;
     private bool _dragging;
+    private bool _draggingParentWindow;
+    private bool _parentDragStarted;
+    private bool _nativeDetachedMovePending;
     private bool _resizing;
     private bool _dockReady;
+    private bool _closeChoiceOpen;
     private Point _dragStart;
     private Point _dragPointerOffset;
     private Rectangle _dragStartBounds;
@@ -265,6 +273,7 @@ internal sealed class AdminPanelForm : Form
                 if (action == "attach" && !_attached) AttachToParent(true);
                 else if (action == "detach" && _attached) DetachFromParent();
                 else if (action == "toggle_attach") ToggleAttach();
+                else if (action == "minimize") MinimizeActiveWindow();
                 else if (action == "maximize") ToggleMaximize();
                 else if (action == "show_dashboard") ShowDashboard();
                 else if (action == "show_admin") ShowAdmin();
@@ -276,7 +285,15 @@ internal sealed class AdminPanelForm : Form
             }
             if (type == "host_drag_start")
             {
-                BeginWebDrag(ReadCoordinate(root, "screenX"), ReadCoordinate(root, "screenY"));
+                var target = root.TryGetProperty("target", out var targetElement)
+                    ? targetElement.GetString() ?? "admin"
+                    : "admin";
+                BeginWebDrag(ReadCoordinate(root, "screenX"), ReadCoordinate(root, "screenY"), target);
+                return;
+            }
+            if (type == "host_window_move_start")
+            {
+                BeginNativeParentWindowMove(ReadCoordinate(root, "screenX"), ReadCoordinate(root, "screenY"));
                 return;
             }
             if (type == "host_drag_move")
@@ -372,12 +389,28 @@ internal sealed class AdminPanelForm : Form
             Close();
             return;
         }
+        RefreshParentWindowState();
         if (!_attached)
         {
             _dashboardChrome?.UpdateParentBounds();
             return;
         }
         SetEmbeddedBounds(_adminVisible ? GetDefaultEmbeddedBounds() : GetDashboardChromeBounds());
+    }
+
+    private void RefreshParentWindowState()
+    {
+        if (_parentHandle == IntPtr.Zero || NativeMethods.IsIconic(_parentHandle)) return;
+        if (!NativeMethods.GetWindowRect(_parentHandle, out var rect)) return;
+        var current = rect.ToRectangle();
+        if (current.Width <= 0 || current.Height <= 0) return;
+        var workingArea = Screen.FromHandle(_parentHandle).WorkingArea;
+        var maximized = RectanglesNearlyEqual(current, workingArea);
+        if (!maximized) _parentRestoreBounds = current;
+        if (_parentMaximized == maximized) return;
+        _parentMaximized = maximized;
+        _dashboardChrome?.UpdateState(maximized);
+        SendHostState();
     }
 
     private Size GetParentClientSize()
@@ -516,14 +549,44 @@ internal sealed class AdminPanelForm : Form
         SendHostState();
     }
 
-    private void HandleCloseRequest()
+    private async void HandleCloseRequest()
     {
-        if (_attached)
+        if (_closeChoiceOpen) return;
+        _closeChoiceOpen = true;
+        try
         {
-            NativeMethods.PostMessage(_parentHandle, NativeMethods.WmClose, IntPtr.Zero, IntPtr.Zero);
-            return;
+            var choice = ShowCloseChoiceDialog();
+            if (choice == CloseChoice.MinimizeToTray)
+            {
+                await MinimizeToTrayAsync();
+            }
+            else if (choice == CloseChoice.ExitApplication)
+            {
+                await ExitApplicationAsync();
+            }
         }
-        ShowDashboard();
+        catch (Exception exception)
+        {
+            WriteHostError("关闭选择弹窗创建失败", exception);
+            try
+            {
+                MessageBox.Show(
+                    this,
+                    "关闭选项暂时无法显示，请重试。主程序仍在运行。",
+                    "关闭操作",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning
+                );
+            }
+            catch
+            {
+                // A UI fallback must never terminate the host process.
+            }
+        }
+        finally
+        {
+            _closeChoiceOpen = false;
+        }
     }
 
     private void ShowDetachedDashboardChrome()
@@ -550,11 +613,26 @@ internal sealed class AdminPanelForm : Form
             case "focus_admin":
                 ShowPanel();
                 break;
+            case "move_parent_native":
+                BeginNativeParentWindowMove(screenX, screenY);
+                break;
+            case "move_parent_start":
+                BeginParentWindowDrag(screenX, screenY);
+                break;
+            case "move_parent_move":
+                ContinueWindowDrag(screenX, screenY);
+                break;
+            case "move_parent_end":
+                EndWindowDrag(screenX, screenY);
+                break;
+            case "minimize":
+                MinimizeActiveWindow();
+                break;
             case "maximize":
                 ToggleParentMaximize();
                 break;
             case "close":
-                NativeMethods.PostMessage(_parentHandle, NativeMethods.WmClose, IntPtr.Zero, IntPtr.Zero);
+                HandleCloseRequest();
                 break;
         }
     }
@@ -593,7 +671,8 @@ internal sealed class AdminPanelForm : Form
         exStyle |= NativeMethods.WsExToolWindow;
         NativeMethods.SetWindowStyle(Handle, NativeMethods.GwlExStyle, exStyle);
         NativeMethods.SetParent(Handle, _parentHandle);
-        SetEmbeddedBounds(_adminVisible ? GetDefaultEmbeddedBounds() : GetDashboardChromeBounds());
+        UpdateDetachedWindowAppearance();
+        SetEmbeddedBounds(_adminVisible ? GetDefaultEmbeddedBounds() : GetDashboardChromeBounds(), force: true);
         ShowPanel(_adminVisible);
         SendHostState();
     }
@@ -610,7 +689,14 @@ internal sealed class AdminPanelForm : Form
         NativeMethods.SetParent(Handle, IntPtr.Zero);
         var style = NativeMethods.GetWindowStyle(Handle, NativeMethods.GwlStyle);
         style &= ~NativeMethods.WsChild;
-        style |= NativeMethods.WsPopup | NativeMethods.WsVisible | NativeMethods.WsClipChildren | NativeMethods.WsClipSiblings;
+        style |= NativeMethods.WsPopup
+            | NativeMethods.WsVisible
+            | NativeMethods.WsClipChildren
+            | NativeMethods.WsClipSiblings
+            | NativeMethods.WsThickFrame
+            | NativeMethods.WsMinimizeBox
+            | NativeMethods.WsMaximizeBox
+            | NativeMethods.WsSysMenu;
         NativeMethods.SetWindowStyle(Handle, NativeMethods.GwlStyle, style);
         var exStyle = NativeMethods.GetWindowStyle(Handle, NativeMethods.GwlExStyle);
         exStyle &= ~NativeMethods.WsExToolWindow;
@@ -624,6 +710,7 @@ internal sealed class AdminPanelForm : Form
                     : _defaultDetachedBounds);
         NativeMethods.SetWindowPos(Handle, NativeMethods.HwndTop, bounds.X, bounds.Y, bounds.Width, bounds.Height, NativeMethods.SwpFrameChanged | NativeMethods.SwpShowWindow);
         Bounds = bounds;
+        UpdateDetachedWindowAppearance();
         _panelHidden = false;
         NativeMethods.ShowWindow(Handle, NativeMethods.SwShow);
         if (activate)
@@ -661,13 +748,148 @@ internal sealed class AdminPanelForm : Form
             Bounds = _savedDetachedBounds.Width >= MinimumPanelWidth ? _savedDetachedBounds : _defaultDetachedBounds;
         }
         _maximizeButton.Text = _maximized ? "还原" : "最大化";
+        UpdateDetachedWindowAppearance();
         SendHostState();
     }
 
-    private void SetEmbeddedBounds(Rectangle bounds)
+    private void MinimizeActiveWindow()
     {
+        if (_attached)
+        {
+            if (TryResolveParentWindow()) NativeMethods.ShowWindow(_parentHandle, NativeMethods.SwMinimize);
+            return;
+        }
+
+        if (!_maximized) _savedDetachedBounds = Bounds;
+        NativeMethods.ShowWindow(Handle, NativeMethods.SwMinimize);
+    }
+
+    private CloseChoice ShowCloseChoiceDialog()
+    {
+        using var dialog = new CloseChoiceDialog();
+        IWin32Window owner = _attached && _parentHandle != IntPtr.Zero
+            ? new WindowHandleOwner(_parentHandle)
+            : this;
+        dialog.ShowDialog(owner);
+        return dialog.Choice;
+    }
+
+    private async Task MinimizeToTrayAsync()
+    {
+        if (!HasDesktopControl)
+        {
+            MinimizeActiveWindow();
+            return;
+        }
+
+        if (await PostDesktopControlAsync("minimize-to-tray"))
+        {
+            HideApplicationToTray();
+            return;
+        }
+
+        MessageBox.Show(
+            this,
+            "暂时无法连接桌面托盘服务，窗口将改为最小化到任务栏。",
+            "托盘服务不可用",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning
+        );
+        MinimizeActiveWindow();
+    }
+
+    private async Task ExitApplicationAsync()
+    {
+        if (HasDesktopControl)
+        {
+            if (await PostDesktopControlAsync("quit")) return;
+            MessageBox.Show(
+                this,
+                "无法连接桌面管理服务。为避免绕过退出备份，本次没有强制结束程序；请稍后重试或从右下角托盘菜单退出。",
+                "安全退出失败",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error
+            );
+            return;
+        }
+
+        if (TryResolveParentWindow())
+        {
+            NativeMethods.PostMessage(_parentHandle, NativeMethods.WmClose, IntPtr.Zero, IntPtr.Zero);
+        }
+        else
+        {
+            Close();
+        }
+    }
+
+    private bool HasDesktopControl => !string.IsNullOrWhiteSpace(_options.DesktopControlUrl)
+        && !string.IsNullOrWhiteSpace(_options.DesktopControlToken);
+
+    private static void WriteHostError(string message, Exception exception)
+    {
+        try
+        {
+            var logDirectory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "heat-treatment-digital-twin-desktop",
+                "logs"
+            );
+            Directory.CreateDirectory(logDirectory);
+            File.AppendAllText(
+                Path.Combine(logDirectory, "admin-host.log"),
+                $"[{DateTimeOffset.Now:O}] {message}: {exception}\n"
+            );
+        }
+        catch
+        {
+            // Diagnostics must not affect the UI host.
+        }
+    }
+
+    private async Task<bool> PostDesktopControlAsync(string action)
+    {
+        if (!HasDesktopControl) return false;
+        try
+        {
+            using var request = new HttpRequestMessage(
+                HttpMethod.Post,
+                $"{_options.DesktopControlUrl!.TrimEnd('/')}/{action}"
+            );
+            request.Headers.TryAddWithoutValidation("x-desktop-control-token", _options.DesktopControlToken);
+            using var response = await DesktopControlClient.SendAsync(request);
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void HideApplicationToTray()
+    {
+        _panelHidden = true;
+        HideDetachedDashboardChrome();
+        NativeMethods.ShowWindow(Handle, NativeMethods.SwHide);
+        Hide();
+        if (TryResolveParentWindow()) NativeMethods.ShowWindow(_parentHandle, NativeMethods.SwHide);
+    }
+
+    private void RestoreDashboardFromTray()
+    {
+        if (!TryResolveParentWindow()) return;
+        NativeMethods.ShowWindow(_parentHandle, NativeMethods.SwRestore);
+        NativeMethods.ShowWindow(_parentHandle, NativeMethods.SwShow);
+        ShowDashboard();
+        NativeMethods.SetForegroundWindow(_parentHandle);
+    }
+
+    private void SetEmbeddedBounds(Rectangle bounds, bool force = false)
+    {
+        var previous = _embeddedBounds;
         _embeddedBounds = bounds;
         ClampEmbeddedBounds();
+        if (!force && previous == _embeddedBounds) return;
         var flags = NativeMethods.SwpFrameChanged;
         if (!_panelHidden) flags |= NativeMethods.SwpShowWindow;
         NativeMethods.SetWindowPos(Handle, NativeMethods.HwndTop, _embeddedBounds.X, _embeddedBounds.Y, _embeddedBounds.Width, _embeddedBounds.Height, flags);
@@ -750,9 +972,9 @@ internal sealed class AdminPanelForm : Form
         EndWindowDrag(pointer.X, pointer.Y);
     }
 
-    private void BeginWebDrag(int screenX, int screenY)
+    private void BeginWebDrag(int screenX, int screenY, string target)
     {
-        BeginWindowDrag(screenX, screenY);
+        BeginWindowDrag(screenX, screenY, target);
     }
 
     private void ContinueWebDrag(int screenX, int screenY)
@@ -765,10 +987,20 @@ internal sealed class AdminPanelForm : Form
         EndWindowDrag(screenX, screenY);
     }
 
-    private void BeginWindowDrag(int screenX, int screenY)
+    private void BeginWindowDrag(int screenX, int screenY, string target = "admin")
     {
         ResolvePointerCoordinates(ref screenX, ref screenY);
-        if (!_attached && _maximized) RestoreDetachedWindowForDrag(screenX, screenY);
+        _draggingParentWindow = false;
+        if (_attached && target.Equals("dashboard", StringComparison.OrdinalIgnoreCase))
+        {
+            BeginNativeParentWindowMove(screenX, screenY);
+            return;
+        }
+        if (!_attached)
+        {
+            BeginNativeDetachedWindowMove(screenX, screenY);
+            return;
+        }
         _dragging = true;
         _dragStart = new Point(screenX, screenY);
         _dragStartBounds = _attached ? _embeddedBounds : Bounds;
@@ -790,6 +1022,37 @@ internal sealed class AdminPanelForm : Form
     {
         if (!_dragging) return;
         ResolvePointerCoordinates(ref screenX, ref screenY);
+        if (_draggingParentWindow)
+        {
+            if (!_parentDragStarted)
+            {
+                var deltaX = screenX - _dragStart.X;
+                var deltaY = screenY - _dragStart.Y;
+                if ((deltaX * deltaX) + (deltaY * deltaY) < WindowMoveStartDistance * WindowMoveStartDistance)
+                {
+                    return;
+                }
+                StartParentWindowMove(screenX, screenY);
+            }
+            var bounds = new Rectangle(
+                screenX - _dragPointerOffset.X,
+                screenY - _dragPointerOffset.Y,
+                _dragStartBounds.Width,
+                _dragStartBounds.Height
+            );
+            NativeMethods.SetWindowPos(
+                _parentHandle,
+                NativeMethods.HwndTop,
+                bounds.X,
+                bounds.Y,
+                bounds.Width,
+                bounds.Height,
+                NativeMethods.SwpFrameChanged | NativeMethods.SwpShowWindow
+            );
+            _parentRestoreBounds = bounds;
+            BeginInvoke(MaintainParentWindow);
+            return;
+        }
         if (_attached)
         {
             var deltaX = screenX - _dragStart.X;
@@ -815,6 +1078,17 @@ internal sealed class AdminPanelForm : Form
         if (!_dragging) return;
         ResolvePointerCoordinates(ref screenX, ref screenY);
         _dragging = false;
+        if (_draggingParentWindow)
+        {
+            _draggingParentWindow = false;
+            _parentDragStarted = false;
+            if (NativeMethods.GetWindowRect(_parentHandle, out var parentRect))
+            {
+                _parentRestoreBounds = parentRect.ToRectangle();
+            }
+            SendHostState();
+            return;
+        }
         if (!_attached)
         {
             _savedDetachedBounds = Bounds;
@@ -825,6 +1099,144 @@ internal sealed class AdminPanelForm : Form
             }
         }
         SetDockReady(false);
+    }
+
+    private void BeginParentWindowDrag(int screenX, int screenY)
+    {
+        if (!TryResolveParentWindow()) return;
+        if (!NativeMethods.GetWindowRect(_parentHandle, out var currentRect)) return;
+        var currentBounds = currentRect.ToRectangle();
+
+        _dragging = true;
+        _draggingParentWindow = true;
+        _parentDragStarted = false;
+        _dragStart = new Point(screenX, screenY);
+        _dragStartBounds = currentBounds;
+        _dragPointerOffset = new Point(
+            Math.Clamp(screenX - currentBounds.Left, 0, Math.Max(0, currentBounds.Width - 1)),
+            Math.Clamp(screenY - currentBounds.Top, 0, Math.Max(0, currentBounds.Height - 1))
+        );
+        SetDockReady(false);
+    }
+
+    private void BeginNativeParentWindowMove(int screenX, int screenY)
+    {
+        ResolvePointerCoordinates(ref screenX, ref screenY);
+        if (!TryResolveParentWindow()) return;
+        if (!NativeMethods.GetWindowRect(_parentHandle, out var currentRect)) return;
+        var currentBounds = currentRect.ToRectangle();
+
+        if (_parentMaximized)
+        {
+            var restore = _parentRestoreBounds.Width > 0
+                ? _parentRestoreBounds
+                : GetDefaultParentRestoreBounds(Screen.FromHandle(_parentHandle).WorkingArea);
+            var horizontalRatio = currentBounds.Width > 0
+                ? Math.Clamp((screenX - currentBounds.Left) / (double)currentBounds.Width, 0.08d, 0.92d)
+                : 0.5d;
+            var gripX = (int)Math.Round(restore.Width * horizontalRatio);
+            var gripY = Math.Clamp(screenY - currentBounds.Top, 0, HeaderHeight - 1);
+            currentBounds = new Rectangle(screenX - gripX, screenY - gripY, restore.Width, restore.Height);
+            NativeMethods.SetWindowPos(
+                _parentHandle,
+                NativeMethods.HwndTop,
+                currentBounds.X,
+                currentBounds.Y,
+                currentBounds.Width,
+                currentBounds.Height,
+                NativeMethods.SwpFrameChanged | NativeMethods.SwpShowWindow
+            );
+            _parentMaximized = false;
+        }
+
+        NativeMethods.ReleaseCapture();
+        NativeMethods.PostMessage(
+            _parentHandle,
+            NativeMethods.WmNcLButtonDown,
+            new IntPtr(NativeMethods.HtCaption),
+            NativeMethods.PackScreenPoint(screenX, screenY)
+        );
+
+        if (NativeMethods.GetWindowRect(_parentHandle, out var movedRect))
+        {
+            var moved = movedRect.ToRectangle();
+            var workingArea = Screen.FromHandle(_parentHandle).WorkingArea;
+            _parentMaximized = RectanglesNearlyEqual(moved, workingArea);
+            if (!_parentMaximized) _parentRestoreBounds = moved;
+        }
+        _dashboardChrome?.UpdateState(_parentMaximized);
+        BeginInvoke(MaintainParentWindow);
+        SendHostState();
+    }
+
+    private void BeginNativeDetachedWindowMove(int screenX, int screenY)
+    {
+        ResolvePointerCoordinates(ref screenX, ref screenY);
+        if (_attached || !IsHandleCreated || IsDisposed) return;
+        if (_maximized) RestoreDetachedWindowForDrag(screenX, screenY);
+
+        _dragging = false;
+        _draggingParentWindow = false;
+        _parentDragStarted = false;
+        SetDockReady(false);
+        NativeMethods.SetForegroundWindow(Handle);
+        NativeMethods.ReleaseCapture();
+        _nativeDetachedMovePending = true;
+        NativeMethods.PostMessage(
+            Handle,
+            NativeMethods.WmNcLButtonDown,
+            new IntPtr(NativeMethods.HtCaption),
+            NativeMethods.PackScreenPoint(screenX, screenY)
+        );
+
+        UpdateDetachedWindowAppearance();
+        SendHostState();
+    }
+
+    private void FinishNativeDetachedWindowMove()
+    {
+        if (_attached || IsDisposed) return;
+        if (NativeMethods.GetWindowRect(Handle, out var movedRect))
+        {
+            _savedDetachedBounds = movedRect.ToRectangle();
+        }
+        var pointer = Cursor.Position;
+        if (IsParentDockPoint(pointer.X, pointer.Y))
+        {
+            AttachToParent(true);
+            return;
+        }
+        UpdateDetachedWindowAppearance();
+        SendHostState();
+    }
+
+    private void StartParentWindowMove(int screenX, int screenY)
+    {
+        _parentDragStarted = true;
+        if (!_parentMaximized) return;
+
+        var currentBounds = _dragStartBounds;
+        var restore = _parentRestoreBounds.Width > 0
+            ? _parentRestoreBounds
+            : GetDefaultParentRestoreBounds(Screen.FromHandle(_parentHandle).WorkingArea);
+        var horizontalRatio = currentBounds.Width > 0
+            ? Math.Clamp((_dragStart.X - currentBounds.Left) / (double)currentBounds.Width, 0.08d, 0.92d)
+            : 0.5d;
+        var gripX = (int)Math.Round(restore.Width * horizontalRatio);
+        var gripY = Math.Clamp(_dragStart.Y - currentBounds.Top, 0, HeaderHeight - 1);
+        _dragStartBounds = new Rectangle(screenX - gripX, screenY - gripY, restore.Width, restore.Height);
+        _dragPointerOffset = new Point(gripX, gripY);
+        NativeMethods.SetWindowPos(
+            _parentHandle,
+            NativeMethods.HwndTop,
+            _dragStartBounds.X,
+            _dragStartBounds.Y,
+            _dragStartBounds.Width,
+            _dragStartBounds.Height,
+            NativeMethods.SwpFrameChanged | NativeMethods.SwpShowWindow
+        );
+        _parentMaximized = false;
+        _dashboardChrome?.UpdateState(false);
     }
 
     private void DetachForDrag(int screenX, int screenY)
@@ -849,9 +1261,8 @@ internal sealed class AdminPanelForm : Form
         var gripY = Math.Clamp(_dragPointerOffset.Y, 0, Math.Min(HeaderHeight - 1, detachedSize.Height - 1));
         var bounds = new Rectangle(screenX - gripX, screenY - gripY, detachedSize.Width, detachedSize.Height);
         DetachFromParent(bounds, false);
-        _dragStart = new Point(screenX, screenY);
-        _dragStartBounds = bounds;
-        _dragPointerOffset = new Point(gripX, gripY);
+        _dragging = false;
+        BeginNativeDetachedWindowMove(screenX, screenY);
     }
 
     private void RestoreDetachedWindowForDrag(int screenX, int screenY)
@@ -873,7 +1284,6 @@ internal sealed class AdminPanelForm : Form
 
     private static void ResolvePointerCoordinates(ref int screenX, ref int screenY)
     {
-        if (screenX != 0 || screenY != 0) return;
         if (!NativeMethods.GetCursorPos(out var pointer)) return;
         screenX = pointer.X;
         screenY = pointer.Y;
@@ -925,7 +1335,10 @@ internal sealed class AdminPanelForm : Form
                         if (command.Equals("show", StringComparison.OrdinalIgnoreCase)) ShowAdmin();
                         else if (command.Equals("detach", StringComparison.OrdinalIgnoreCase) && _attached) DetachFromParent();
                         else if (command.Equals("attach", StringComparison.OrdinalIgnoreCase) && !_attached) AttachToParent(true);
+                        else if (command.Equals("minimize", StringComparison.OrdinalIgnoreCase)) MinimizeActiveWindow();
                         else if (command.Equals("maximize", StringComparison.OrdinalIgnoreCase)) ToggleMaximize();
+                        else if (command.Equals("hide_to_tray", StringComparison.OrdinalIgnoreCase)) HideApplicationToTray();
+                        else if (command.Equals("restore_dashboard", StringComparison.OrdinalIgnoreCase)) RestoreDashboardFromTray();
                         else if (command.Equals("close", StringComparison.OrdinalIgnoreCase)) Close();
                     });
                 }
@@ -933,6 +1346,126 @@ internal sealed class AdminPanelForm : Form
             catch (OperationCanceledException) { break; }
             catch { await Task.Delay(200, cancellationToken); }
         }
+    }
+
+    protected override void WndProc(ref Message message)
+    {
+        if (message.Msg == NativeMethods.WmExitSizeMove && _nativeDetachedMovePending)
+        {
+            _nativeDetachedMovePending = false;
+            BeginInvoke(FinishNativeDetachedWindowMove);
+        }
+
+        if (message.Msg == NativeMethods.WmNcHitTest && !_attached && !_maximized && WindowState == FormWindowState.Normal)
+        {
+            var packed = message.LParam.ToInt64();
+            var screenPoint = new Point(
+                unchecked((short)(packed & 0xffff)),
+                unchecked((short)((packed >> 16) & 0xffff))
+            );
+            var clientPoint = PointToClient(screenPoint);
+            var border = Math.Max(ResizeBorderThickness, DeviceDpi * ResizeBorderThickness / 96);
+            var left = clientPoint.X >= 0 && clientPoint.X < border;
+            var right = clientPoint.X < ClientSize.Width && clientPoint.X >= ClientSize.Width - border;
+            var top = clientPoint.Y >= 0 && clientPoint.Y < border;
+            var bottom = clientPoint.Y < ClientSize.Height && clientPoint.Y >= ClientSize.Height - border;
+
+            var hit = top && left
+                ? NativeMethods.HtTopLeft
+                : top && right
+                    ? NativeMethods.HtTopRight
+                    : bottom && left
+                        ? NativeMethods.HtBottomLeft
+                        : bottom && right
+                            ? NativeMethods.HtBottomRight
+                            : left
+                                ? NativeMethods.HtLeft
+                                : right
+                                    ? NativeMethods.HtRight
+                                    : top
+                                        ? NativeMethods.HtTop
+                                        : bottom
+                                            ? NativeMethods.HtBottom
+                                            : NativeMethods.HtClient;
+            if (hit != NativeMethods.HtClient)
+            {
+                message.Result = new IntPtr(hit);
+                return;
+            }
+        }
+
+        base.WndProc(ref message);
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        BeginInvoke(UpdateDetachedWindowAppearance);
+    }
+
+    protected override void OnSizeChanged(EventArgs e)
+    {
+        base.OnSizeChanged(e);
+        if (IsHandleCreated) UpdateDetachedWindowAppearance();
+    }
+
+    private void UpdateDetachedWindowAppearance()
+    {
+        if (!IsHandleCreated || IsDisposed) return;
+        var shouldRound = !_attached && !_maximized && WindowState == FormWindowState.Normal;
+        var preference = shouldRound
+            ? NativeMethods.DwmWindowCornerRound
+            : NativeMethods.DwmWindowCornerDoNotRound;
+        try
+        {
+            NativeMethods.DwmSetWindowAttribute(
+                Handle,
+                NativeMethods.DwmWindowCornerPreference,
+                ref preference,
+                sizeof(int)
+            );
+        }
+        catch
+        {
+            // The native window region below still guarantees visible rounding.
+        }
+
+        if (!shouldRound)
+        {
+            ClearNativeWindowRegion();
+            return;
+        }
+
+        ApplyNativeRoundedWindowRegion();
+    }
+
+    private void ApplyNativeRoundedWindowRegion()
+    {
+        if (!NativeMethods.GetWindowRect(Handle, out var bounds) || bounds.Width <= 0 || bounds.Height <= 0) return;
+        var radius = Math.Max(RoundedCornerRadius, DeviceDpi * RoundedCornerRadius / 96);
+        var region = NativeMethods.CreateRoundRectRgn(
+            0,
+            0,
+            bounds.Width + 1,
+            bounds.Height + 1,
+            radius * 2,
+            radius * 2
+        );
+        if (region == IntPtr.Zero) return;
+        if (NativeMethods.SetWindowRgn(Handle, region, true) == 0)
+        {
+            NativeMethods.DeleteObject(region);
+        }
+    }
+
+    private void ClearNativeWindowRegion()
+    {
+        NativeMethods.SetWindowRgn(Handle, IntPtr.Zero, true);
+    }
+
+    private sealed class WindowHandleOwner(IntPtr handle) : IWin32Window
+    {
+        public IntPtr Handle { get; } = handle;
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)

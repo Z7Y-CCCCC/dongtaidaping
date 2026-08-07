@@ -9,6 +9,7 @@ const projects = [
     { label: 'backend', directory: path.join(projectDir, 'backend') }
 ];
 const packages = new Map();
+const ffmpegDirectory = path.join(desktopDir, 'resources', 'ffmpeg');
 
 function normalizeLicense(value) {
     if (Array.isArray(value)) return value.map(normalizeLicense).filter(Boolean).join(' OR ');
@@ -81,6 +82,22 @@ projects.forEach(({ directory }) => {
     collectDependencies(JSON.parse(output).dependencies);
 });
 
+function readFfmpegNotice() {
+    const metadataPath = path.join(ffmpegDirectory, 'FFMPEG_METADATA.json');
+    const licensePath = path.join(ffmpegDirectory, 'LICENSE.txt');
+    const sourcePath = path.join(ffmpegDirectory, 'SOURCE.txt');
+    if (![metadataPath, licensePath, sourcePath].every(filename => fs.existsSync(filename))) {
+        throw new Error('缺少 FFmpeg 许可证资源，请先运行 npm run prepare:ffmpeg');
+    }
+    return {
+        metadata: JSON.parse(fs.readFileSync(metadataPath, 'utf8')),
+        licenseText: fs.readFileSync(licensePath, 'utf8').trim().replace(/[ \t]+$/gm, ''),
+        sourceText: fs.readFileSync(sourcePath, 'utf8').trim().replace(/[ \t]+$/gm, '')
+    };
+}
+
+const ffmpeg = readFfmpegNotice();
+
 const lines = [
     'THIRD-PARTY SOFTWARE NOTICES',
     '============================',
@@ -88,6 +105,26 @@ const lines = [
     'This product includes the following installed production packages. License',
     'metadata and upstream license files are captured from the build environment.',
     'Electron and Chromium notices are distributed in their own license files.',
+    '',
+    'BUNDLED NATIVE COMPONENT',
+    '------------------------',
+    '',
+    `${ffmpeg.metadata.name} ${ffmpeg.metadata.version}`,
+    `License: ${ffmpeg.metadata.license}`,
+    `Distribution: ${ffmpeg.metadata.distribution}`,
+    `Binary release: ${ffmpeg.metadata.downloadUrl}`,
+    `Build scripts: ${ffmpeg.metadata.buildScriptsUrl}`,
+    `Corresponding source: ${ffmpeg.metadata.ffmpegSourceUrl}`,
+    `Archive SHA-256: ${ffmpeg.metadata.archiveSha256}`,
+    '',
+    ffmpeg.sourceText,
+    '',
+    '----- BEGIN FFMPEG LGPL LICENSE TEXT -----',
+    ffmpeg.licenseText,
+    '----- END FFMPEG LGPL LICENSE TEXT -----',
+    '',
+    'INSTALLED PRODUCTION PACKAGES',
+    '-----------------------------',
     '',
     ...Array.from(packages.values())
         .sort((a, b) => `${a.name}@${a.version}`.localeCompare(`${b.name}@${b.version}`))

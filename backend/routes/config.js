@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { getDb } = require('../db/database');
 const { mergeBuiltinModels } = require('../services/builtinModels');
+const { normalizeWorkshopLayout, normalizeLineLayout } = require('../utils/spatialLayout');
 
 function safeJsonParse(value, fallback) {
     if (!value) return fallback;
@@ -41,16 +42,18 @@ router.get('/', async (req, res) => {
         });
 
         const linesWithDevices = lines.map(line => {
+            const layout = normalizeLineLayout(line.layout_json || line.layout);
             const devices = allDevices
                 .filter(d => d.line_id === line.id && !isAuxiliaryDevice(d))
                 .map(d => ({
                     ...d,
                     dataPoints: pointsByDevice[d.id] || []
                 }));
-            return { ...line, devices };
+            return { ...line, layout, layout_json: JSON.stringify(layout), devices };
         });
 
         const workshopsWithLines = workshops.map(ws => {
+            const layout = normalizeWorkshopLayout(ws.layout_json || ws.layout);
             const wsLines = linesWithDevices.filter(l => l.workshop_id === ws.id);
             const wsLineIds = new Set(wsLines.map(line => line.id));
             const devices = allDevices
@@ -65,7 +68,7 @@ router.get('/', async (req, res) => {
                     ...d,
                     dataPoints: pointsByDevice[d.id] || []
                 }));
-            return { ...ws, lines: wsLines, devices };
+            return { ...ws, layout, layout_json: JSON.stringify(layout), lines: wsLines, devices };
         });
 
         const models = mergeBuiltinModels(await db.all('SELECT * FROM models'));

@@ -1,5 +1,21 @@
 const fs = require('fs');
 const path = require('path');
+const {
+    safeObject,
+    finiteNumber,
+    normalizeAngleDegrees,
+    normalizeSpatialTransform,
+    defaultWorkshopLayout,
+    normalizeWorkshopLayout,
+    normalizeLineLayout,
+    localToParentPoint,
+    parentToLocalPoint,
+    composeSpatialTransforms,
+    deviceYawToDegrees,
+    deviceYawFromDegrees,
+    effectiveDeviceLineId,
+    configuredDeviceWorkshopId
+} = require('../utils/spatialLayout');
 
 const DATA_DIR = process.env.APP_DATA_DIR
     ? path.resolve(process.env.APP_DATA_DIR)
@@ -1157,8 +1173,10 @@ async function ensureColumn(table, column, definitionSql) {
 async function ensureSchemaColumns() {
     const t = schemaTypes();
 
+    await ensureColumn('workshops', 'layout_json', `${t.json}`);
     await ensureColumn('lines', 'layout_json', `${t.json}`);
 
+    await ensureColumn('devices', 'coordinate_space', `${t.string(32)} DEFAULT 'legacy_world'`);
     await ensureColumn('devices', 'plc_enabled', `${t.bool} DEFAULT 0`);
     await ensureColumn('devices', 'plc_protocol', `${t.string(32)} DEFAULT 'S7'`);
     await ensureColumn('devices', 'plc_ip', `${t.string(128)} DEFAULT ''`);
@@ -1196,6 +1214,7 @@ async function initTables() {
         id ${t.string(64)} PRIMARY KEY,
         name ${t.string(255)} NOT NULL,
         sort_order ${t.int} DEFAULT 0,
+        layout_json ${t.json},
         created_at ${t.datetime} DEFAULT CURRENT_TIMESTAMP
     `);
     await createTable('lines', `
@@ -1219,6 +1238,7 @@ async function initTables() {
         pos_z ${t.double} DEFAULT 0,
         rotation_y ${t.double} DEFAULT 0,
         scale ${t.double} DEFAULT 1,
+        coordinate_space ${t.string(32)} DEFAULT 'line_local',
         sort_order ${t.int} DEFAULT 0,
         plc_enabled ${t.bool} DEFAULT 0,
         plc_protocol ${t.string(32)} DEFAULT 'S7',
@@ -1454,7 +1474,6 @@ async function seedDefaults() {
             sideMargin: 24,
             showHeader: true,
             showWorldLabels: true,
-            showBottomHints: true,
             overview: {
                 left: { visible: true, width: 326, height: 824, opacity: 1 },
                 right: { visible: true, width: 326, height: 824, opacity: 1, maxDevices: 20 }
@@ -1473,6 +1492,7 @@ async function seedDefaults() {
 
     await seedModelAssets(db);
     await seedFactoryDefaults(db);
+    await migrateSpatialHierarchyV2(db);
     await seedPlatformDefaults(db);
     await migrateDefaultFurnacesToNativeV5(db);
 }
@@ -1496,7 +1516,9 @@ async function seedFactoryDefaults(db) {
             name: lineNames[li],
             workshop_id: 'ws_1',
             layout_json: JSON.stringify({
-                version: 1,
+                version: 2,
+                coordinateSpace: 'workshop_local',
+                transform: { x: 0, y: 0, z: -li * 16, rotationY: 0 },
                 lanes: [{ id: 'lane_1', name: '设备线 1', type: 'device_lane', offsetZ: 0, length: 60, sort_order: 0 }],
                 rails: []
             }),
@@ -1515,9 +1537,10 @@ async function seedFactoryDefaults(db) {
                 instance_config: '{}',
                 pos_x: (di - 2) * 14,
                 pos_y: 0,
-                pos_z: -li * 16,
+                pos_z: 0,
                 rotation_y: 0,
                 scale: 1,
+                coordinate_space: 'line_local',
                 sort_order: di
             }, 'id');
         }
@@ -1642,6 +1665,252 @@ async function seedPlatformDefaults(db) {
             is_current: 1
         }, 'id');
     }
+}
+
+function roundSpatialNumber(value, digits = 6) {
+    const factor = 10 ** digits;
+    return Math.round(finiteNumber(value, 0) * factor) / factor;
+}
+
+function hasSpatialLayout(value) {
+    const source = safeObject(value);
+    return Number(source.version || 0) >= 2 && source.transform && typeof source.transform === 'object';
+}
+
+function addSpatialPoint(bounds, point) {
+    if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.z))) return bounds;
+    const x = Number(point.x);
+    const z = Number(point.z);
+    if (!bounds) return { minX: x, maxX: x, minZ: z, maxZ: z };
+    bounds.minX = Math.min(bounds.minX, x);
+    bounds.maxX = Math.max(bounds.maxX, x);
+    bounds.minZ = Math.min(bounds.minZ, z);
+    bounds.maxZ = Math.max(bounds.maxZ, z);
+    return bounds;
+}
+
+function derivedWorkshopLayout(bounds) {
+    if (!bounds) return defaultWorkshopLayout();
+    const centerX = (bounds.minX + bounds.maxX) * 0.5;
+    const centerZ = (bounds.minZ + bounds.maxZ) * 0.5;
+    const width = Math.max(100, Math.ceil(((bounds.maxX - bounds.minX) + 24) / 10) * 10);
+    const depth = Math.max(80, Math.ceil(((bounds.maxZ - bounds.minZ) + 24) / 10) * 10);
+    return normalizeWorkshopLayout({
+        version: 2,
+        transform: { x: centerX, y: 0, z: centerZ, rotationY: 0 },
+        size: { width, depth, height: 8 },
+        boundary: { enabled: true }
+    });
+}
+
+async function migrateSpatialHierarchyV2(db) {
+    const workshops = await db.all('SELECT * FROM workshops ORDER BY sort_order ASC, id ASC');
+    const lines = await db.all('SELECT * FROM `lines` ORDER BY sort_order ASC, id ASC');
+    const devices = await db.all('SELECT * FROM devices ORDER BY line_id, sort_order ASC, id ASC');
+    if (!workshops.length) return;
+
+    const firstWorkshopId = workshops[0].id;
+    const workshopById = new Map(workshops.map(workshop => [String(workshop.id), workshop]));
+    const lineById = new Map(lines.map(line => [String(line.id), line]));
+    const initialWorkshopTransforms = new Map();
+    const initialLineWorldTransforms = new Map();
+    const lineLayoutSources = new Map();
+
+    workshops.forEach((workshop) => {
+        initialWorkshopTransforms.set(
+            String(workshop.id),
+            hasSpatialLayout(workshop.layout_json)
+                ? normalizeWorkshopLayout(workshop.layout_json).transform
+                : normalizeSpatialTransform({})
+        );
+    });
+
+    lines.forEach((line, index) => {
+        const source = safeObject(line.layout_json);
+        lineLayoutSources.set(String(line.id), source);
+        const workshopTransform = initialWorkshopTransforms.get(String(line.workshop_id))
+            || normalizeSpatialTransform({});
+        const lineTransform = hasSpatialLayout(source)
+            ? normalizeLineLayout(source).transform
+            : { x: 0, y: 0, z: -index * 16, rotationY: 0 };
+        initialLineWorldTransforms.set(
+            String(line.id),
+            composeSpatialTransforms(workshopTransform, lineTransform)
+        );
+    });
+
+    const boundsByWorkshop = new Map(workshops.map(workshop => [String(workshop.id), null]));
+    lines.forEach((line) => {
+        const workshopId = String(line.workshop_id || firstWorkshopId);
+        const lineWorld = initialLineWorldTransforms.get(String(line.id)) || normalizeSpatialTransform({});
+        let bounds = boundsByWorkshop.get(workshopId) || null;
+        bounds = addSpatialPoint(bounds, lineWorld);
+        const layout = normalizeLineLayout(line.layout_json);
+        for (const item of [...layout.lanes, ...layout.rails]) {
+            const halfLength = finiteNumber(item.length, 60, 1, 10000) * 0.5;
+            bounds = addSpatialPoint(bounds, localToParentPoint({ x: -halfLength, y: 0, z: item.offsetZ }, lineWorld));
+            bounds = addSpatialPoint(bounds, localToParentPoint({ x: halfLength, y: 0, z: item.offsetZ }, lineWorld));
+        }
+        boundsByWorkshop.set(workshopId, bounds);
+    });
+
+    devices.forEach((device) => {
+        const effectiveLineId = effectiveDeviceLineId(device);
+        const line = lineById.get(effectiveLineId);
+        const workshopId = String(line?.workshop_id || configuredDeviceWorkshopId(device) || firstWorkshopId);
+        const coordinateSpace = String(device.coordinate_space || 'legacy_world');
+        const localPoint = { x: device.pos_x, y: device.pos_y, z: device.pos_z };
+        let worldPoint = localPoint;
+        if (coordinateSpace === 'line_local' && line) {
+            worldPoint = localToParentPoint(localPoint, initialLineWorldTransforms.get(effectiveLineId));
+        } else if (coordinateSpace === 'workshop_local') {
+            worldPoint = localToParentPoint(
+                localPoint,
+                initialWorkshopTransforms.get(workshopId) || normalizeSpatialTransform({})
+            );
+        }
+        boundsByWorkshop.set(workshopId, addSpatialPoint(boundsByWorkshop.get(workshopId) || null, worldPoint));
+    });
+
+    const finalWorkshopLayouts = new Map();
+    workshops.forEach((workshop) => {
+        const workshopId = String(workshop.id);
+        finalWorkshopLayouts.set(
+            workshopId,
+            hasSpatialLayout(workshop.layout_json)
+                ? normalizeWorkshopLayout(workshop.layout_json)
+                : derivedWorkshopLayout(boundsByWorkshop.get(workshopId))
+        );
+    });
+
+    const finalLineLayouts = new Map();
+    const finalLineWorldTransforms = new Map();
+    lines.forEach((line) => {
+        const lineId = String(line.id);
+        const workshopLayout = finalWorkshopLayouts.get(String(line.workshop_id)) || defaultWorkshopLayout();
+        const source = lineLayoutSources.get(lineId) || {};
+        let lineLayout;
+        if (hasSpatialLayout(source) && hasSpatialLayout(workshopById.get(String(line.workshop_id))?.layout_json)) {
+            lineLayout = normalizeLineLayout(source);
+        } else {
+            const initialWorld = initialLineWorldTransforms.get(lineId) || normalizeSpatialTransform({});
+            const localPosition = parentToLocalPoint(initialWorld, workshopLayout.transform);
+            lineLayout = normalizeLineLayout(source, {
+                x: localPosition.x,
+                y: localPosition.y,
+                z: localPosition.z,
+                rotationY: normalizeAngleDegrees(initialWorld.rotationY - workshopLayout.transform.rotationY)
+            });
+        }
+        finalLineLayouts.set(lineId, lineLayout);
+        finalLineWorldTransforms.set(
+            lineId,
+            composeSpatialTransforms(workshopLayout.transform, lineLayout.transform)
+        );
+    });
+
+    const environmentRow = await db.get('SELECT value FROM settings WHERE `key` = ?', ['native_environment_config']);
+    const environment = safeObject(environmentRow?.value);
+    const normalizedWalls = (Array.isArray(environment.walls) ? environment.walls : []).map((rawWall, index) => {
+        const wall = rawWall && typeof rawWall === 'object' ? { ...rawWall } : {};
+        const existingWorkshopId = String(wall.workshopId || wall.workshop_id || '').trim();
+        let workshopId = workshopById.has(existingWorkshopId) ? existingWorkshopId : '';
+        let worldPoint = { x: wall.x, y: wall.baseY, z: wall.z };
+        let worldRotation = finiteNumber(wall.rotationY, 0, -100000, 100000);
+
+        if (workshopId && wall.coordinateSpace === 'workshop_local') {
+            const layout = finalWorkshopLayouts.get(workshopId) || defaultWorkshopLayout();
+            worldPoint = localToParentPoint(worldPoint, layout.transform);
+            worldRotation += layout.transform.rotationY;
+        }
+
+        if (!workshopId) {
+            const candidates = workshops.map((workshop) => {
+                const layout = finalWorkshopLayouts.get(String(workshop.id)) || defaultWorkshopLayout();
+                const local = parentToLocalPoint(worldPoint, layout.transform);
+                const inside = Math.abs(local.x) <= layout.size.width * 0.5
+                    && Math.abs(local.z) <= layout.size.depth * 0.5;
+                return {
+                    id: String(workshop.id),
+                    layout,
+                    local,
+                    inside,
+                    score: inside
+                        ? layout.size.width * layout.size.depth
+                        : Math.hypot(local.x, local.z) + 1000000
+                };
+            }).sort((a, b) => a.score - b.score);
+            workshopId = candidates[0]?.id || firstWorkshopId;
+        }
+
+        const workshopLayout = finalWorkshopLayouts.get(workshopId) || defaultWorkshopLayout();
+        const localPoint = parentToLocalPoint(worldPoint, workshopLayout.transform);
+        return {
+            ...wall,
+            id: String(wall.id || `wall_${index + 1}`),
+            workshopId,
+            coordinateSpace: 'workshop_local',
+            x: roundSpatialNumber(localPoint.x),
+            baseY: roundSpatialNumber(localPoint.y),
+            z: roundSpatialNumber(localPoint.z),
+            rotationY: normalizeAngleDegrees(worldRotation - workshopLayout.transform.rotationY)
+        };
+    });
+
+    await db.transaction(async (tx) => {
+        for (const workshop of workshops) {
+            const layout = finalWorkshopLayouts.get(String(workshop.id)) || defaultWorkshopLayout();
+            await tx.run('UPDATE workshops SET layout_json = ? WHERE id = ?', [JSON.stringify(layout), workshop.id]);
+        }
+        for (const line of lines) {
+            const layout = finalLineLayouts.get(String(line.id)) || normalizeLineLayout(line.layout_json);
+            await tx.run('UPDATE `lines` SET layout_json = ? WHERE id = ?', [JSON.stringify(layout), line.id]);
+        }
+        for (const device of devices) {
+            const inferredLineId = effectiveDeviceLineId(device);
+            const line = lineById.get(inferredLineId);
+            const workshopId = String(line?.workshop_id || configuredDeviceWorkshopId(device) || firstWorkshopId);
+            const initialWorkshopTransform = initialWorkshopTransforms.get(workshopId) || normalizeSpatialTransform({});
+            const finalWorkshopLayout = finalWorkshopLayouts.get(workshopId) || defaultWorkshopLayout();
+            const currentCoordinateSpace = String(device.coordinate_space || 'legacy_world');
+            const currentPoint = { x: device.pos_x, y: device.pos_y, z: device.pos_z };
+            let worldPoint = currentPoint;
+            let worldYaw = deviceYawToDegrees(device.rotation_y);
+
+            if (currentCoordinateSpace === 'line_local' && line) {
+                const parent = initialLineWorldTransforms.get(inferredLineId) || normalizeSpatialTransform({});
+                worldPoint = localToParentPoint(currentPoint, parent);
+                worldYaw += parent.rotationY;
+            } else if (currentCoordinateSpace === 'workshop_local') {
+                worldPoint = localToParentPoint(currentPoint, initialWorkshopTransform);
+                worldYaw += initialWorkshopTransform.rotationY;
+            }
+
+            const parentTransform = line
+                ? (finalLineWorldTransforms.get(inferredLineId) || finalWorkshopLayout.transform)
+                : finalWorkshopLayout.transform;
+            const localPoint = parentToLocalPoint(worldPoint, parentTransform);
+            const coordinateSpace = line ? 'line_local' : 'workshop_local';
+            const instanceConfig = safeObject(device.instance_config);
+            if (!line && !configuredDeviceWorkshopId(device)) instanceConfig.workshop_id = workshopId;
+
+            await tx.run(`UPDATE devices SET line_id = ?, pos_x = ?, pos_y = ?, pos_z = ?,
+                rotation_y = ?, coordinate_space = ?, instance_config = ? WHERE id = ?`, [
+                line ? inferredLineId : (device.line_id || null),
+                roundSpatialNumber(localPoint.x),
+                roundSpatialNumber(localPoint.y),
+                roundSpatialNumber(localPoint.z),
+                roundSpatialNumber(deviceYawFromDegrees(worldYaw - parentTransform.rotationY, device.rotation_y)),
+                coordinateSpace,
+                JSON.stringify(instanceConfig),
+                device.id
+            ]);
+        }
+        await tx.run('UPDATE settings SET value = ? WHERE `key` = ?', [
+            JSON.stringify({ ...environment, version: 3, walls: normalizedWalls }),
+            'native_environment_config'
+        ]);
+    });
 }
 
 async function migrateDefaultFurnacesToNativeV5(db) {

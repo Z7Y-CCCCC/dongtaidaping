@@ -192,6 +192,11 @@ async function main() {
         await putSettings({ [RECOVERY_KEY]: 'unbacked-value-before-corruption' });
         await forceStop(backend);
         backend = null;
+        // A valid WAL can replay page 1 and repair a damaged main database header.
+        // Remove the closed database sidecars first so this branch tests the actual
+        // backup-recovery path instead of SQLite's normal WAL crash recovery path.
+        fs.rmSync(`${databaseFile}-wal`, { force: true });
+        fs.rmSync(`${databaseFile}-shm`, { force: true });
         const corruptHandle = fs.openSync(databaseFile, 'r+');
         try {
             fs.writeSync(corruptHandle, Buffer.alloc(4096, 0x58), 0, 4096, 0);

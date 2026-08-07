@@ -39,10 +39,12 @@ import {
 } from './admin/utils/lineLayout.js'
 import { useAppDialog } from './admin/composables/useAppDialog.js'
 import { useSystemSettings } from './admin/composables/useSystemSettings.js'
+import { useCastDevices } from './admin/composables/useCastDevices.js'
 import { usePointMonitor } from './admin/composables/usePointMonitor.js'
 import { useDataPoints } from './admin/composables/useDataPoints.js'
 import { formatPointValue, formatQualityLabel, formatPointTime } from './admin/utils/points.js'
 import NativeEnvironmentSettings from './admin/components/NativeEnvironmentSettings.vue'
+import { normalizeWorkshopLayout } from '../utils/spatialLayout.js'
 
 defineOptions({ name: 'AdminPanel' })
 
@@ -50,6 +52,10 @@ const ADMIN_UI_STATE_KEY = 'digital_twin_admin_ui_state_v1'
 const isUnityEmbedded = new URLSearchParams(window.location.search).get('embedded') === 'unity'
 const unityHostState = reactive({ attached: true, maximized: false, dockReady: false, adminVisible: true })
 let unityHostDragActive = false
+let unityHostDragTarget = 'admin'
+let unityHostDragStartX = 0
+let unityHostDragStartY = 0
+const UNITY_NATIVE_MOVE_THRESHOLD = 5
 
 function postUnityHostMessage(message) {
     window.chrome?.webview?.postMessage(message)
@@ -67,21 +73,55 @@ function requestUnityHostAction(action) {
     postUnityHostMessage({ type: 'host_action', action })
 }
 
-function beginUnityHostDrag(event) {
+function beginUnityHostDrag(event, target = 'admin') {
     if (event.button !== 0) return
+    if (!unityHostState.attached) {
+        postUnityHostMessage({
+            type: 'host_drag_start',
+            target: 'admin',
+            screenX: Math.round(event.screenX),
+            screenY: Math.round(event.screenY)
+        })
+        return
+    }
     unityHostDragActive = true
+    unityHostDragTarget = target
+    unityHostDragStartX = event.screenX
+    unityHostDragStartY = event.screenY
     event.currentTarget?.setPointerCapture?.(event.pointerId)
-    postUnityHostMessage({ type: 'host_drag_start', screenX: Math.round(event.screenX), screenY: Math.round(event.screenY) })
+    if (target === 'dashboard') return
+    postUnityHostMessage({
+        type: 'host_drag_start',
+        target,
+        screenX: Math.round(event.screenX),
+        screenY: Math.round(event.screenY)
+    })
 }
 
 function continueUnityHostDrag(event) {
     if (!unityHostDragActive) return
+    if (unityHostDragTarget === 'dashboard') {
+        const deltaX = event.screenX - unityHostDragStartX
+        const deltaY = event.screenY - unityHostDragStartY
+        if ((deltaX * deltaX) + (deltaY * deltaY) < UNITY_NATIVE_MOVE_THRESHOLD * UNITY_NATIVE_MOVE_THRESHOLD) return
+        unityHostDragActive = false
+        event.currentTarget?.releasePointerCapture?.(event.pointerId)
+        postUnityHostMessage({
+            type: 'host_window_move_start',
+            screenX: Math.round(event.screenX),
+            screenY: Math.round(event.screenY)
+        })
+        return
+    }
     postUnityHostMessage({ type: 'host_drag_move', screenX: Math.round(event.screenX), screenY: Math.round(event.screenY) })
 }
 
 function endUnityHostDrag(event) {
     if (!unityHostDragActive) return
+    const target = unityHostDragTarget
     unityHostDragActive = false
+    unityHostDragTarget = 'admin'
+    if (target === 'dashboard') return
     postUnityHostMessage({
         type: 'host_drag_end',
         screenX: Math.round(event?.screenX || 0),
@@ -110,9 +150,7 @@ function showUnityDashboard() {
 }
 
 function showUnityAdmin() {
-    if (unityHostState.attached && !unityHostState.adminVisible) {
-        requestUnityHostAction('show_admin')
-    }
+    requestUnityHostAction('show_admin')
 }
 
 function loadAdminUiState() {
@@ -224,6 +262,23 @@ const {
     scheduleComposerPreview: (...args) => scheduleComposerPreview(...args)
 })
 
+const {
+    castState,
+    castBusyDeviceId,
+    castMessage,
+    castingDeviceId,
+    castingDeviceName,
+    deviceLabel: castDeviceLabel,
+    deviceSubtitle: castDeviceSubtitle,
+    sessionStateLabel: castSessionStateLabel,
+    loadCastDevices,
+    refreshCastDevices,
+    startCast,
+    stopCast,
+    startCastRefresh,
+    stopCastRefresh
+} = useCastDevices({ alert, confirm })
+
 function getDbStatusBadgeClass(statusText) {
     if (!statusText) return ''
     if (statusText.includes('成功')) return 'status-success'
@@ -235,14 +290,52 @@ function getDbStatusBadgeClass(statusText) {
 // ============ 车间管理 ============
 const workshops = ref([])
 const newWorkshop = reactive({ id: '', name: '' })
+const selectedWorkshopEditorId = ref('')
+const workshopSavingId = ref('')
+
+function normalizeWorkshopRecord(workshop) {
+    const layout = normalizeWorkshopLayout(workshop?.layout || workshop?.layout_json)
+    return { ...workshop, layout, layout_json: JSON.stringify(layout) }
+}
+
+function getWorkshopLayout(workshop) {
+    if (!workshop) return normalizeWorkshopLayout(null)
+    if (!workshop.layout || typeof workshop.layout !== 'object') {
+        workshop.layout = normalizeWorkshopLayout(workshop.layout_json)
+    }
+    return workshop.layout
+}
+
+const selectedWorkshopEditor = computed(() => (
+    workshops.value.find(workshop => workshop.id === selectedWorkshopEditorId.value)
+    || workshops.value[0]
+    || null
+))
 
 async function loadWorkshops() {
-    workshops.value = await adminApi.getWorkshops()
+    workshops.value = (await adminApi.getWorkshops()).map(normalizeWorkshopRecord)
+    if (!workshops.value.some(workshop => workshop.id === selectedWorkshopEditorId.value)) {
+        selectedWorkshopEditorId.value = workshops.value[0]?.id || ''
+    }
 }
 
 async function createWorkshop() {
     if (!newWorkshop.id || !newWorkshop.name) return alert('请填写车间ID和名称')
-    const result = await adminApi.createWorkshop({ id: newWorkshop.id, name: newWorkshop.name, sort_order: workshops.value.length })
+    const layout = normalizeWorkshopLayout(null)
+    const previousWorkshop = sortByOrder(workshops.value)[workshops.value.length - 1]
+    if (previousWorkshop) {
+        const previousLayout = getWorkshopLayout(previousWorkshop)
+        layout.transform.x = numberOrDefault(previousLayout.transform.x, 0)
+            + numberOrDefault(previousLayout.size.width, 100) * 0.5
+            + layout.size.width * 0.5
+            + 20
+    }
+    const result = await adminApi.createWorkshop({
+        id: newWorkshop.id,
+        name: newWorkshop.name,
+        sort_order: workshops.value.length,
+        layout
+    })
     if (result?.error) return alert(result.error, { title: '新增车间失败', type: 'danger' })
     if (!result?.success) return alert('新增车间失败：后端没有返回成功状态', { title: '新增车间失败', type: 'danger' })
     const createdName = newWorkshop.name
@@ -261,6 +354,32 @@ async function deleteWorkshop(id) {
     await loadLines()
     await loadDevices()
     await alert(`车间「${id}」已删除`, { title: '删除成功', type: 'success' })
+}
+
+function previewWorkshopSpatialLayout() {
+    scheduleNativeScenePreview({ source: 'spatial', includeLayout: true })
+}
+
+async function saveWorkshopSpatialLayout(workshop = selectedWorkshopEditor.value) {
+    if (!workshop) return
+    workshopSavingId.value = workshop.id
+    try {
+        const layout = normalizeWorkshopLayout(getWorkshopLayout(workshop))
+        workshop.layout = layout
+        workshop.layout_json = JSON.stringify(layout)
+        const result = await adminApi.updateWorkshop(workshop.id, {
+            name: workshop.name,
+            sort_order: workshop.sort_order,
+            layout,
+            layout_json: workshop.layout_json
+        })
+        if (result?.error) return alert(result.error, { title: '保存车间空间失败', type: 'danger' })
+        await loadWorkshops()
+        await reloadSavedNativeScenePreview('spatial')
+        await alert(`车间「${workshop.name}」的世界位置和边界已保存`, { title: '保存成功', type: 'success' })
+    } finally {
+        workshopSavingId.value = ''
+    }
 }
 
 // ============ 产线管理 ============
@@ -330,6 +449,7 @@ function nativePreviewDevicePayload(device, override = null) {
         pos_z: numberOrDefault(source.pos_z, 0),
         rotation_y: numberOrDefault(source.rotation_y, 0),
         scale: Math.max(0.0001, numberOrDefault(source.scale, 1)),
+        coordinate_space: source.coordinate_space || (source.line_id ? 'line_local' : 'workshop_local'),
         instance_config: parseInstanceConfig(source.instance_config)
     }
 }
@@ -340,6 +460,14 @@ function buildNativePreviewFocus(source = activeTab.value) {
             mode: 'line',
             workshopId: selectedLineEditor.value?.workshop_id || '',
             lineId: selectedLineEditor.value?.id || '',
+            deviceId: ''
+        }
+    }
+    if (source === 'spatial') {
+        return {
+            mode: 'workshop',
+            workshopId: selectedWorkshopEditor.value?.id || '',
+            lineId: '',
             deviceId: ''
         }
     }
@@ -360,7 +488,15 @@ function buildNativePreviewDevices(source, override = null) {
 function buildNativePreviewLines() {
     return lines.value.map(line => ({
         id: line.id,
+        workshop_id: line.workshop_id,
         layout: normalizeLineLayout(getLineLayout(line))
+    }))
+}
+
+function buildNativePreviewWorkshops() {
+    return workshops.value.map(workshop => ({
+        id: workshop.id,
+        layout: normalizeWorkshopLayout(getWorkshopLayout(workshop))
     }))
 }
 
@@ -415,7 +551,7 @@ async function sendNativeScenePreview(payload, { quiet = false } = {}) {
 }
 
 function scheduleNativeScenePreview({ source = activeTab.value, includeLayout = false, deviceOverride } = {}) {
-    if (source !== 'composer' && source !== 'lines') return
+    if (!['composer', 'lines', 'spatial'].includes(source)) return
     nativeScenePreviewPending = {
         source,
         includeLayout: includeLayout || nativeScenePreviewPending?.includeLayout || false,
@@ -435,6 +571,7 @@ function scheduleNativeScenePreview({ source = activeTab.value, includeLayout = 
             includeLayout: pending.includeLayout,
             devices: buildNativePreviewDevices(pending.source, pending.deviceOverride),
             lines: pending.includeLayout ? buildNativePreviewLines() : [],
+            workshops: pending.includeLayout ? buildNativePreviewWorkshops() : [],
             focus: buildNativePreviewFocus(pending.source)
         }, { quiet: true })
     }, 90)
@@ -490,11 +627,17 @@ async function loadLines() {
 
 async function createLine() {
     if (!newLine.id || !newLine.name || !newLine.workshop_id) return alert('请填写产线ID、名称和所属车间')
+    const layout = defaultLineLayout()
+    const siblingLines = sortByOrder(lines.value.filter(line => line.workshop_id === newLine.workshop_id))
+    const lastSibling = siblingLines[siblingLines.length - 1]
+    layout.transform.z = lastSibling
+        ? numberOrDefault(getLineLayout(lastSibling).transform.z, 0) - 16
+        : 0
     const result = await adminApi.createLine({
         id: newLine.id,
         name: newLine.name,
         workshop_id: newLine.workshop_id,
-        layout_json: serializeLineLayout(defaultLineLayout()),
+        layout_json: serializeLineLayout(layout),
         sort_order: lines.value.length
     })
     if (result?.error) return alert(result.error, { title: '新增产线失败', type: 'danger' })
@@ -621,7 +764,7 @@ function defaultPlcConnectionConfig() {
 }
 const editingDevice = reactive({
     id: '', name: '', line_id: '', model_type: 'builtin_furnace', model_file: '', template_id: '', instance_config: '{}',
-    pos_x: 0, pos_y: 0, pos_z: 0, rotation_y: 0, scale: 1.0, sort_order: 0,
+    pos_x: 0, pos_y: 0, pos_z: 0, rotation_y: 0, scale: 1.0, coordinate_space: 'line_local', sort_order: 0,
     ...defaultPlcConnectionConfig()
 })
 const isEditMode = ref(false)
@@ -636,7 +779,7 @@ function openCreateDevice() {
     Object.assign(editingDevice, { 
         id: '', name: '', line_id: lines.value[0]?.id || '', 
         model_type: 'builtin_furnace', model_file: '', template_id: '', instance_config: '{}',
-        pos_x: 0, pos_y: 0, pos_z: 0, rotation_y: 0, scale: 1.0, sort_order: devices.value.length,
+        pos_x: 0, pos_y: 0, pos_z: 0, rotation_y: 0, scale: 1.0, coordinate_space: 'line_local', sort_order: devices.value.length,
         ...defaultPlcConnectionConfig()
     })
     showDeviceForm.value = true
@@ -3117,6 +3260,7 @@ const composerDraft = reactive({
     pos_z: 0,
     rotation_y: 0,
     scale: 1,
+    coordinate_space: 'line_local',
     sort_order: 0
 })
 
@@ -3182,6 +3326,7 @@ function buildDevicePayloadForSave(device, workshopId) {
         if (config.role === 'auxiliary' || config.role === 'transfer_cart') delete config.role
     }
 
+    payload.coordinate_space = payload.line_id ? 'line_local' : 'workshop_local'
     payload.instance_config = JSON.stringify(config, null, 2)
     return payload
 }
@@ -3195,6 +3340,7 @@ function normalizeDeviceConfig(device) {
         pos_z: numberOrDefault(device.pos_z, 0),
         rotation_y: numberOrDefault(device.rotation_y, 0),
         scale: numberOrDefault(device.scale, 1),
+        coordinate_space: device.coordinate_space || (device.line_id ? 'line_local' : 'workshop_local'),
         sort_order: numberOrDefault(device.sort_order, 0),
         instance_config: stringifyInstanceConfigForEdit(device.instance_config, defaultInstanceConfig)
     }
@@ -3280,6 +3426,7 @@ function syncComposerDraftFromSelection() {
             pos_z: 0,
             rotation_y: 0,
             scale: 1,
+            coordinate_space: 'line_local',
             sort_order: 0
         })
         return
@@ -3768,6 +3915,8 @@ onMounted(async () => {
     await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform()])
     ensureNativeDashboardDeviceSelection()
     startRuntimeRefresh()
+    loadCastDevices({ silent: true })
+    startCastRefresh()
     if (!newLine.workshop_id && workshops.value.length > 0) {
         newLine.workshop_id = workshops.value[0].id
     }
@@ -3818,6 +3967,7 @@ onUnmounted(() => {
     nativeScenePreviewTimer = null
     nativeScenePreviewStatusTimer = null
     stopRuntimeRefresh()
+    stopCastRefresh()
     finishLinePreviewDrag()
     cancelLineDeviceDrag()
     cancelLineDevicePoolMove()
@@ -4111,6 +4261,8 @@ async function saveSelectedLineLayout() {
 }
 
 function getLineBaseZ(lineId) {
+    const line = lines.value.find(item => item.id === lineId)
+    if (Number(getLineLayout(line)?.version || 0) >= 2) return 0
     const lineIndex = sortByOrder(lines.value).findIndex(line => line.id === lineId)
     return lineIndex >= 0 ? -lineIndex * 16 : 0
 }
@@ -4191,6 +4343,7 @@ function buildDeviceLayoutBindingPatch(device, type, item, line) {
 
     return {
         line_id: line.id,
+        coordinate_space: 'line_local',
         pos_x: nextX,
         pos_z: nextZ,
         instance_config: JSON.stringify(config, null, 2)
@@ -4637,6 +4790,7 @@ async function placeLineDeviceOnTarget(drag) {
 
     const patch = {
         line_id: line.id,
+        coordinate_space: 'line_local',
         pos_x: nextX,
         pos_z: nextZ,
         instance_config: JSON.stringify(config, null, 2)
@@ -4829,15 +4983,30 @@ const mainTabs = [
 
 <template>
     <div class="admin-container" :class="{ 'unity-embedded': isUnityEmbedded, 'unity-dashboard-tab': isUnityEmbedded && unityHostState.attached && !unityHostState.adminVisible, 'nav-collapsed': isAdminNavCollapsed, 'composer-active': activeTab === 'composer', 'line-planner-active': activeTab === 'lines' }">
-        <div v-if="isUnityEmbedded" class="unity-window-chrome" :class="{ 'is-dock-ready': unityHostState.dockReady }">
-            <div class="unity-tab-strip">
+        <div
+            v-if="isUnityEmbedded"
+            class="unity-window-chrome"
+            :class="{ 'is-dock-ready': unityHostState.dockReady }"
+            @pointerdown="beginUnityHostDrag($event, 'dashboard')"
+            @pointermove="continueUnityHostDrag"
+            @pointerup="endUnityHostDrag"
+            @pointercancel="endUnityHostDrag"
+            @lostpointercapture="endUnityHostDrag"
+        >
+            <div
+                class="unity-tab-strip"
+            >
                 <button
                     v-if="unityHostState.attached"
                     type="button"
                     class="unity-browser-tab unity-screen-tab"
                     :class="{ 'is-active': !unityHostState.adminVisible }"
-                    title="显示正在运行的 Unity 大屏"
-                    @pointerdown.stop
+                    title="实时大屏"
+                    @pointerdown.stop="beginUnityHostDrag($event, 'dashboard')"
+                    @pointermove.stop="continueUnityHostDrag"
+                    @pointerup.stop="endUnityHostDrag"
+                    @pointercancel.stop="endUnityHostDrag"
+                    @lostpointercapture.stop="endUnityHostDrag"
                     @click="showUnityDashboard"
                 >
                     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -4852,13 +5021,12 @@ const mainTabs = [
                     :class="{ 'is-active': !unityHostState.attached || unityHostState.adminVisible }"
                     role="tab"
                     aria-selected="true"
-                    title="拖动页签可移出窗口；拖回 Unity 顶部后松开可重新嵌入"
-                    @pointerdown="beginUnityHostDrag"
-                    @pointermove="continueUnityHostDrag"
-                    @pointerup="endUnityHostDrag"
-                    @pointercancel="endUnityHostDrag"
-                    @lostpointercapture="endUnityHostDrag"
-                    @dblclick="requestUnityHostAction('maximize')"
+                    title="后台管理"
+                    @pointerdown.stop="beginUnityHostDrag($event, 'admin')"
+                    @pointermove.stop="continueUnityHostDrag"
+                    @pointerup.stop="endUnityHostDrag"
+                    @pointercancel.stop="endUnityHostDrag"
+                    @lostpointercapture.stop="endUnityHostDrag"
                     @click="showUnityAdmin"
                 >
                     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -4871,18 +5039,20 @@ const mainTabs = [
                     <i class="unity-tab-online" aria-hidden="true"></i>
                 </div>
 
-                <span class="unity-tab-drag-hint">
-                    {{ unityHostState.attached
-                        ? unityHostState.adminVisible
-                            ? '拖动“后台管理”页签可移出'
-                            : '点击后台管理进入配置，或拖出为独立窗口'
-                        : unityHostState.dockReady
-                            ? '松开即可嵌入 Unity'
-                            : '拖到 Unity 窗口顶部后松开即可嵌入' }}
-                </span>
             </div>
 
             <div class="unity-window-actions" @pointerdown.stop>
+                <button
+                    type="button"
+                    class="unity-window-action"
+                    title="最小化"
+                    aria-label="最小化窗口"
+                    @click="requestUnityHostAction('minimize')"
+                >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M5 16.5h14" />
+                    </svg>
+                </button>
                 <button
                     type="button"
                     class="unity-window-action"
@@ -4901,8 +5071,8 @@ const mainTabs = [
                 <button
                     type="button"
                     class="unity-window-action is-close"
-                    title="关闭后台管理"
-                    aria-label="关闭后台管理"
+                    title="关闭软件"
+                    aria-label="关闭软件"
                     @click="closeAdminPanel"
                 >
                     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -5244,7 +5414,12 @@ const mainTabs = [
                 <!-- ======== 车间管理 ======== -->
                 <div v-if="activeTab === 'workshops'" class="tab-content">
                     <h2>车间管理</h2>
-                    <p class="desc">管理工厂的车间划分。每个车间可包含多条产线。</p>
+                    <p class="desc">车间是工厂世界中的一级空间容器。移动或旋转车间时，所属产线、设备、地面与围墙会作为整体跟随。</p>
+
+                    <div class="spatial-rule-banner">
+                        <strong>统一空间层级</strong>
+                        <span>工厂世界 → 车间（世界位置/边界）→ 产线（车间局部位置）→ 设备（产线局部位置）；围墙直接使用车间局部坐标。</span>
+                    </div>
 
                     <div class="form-row">
                         <input v-model="newWorkshop.id" placeholder="车间ID（如 ws_a）" class="input" />
@@ -5254,19 +5429,48 @@ const mainTabs = [
 
                     <table class="data-table">
                         <thead>
-                            <tr><th>ID</th><th>名称</th><th>产线数量</th><th>操作</th></tr>
+                            <tr><th>ID</th><th>名称</th><th>世界位置</th><th>车间边界</th><th>产线数量</th><th>操作</th></tr>
                         </thead>
                         <tbody>
-                            <tr v-for="ws in workshops" :key="ws.id">
+                            <tr v-for="ws in workshops" :key="ws.id" :class="{ 'row-selected': selectedWorkshopEditor?.id === ws.id }">
                                 <td><code>{{ ws.id }}</code></td>
                                 <td>{{ ws.name }}</td>
+                                <td>X {{ getWorkshopLayout(ws).transform.x }} / Z {{ getWorkshopLayout(ws).transform.z }} / {{ getWorkshopLayout(ws).transform.rotationY }}°</td>
+                                <td>{{ getWorkshopLayout(ws).size.width }} × {{ getWorkshopLayout(ws).size.depth }} 米</td>
                                 <td>{{ (linesByWorkshop[ws.id] || []).length }} 条</td>
                                 <td>
+                                    <button type="button" class="btn btn-sm" @click="selectedWorkshopEditorId = ws.id">空间设置</button>
                                     <button @click="deleteWorkshop(ws.id)" class="btn btn-danger btn-sm">删除</button>
                                 </td>
                             </tr>
                         </tbody>
                     </table>
+
+                    <section v-if="selectedWorkshopEditor" class="workshop-spatial-editor">
+                        <div class="workshop-spatial-heading">
+                            <div>
+                                <h3>{{ selectedWorkshopEditor.name }} · 空间定义</h3>
+                                <p>世界位置决定整个车间放在工厂中的位置；边界决定车间地面、围墙编辑范围及工程师可用空间。</p>
+                            </div>
+                            <div class="line-native-actions">
+                                <span class="native-live-status" :class="nativeScenePreviewStatusClass">{{ nativeScenePreviewStatus }}</span>
+                                <button type="button" class="btn" @click="restoreSavedNativeScenePreview">撤销未保存预览</button>
+                                <button type="button" class="btn btn-primary" :disabled="workshopSavingId === selectedWorkshopEditor.id" @click="saveWorkshopSpatialLayout()">
+                                    {{ workshopSavingId === selectedWorkshopEditor.id ? '保存中...' : '保存车间空间' }}
+                                </button>
+                            </div>
+                        </div>
+                        <div class="workshop-spatial-grid" @input="previewWorkshopSpatialLayout" @change="previewWorkshopSpatialLayout">
+                            <label>车间世界 X（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).transform.x" type="number" step="0.5" class="input" /></label>
+                            <label>车间世界 Y（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).transform.y" type="number" step="0.1" class="input" /></label>
+                            <label>车间世界 Z（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).transform.z" type="number" step="0.5" class="input" /></label>
+                            <label>车间朝向（°）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).transform.rotationY" type="number" min="-180" max="180" step="1" class="input" /></label>
+                            <label>车间宽度 X（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).size.width" type="number" min="10" max="5000" step="1" class="input" /></label>
+                            <label>车间深度 Z（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).size.depth" type="number" min="10" max="5000" step="1" class="input" /></label>
+                            <label>参考高度（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).size.height" type="number" min="1" max="200" step="0.5" class="input" /></label>
+                            <label class="workshop-boundary-toggle"><input v-model="getWorkshopLayout(selectedWorkshopEditor).boundary.enabled" type="checkbox" /> 启用车间地面与边界</label>
+                        </div>
+                    </section>
                 </div>
 
                 <!-- ======== 产线管理 ======== -->
@@ -5339,6 +5543,18 @@ const mainTabs = [
                                 </div>
 
                                 <div v-if="selectedLineEditor" class="line-structure-editor">
+                                    <div class="line-structure-section">
+                                        <div class="line-structure-title">
+                                            <strong>产线在车间中的位置</strong>
+                                            <span class="line-flow-hint">这些值是相对所属车间的局部坐标；车间移动时无需逐台修改设备。</span>
+                                        </div>
+                                        <div class="line-transform-grid">
+                                            <label>相对车间 X<input v-model.number="selectedLineLayout.transform.x" type="number" step="0.5" class="input input-sm" /></label>
+                                            <label>相对车间 Y<input v-model.number="selectedLineLayout.transform.y" type="number" step="0.1" class="input input-sm" /></label>
+                                            <label>相对车间 Z<input v-model.number="selectedLineLayout.transform.z" type="number" step="0.5" class="input input-sm" /></label>
+                                            <label>相对车间朝向（°）<input v-model.number="selectedLineLayout.transform.rotationY" type="number" min="-180" max="180" step="1" class="input input-sm" /></label>
+                                        </div>
+                                    </div>
                                     <div class="line-structure-section">
                                         <div class="line-structure-title">
                                             <strong>产线方向</strong>
@@ -6130,6 +6346,9 @@ const mainTabs = [
                         :saving="nativeEnvironmentSaving"
                         :message="nativeEnvironmentMessage"
                         :preset-options="nativeEnvironmentPresetOptions"
+                        :workshops="workshops"
+                        :lines="lines"
+                        :devices="devices"
                         @save="saveNativeEnvironmentSettings($event || {})"
                         @apply-preset="applyNativeEnvironmentPreset"
                         @reset="resetNativeEnvironmentConfig"
@@ -6162,7 +6381,6 @@ const mainTabs = [
                             </label>
                             <label class="checkbox-line"><input v-model="nativeDashboardConfig.showHeader" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" /> 显示顶部标题栏</label>
                             <label class="checkbox-line"><input v-model="nativeDashboardConfig.showWorldLabels" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" /> 显示设备悬浮标签</label>
-                            <label class="checkbox-line"><input v-model="nativeDashboardConfig.showBottomHints" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" /> 显示底部操作提示</label>
                         </div>
 
                         <div class="native-dashboard-panel-grid">
@@ -7100,6 +7318,99 @@ const mainTabs = [
                         <!-- ===== 运行与投屏 ===== -->
                         <div class="settings-section runtime-settings-section">
                             <h3 class="section-title">运行与投屏</h3>
+
+                            <!-- 主路径：像手机投屏一样，直接选局域网里的电视 -->
+                            <section class="cast-device-panel">
+                                <div class="cast-panel-heading">
+                                    <div>
+                                        <strong>局域网电视</strong>
+                                        <p>电脑与电视连接同一路由器后，可直接搜索支持 DLNA / 多屏互动的电视并投送 Unity 大屏。</p>
+                                    </div>
+                                    <div class="cast-panel-actions">
+                                        <span class="runtime-badge" :class="castState.casting ? 'is-supported' : 'is-muted'">
+                                            {{ castState.casting ? `投屏中 · ${castingDeviceName}` : (!castState.loaded ? '正在检测投屏服务' : `待机 · ${castState.devices.length} 台可投`) }}
+                                        </span>
+                                        <button
+                                            class="btn btn-small"
+                                            type="button"
+                                            :disabled="castState.scanning"
+                                            @click="refreshCastDevices"
+                                        >
+                                            {{ castState.scanning ? '搜索中...' : '搜索电视' }}
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div v-if="castState.casting" class="cast-active-banner">
+                                    <div>
+                                        <strong>{{ castSessionStateLabel(castState.session) }} · 「{{ castingDeviceName }}」</strong>
+                                        <small>
+                                            {{ castState.session?.deviceAddress }} ·
+                                            {{ castState.session?.viewers ? `已连接 ${castState.session.viewers} 路视频流` : '电视尚未拉取画面' }}
+                                            <template v-if="castState.session?.retryCount"> · 已自动重试 {{ castState.session.retryCount }} 次</template>
+                                        </small>
+                                    </div>
+                                    <button
+                                        class="btn btn-small btn-danger"
+                                        type="button"
+                                        :disabled="Boolean(castBusyDeviceId)"
+                                        @click="stopCast"
+                                    >停止投屏</button>
+                                </div>
+
+                                <p v-if="castState.loaded && castState.ffmpegChecked && !castState.ffmpegAvailable" class="cast-warning">
+                                    内置投屏编码器没有准备好，电视投屏按钮暂时不可用。正式安装包会自动内置；开发环境请在
+                                    <code>desktop</code> 目录执行 <code>npm run prepare:ffmpeg</code>，等待几秒后重新搜索。
+                                    <template v-if="castState.ffmpegError">检测结果：{{ castState.ffmpegError }}。</template>
+                                    在此之前可以先用下方的网页投屏。
+                                </p>
+
+                                <ul v-if="castState.devices.length" class="cast-device-list">
+                                    <li v-for="device in castState.devices" :key="device.id" class="cast-device-row" :class="{ 'is-active': castingDeviceId === device.id }">
+                                        <span class="cast-device-icon" aria-hidden="true">
+                                            <svg viewBox="0 0 24 24">
+                                                <rect x="2.5" y="4" width="19" height="13" rx="2" />
+                                                <path d="M8 20.5h8M12 17.5v3" />
+                                            </svg>
+                                        </span>
+                                        <span class="cast-device-text">
+                                            <strong>{{ castDeviceLabel(device) }}</strong>
+                                            <small>{{ castDeviceSubtitle(device) }}</small>
+                                        </span>
+                                        <button
+                                            v-if="castingDeviceId === device.id"
+                                            class="btn btn-small btn-danger"
+                                            type="button"
+                                            :disabled="Boolean(castBusyDeviceId)"
+                                            @click="stopCast"
+                                        >停止投屏</button>
+                                        <button
+                                            v-else
+                                            class="btn btn-small btn-primary"
+                                            type="button"
+                                            :disabled="Boolean(castBusyDeviceId) || !castState.loaded || castState.ffmpegChecking || !castState.ffmpegAvailable"
+                                            @click="startCast(device)"
+                                        >{{ castBusyDeviceId === device.id ? '连接中...' : '投屏' }}</button>
+                                    </li>
+                                </ul>
+                                <div v-else-if="!castState.loaded" class="cast-empty">
+                                    <strong>正在检查投屏服务</strong>
+                                    <span>正在读取编码器状态和局域网电视列表...</span>
+                                </div>
+                                <div v-else class="cast-empty">
+                                    <strong>还没有搜到电视</strong>
+                                    <span>请确认：电视已开机并与本机连接同一路由器；电视设置里的“DLNA / 多屏互动”已打开；公司网络没有禁用组播。然后点“搜索电视”。</span>
+                                </div>
+
+                                <p v-if="castMessage" class="runtime-message">{{ castMessage }}</p>
+                                <p v-if="castState.loaded && castState.interfaces.length" class="runtime-help">
+                                    当前扫描网卡：{{ castState.interfaces.map(item => `${item.name} ${item.address}`).join(' · ') }}
+                                </p>
+                                <p v-if="castState.ignoredCount" class="runtime-help">已自动排除 {{ castState.ignoredCount }} 个本机或虚拟媒体设备。</p>
+                                <p v-if="castState.castError" class="runtime-error">{{ castState.castError }}</p>
+                                <p v-else-if="castState.error && !castState.devices.length" class="runtime-help">{{ castState.error }}</p>
+                            </section>
+
                             <div class="runtime-settings-grid">
                                 <section class="runtime-card">
                                     <div class="runtime-card-heading">
@@ -7124,8 +7435,8 @@ const mainTabs = [
                                 <section class="runtime-card cast-runtime-card">
                                     <div class="runtime-card-heading">
                                         <div>
-                                            <strong>内置局域网投屏</strong>
-                                            <p>电视打开浏览器扫描二维码即可显示实时大屏，不需要额外安装投屏软件。</p>
+                                            <strong>网页投屏（备选）</strong>
+                                            <p>给不支持 DLNA、但自带浏览器的电视用：电视扫码或输入网址即可打开大屏。</p>
                                         </div>
                                         <span class="runtime-badge" :class="runtimeStatus.running ? 'is-supported' : 'is-muted'">
                                             {{ runtimeStatus.running ? `运行中 · ${runtimeStatus.clients || 0} 台` : '未运行' }}
@@ -7148,16 +7459,18 @@ const mainTabs = [
                                 </section>
                             </div>
 
-                            <div class="runtime-cast-panel">
-                                <div class="runtime-cast-header">
-                                    <div>
-                                        <strong>电视连接入口</strong>
-                                        <p v-if="runtimeStatus.running">用电视浏览器打开下方地址，或扫描二维码；首次连接输入 6 位投屏码。</p>
-                                        <p v-else>开启并保存后，这里会显示局域网地址和二维码。</p>
-                                    </div>
-                                    <button class="btn btn-primary" type="button" @click="saveRuntimeSettings" :disabled="runtimeSaving">
+                            <details class="runtime-cast-panel runtime-cast-fallback">
+                                <summary>
+                                    <span>电视浏览器入口（二维码 / 网址）</span>
+                                    <button class="btn btn-primary" type="button" @click.prevent.stop="saveRuntimeSettings" :disabled="runtimeSaving">
                                         {{ runtimeSaving ? '保存中...' : '保存运行配置' }}
                                     </button>
+                                </summary>
+                                <div class="runtime-cast-header">
+                                    <div>
+                                        <p v-if="runtimeStatus.running">用电视浏览器打开下方地址，或扫描二维码；首次连接输入 6 位投屏码。</p>
+                                        <p v-else>开启“网页投屏”并保存后，这里会显示局域网地址和二维码。</p>
+                                    </div>
                                 </div>
                                 <div v-if="runtimeStatus.running" class="runtime-cast-content">
                                     <div v-if="runtimeQrDataUrl" class="runtime-qr-block">
@@ -7169,12 +7482,12 @@ const mainTabs = [
                                             <code>{{ url }}</code>
                                             <button class="btn btn-small" type="button" @click="copyCastUrl(url)">复制</button>
                                         </div>
-                                        <p class="runtime-help">电脑与电视必须在同一局域网；电视需要现代浏览器和 WebGL。没有浏览器的普通电视仍需 HDMI、Miracast 接收器或电视盒子。</p>
+                                        <p class="runtime-help">电脑与电视必须在同一局域网；电视需要现代浏览器和 WebGL。完全没有浏览器、也不支持 DLNA 的电视仍需 HDMI、Miracast 接收器或电视盒子。</p>
                                     </div>
                                 </div>
                                 <p v-if="runtimeStatus.error" class="runtime-error">{{ runtimeStatus.error }}</p>
                                 <p v-if="runtimeMessage" class="runtime-message">{{ runtimeMessage }}</p>
-                            </div>
+                            </details>
                         </div>
 
                         <!-- ===== 基础设置 ===== -->
@@ -7349,9 +7662,12 @@ const mainTabs = [
     background: linear-gradient(180deg, #edf2f7 0%, #dfe7ef 100%);
     border-bottom: 1px solid #cbd5df;
     box-shadow: 0 2px 8px rgba(31, 50, 68, 0.14);
+    cursor: grab;
+    touch-action: none;
     user-select: none;
     z-index: 500;
 }
+.unity-window-chrome:active { cursor: grabbing; }
 .unity-tab-strip {
     min-width: 0;
     flex: 1;
@@ -7389,9 +7705,11 @@ const mainTabs = [
 }
 .unity-screen-tab {
     background: transparent;
-    cursor: pointer;
+    cursor: grab;
+    touch-action: none;
     transition: color 0.16s ease, background 0.16s ease;
 }
+.unity-screen-tab:active { cursor: grabbing; }
 .unity-screen-tab:hover {
     color: #175cd3;
     background: rgba(255, 255, 255, 0.58);
@@ -7422,14 +7740,19 @@ const mainTabs = [
     background: #f8fafc;
 }
 .unity-screen-tab { position: relative; }
+.admin-container.unity-dashboard-tab .unity-screen-tab.is-active {
+    margin-bottom: 4px;
+    border-bottom: 1px solid #cbd5df;
+    border-radius: 10px;
+    box-shadow: 0 1px 5px rgba(27, 45, 63, 0.14);
+}
+.admin-container.unity-dashboard-tab .unity-screen-tab.is-active::after {
+    display: none;
+}
 .unity-admin-tab > svg { color: #1570ef; }
 .unity-window-chrome.is-dock-ready .unity-admin-tab {
     border-color: #6ce9a6;
     box-shadow: 0 -1px 0 #6ce9a6, 0 0 0 3px rgba(18, 183, 106, 0.1);
-}
-.unity-window-chrome.is-dock-ready .unity-tab-drag-hint {
-    color: #067647;
-    font-weight: 700;
 }
 .unity-tab-online {
     width: 7px;
@@ -7438,15 +7761,6 @@ const mainTabs = [
     border-radius: 50%;
     background: #12b76a;
     box-shadow: 0 0 0 3px rgba(18, 183, 106, 0.12);
-}
-.unity-tab-drag-hint {
-    min-width: 0;
-    margin: 0 0 9px 10px;
-    color: #7a8998;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 11px;
 }
 .unity-window-actions {
     height: 35px;
@@ -7673,7 +7987,7 @@ const mainTabs = [
 }
 
 .admin-content {
-    flex: 1 1 auto; min-width: 0; min-height: 0; padding: 32px 32px 72px; overflow-y: auto; overflow-x: hidden;
+    flex: 1 1 auto; min-width: 0; min-height: 0; padding: 32px 32px 72px; overflow: auto;
     overscroll-behavior: contain; scrollbar-gutter: stable; background: #f5f5f7;
 }
 .admin-container.composer-active .admin-content {
@@ -8990,8 +9304,16 @@ button:enabled:active {
 }
 
 .table-scroll {
-    width: 100%; overflow-x: auto; border-radius: 12px;
+    width: 100%; max-height: clamp(320px, calc(100dvh - 360px), 720px); overflow: auto; border-radius: 12px;
     border: 1px solid rgba(0, 0, 0, 0.06); background: #ffffff; margin-bottom: 20px;
+    overscroll-behavior: contain; scrollbar-gutter: stable both-edges;
+}
+.table-scroll .data-table { margin-bottom: 0; }
+.table-scroll .data-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    box-shadow: 0 1px 0 rgba(0, 0, 0, 0.05);
 }
 .table-scroll::-webkit-scrollbar {
     height: 12px;
@@ -10705,6 +11027,34 @@ button:enabled:active {
 .runtime-url-row code { flex: 1 1 auto; min-width: 0; overflow: auto; padding: 8px 10px; color: #1d4c62; background: #ffffff; border: 1px solid #dcebf1; border-radius: 6px; font-size: 11px; white-space: nowrap; }
 .runtime-error { margin: 14px 0 0; padding: 9px 11px; color: #8a1c14; background: #fff0ee; border-left: 3px solid #c9372c; font-size: 12px; line-height: 1.5; }
 .runtime-message { margin: 14px 0 0; color: #176b3a; font-size: 12px; line-height: 1.5; }
+
+/* 局域网电视发现与一键投屏 */
+.cast-device-panel { margin-bottom: 16px; padding: 18px; background: #ffffff; border: 1px solid #d7e5ec; border-radius: 10px; }
+.cast-panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.cast-panel-heading strong { color: #1d1d1f; font-size: 15px; }
+.cast-panel-heading p { max-width: 620px; margin: 6px 0 0; color: #6e6e73; font-size: 12px; line-height: 1.55; }
+.cast-panel-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 10px; }
+.cast-active-banner { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 14px; padding: 12px 14px; background: #e8f7ee; border: 1px solid #b6e3c8; border-radius: 8px; }
+.cast-active-banner strong { display: block; color: #14653a; font-size: 13px; }
+.cast-active-banner small { display: block; margin-top: 4px; color: #3f7a5b; font-size: 11px; }
+.cast-warning { margin: 14px 0 0; padding: 10px 12px; color: #7a4a06; background: #fff8ea; border-left: 3px solid #e0a338; font-size: 12px; line-height: 1.6; }
+.cast-warning code { padding: 1px 5px; background: rgba(0, 0, 0, .05); border-radius: 4px; font-size: 11px; }
+.cast-device-list { margin: 14px 0 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.cast-device-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 11px 13px; background: #f8fafb; border: 1px solid #e3eaee; border-radius: 8px; }
+.cast-device-row.is-active { background: #eef8f2; border-color: #b6e3c8; }
+.cast-device-icon { display: inline-flex; width: 34px; height: 34px; align-items: center; justify-content: center; color: #2f6d8c; background: #ffffff; border: 1px solid #dbe6ec; border-radius: 8px; }
+.cast-device-icon svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.cast-device-text { min-width: 0; }
+.cast-device-text strong { display: block; color: #1d1d1f; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cast-device-text small { display: block; margin-top: 3px; color: #86868b; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cast-empty { display: grid; gap: 7px; margin-top: 14px; padding: 20px 16px; color: #6e6e73; text-align: center; background: #f8fafb; border: 1px dashed #d3dde3; border-radius: 8px; }
+.cast-empty strong { color: #344054; font-size: 13px; }
+.cast-empty span { margin: 0 auto; max-width: 620px; font-size: 12px; line-height: 1.6; }
+.runtime-cast-fallback > summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; color: #1d1d1f; font-size: 14px; font-weight: 600; cursor: pointer; }
+.runtime-cast-fallback > summary::-webkit-details-marker { display: none; }
+.runtime-cast-fallback > summary > span::before { content: '▸ '; color: #6e6e73; }
+.runtime-cast-fallback[open] > summary > span::before { content: '▾ '; }
+.runtime-cast-fallback[open] > summary { margin-bottom: 12px; }
 .mode-hint { margin-top: 16px; padding: 16px 20px; background: rgba(0, 102, 204, 0.03); border: 1px solid rgba(0, 102, 204, 0.1); border-radius: 8px; }
 .mode-hint p { margin: 6px 0; font-size: 13px; color: #434345; line-height: 1.6; }
 .mode-hint code { background: rgba(0, 0, 0, 0.04); padding: 2px 6px; border-radius: 4px; font-size: 12px; color: #1d1d1f; }
@@ -10843,5 +11193,26 @@ button:enabled:active {
 @keyframes db-dot-pulse {
     0% { opacity: 0.3; transform: scale(0.8); }
     100% { opacity: 1; transform: scale(1.25); }
+}
+.spatial-rule-banner { display: flex; align-items: center; gap: 14px; margin: 14px 0; padding: 13px 15px; color: #475467; background: #f0f7fa; border: 1px solid #cfe2ea; border-radius: 9px; font-size: 12px; line-height: 1.55; }
+.spatial-rule-banner strong { flex: 0 0 auto; color: #175f7b; }
+.data-table tr.row-selected td { background: #f2f8fb; }
+.data-table td .btn + .btn { margin-left: 6px; }
+.workshop-spatial-editor { margin-top: 18px; padding: 18px; background: #f8fafb; border: 1px solid #dce5eb; border-radius: 11px; }
+.workshop-spatial-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.workshop-spatial-heading h3 { margin: 0; color: #1d2939; font-size: 16px; }
+.workshop-spatial-heading p { max-width: 720px; margin: 6px 0 0; color: #667085; font-size: 12px; line-height: 1.55; }
+.workshop-spatial-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 12px; margin-top: 16px; }
+.workshop-spatial-grid > label, .line-transform-grid > label { display: flex; flex-direction: column; gap: 6px; color: #475467; font-size: 12px; font-weight: 500; }
+.workshop-spatial-grid .workshop-boundary-toggle { flex-direction: row; align-items: center; min-height: 38px; padding: 8px 10px; align-self: end; background: #fff; border: 1px solid #d0d5dd; border-radius: 7px; }
+.workshop-boundary-toggle input { accent-color: #176b8b; }
+.line-transform-grid { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 10px; margin-top: 12px; }
+@media (max-width: 1180px) {
+    .workshop-spatial-heading { flex-direction: column; }
+    .workshop-spatial-grid, .line-transform-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
+}
+@media (max-width: 720px) {
+    .spatial-rule-banner { align-items: flex-start; flex-direction: column; }
+    .workshop-spatial-grid, .line-transform-grid { grid-template-columns: 1fr; }
 }
 </style>

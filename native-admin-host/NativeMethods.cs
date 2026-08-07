@@ -23,6 +23,7 @@ internal static class NativeMethods
 
     internal const uint SwHide = 0;
     internal const uint SwShow = 5;
+    internal const uint SwMinimize = 6;
     internal const uint SwRestore = 9;
     internal const uint SwpNoActivate = 0x0010;
     internal const uint SwpNoZOrder = 0x0004;
@@ -30,7 +31,26 @@ internal static class NativeMethods
     internal const uint SwpShowWindow = 0x0040;
     internal const uint WmApp = 0x8000;
     internal const uint WmClose = 0x0010;
+    internal const uint WmNcHitTest = 0x0084;
+    internal const uint WmNcLButtonDown = 0x00A1;
     internal const uint WmNcLButtonDblClk = 0x00A3;
+    internal const uint WmExitSizeMove = 0x0232;
+
+    internal const int HtClient = 1;
+    internal const int HtCaption = 2;
+    internal const int HtLeft = 10;
+    internal const int HtRight = 11;
+    internal const int HtTop = 12;
+    internal const int HtTopLeft = 13;
+    internal const int HtTopRight = 14;
+    internal const int HtBottom = 15;
+    internal const int HtBottomLeft = 16;
+    internal const int HtBottomRight = 17;
+
+    internal const int DwmWindowCornerPreference = 33;
+    internal const int DwmWindowCornerDefault = 0;
+    internal const int DwmWindowCornerDoNotRound = 1;
+    internal const int DwmWindowCornerRound = 2;
 
     internal static readonly IntPtr HwndTop = IntPtr.Zero;
 
@@ -87,6 +107,9 @@ internal static class NativeMethods
     internal static extern bool IsWindow(IntPtr handle);
 
     [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool IsIconic(IntPtr handle);
+
+    [DllImport("user32.dll", SetLastError = true)]
     internal static extern bool SetWindowPos(
         IntPtr handle,
         IntPtr insertAfter,
@@ -107,6 +130,12 @@ internal static class NativeMethods
     internal static extern bool PostMessage(IntPtr handle, uint message, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll", SetLastError = true)]
+    internal static extern IntPtr SendMessage(IntPtr handle, uint message, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll", SetLastError = true)]
     internal static extern uint GetWindowThreadProcessId(IntPtr handle, out uint processId);
 
     [DllImport("user32.dll", SetLastError = true)]
@@ -114,6 +143,30 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+    [DllImport("dwmapi.dll", PreserveSig = true)]
+    internal static extern int DwmSetWindowAttribute(
+        IntPtr handle,
+        int attribute,
+        ref int value,
+        int valueSize
+    );
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    internal static extern IntPtr CreateRoundRectRgn(
+        int left,
+        int top,
+        int right,
+        int bottom,
+        int ellipseWidth,
+        int ellipseHeight
+    );
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern int SetWindowRgn(IntPtr handle, IntPtr region, bool redraw);
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    internal static extern bool DeleteObject(IntPtr handle);
 
     internal static long GetWindowStyle(IntPtr handle, int index)
     {
@@ -129,5 +182,11 @@ internal static class NativeMethods
             ? SetWindowLongPtr64(handle, index, new IntPtr(value))
             : SetWindowLongPtr32(handle, index, new IntPtr(value));
         return old.ToInt64();
+    }
+
+    internal static IntPtr PackScreenPoint(int x, int y)
+    {
+        var packed = unchecked((int)((uint)(ushort)x | ((uint)(ushort)y << 16)));
+        return new IntPtr(packed);
     }
 }

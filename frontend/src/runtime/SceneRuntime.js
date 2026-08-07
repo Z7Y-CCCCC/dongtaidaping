@@ -2,6 +2,7 @@ import { SceneManager } from '../three/SceneManager.js';
 import { applyRealtimeToDeviceModel, createConfiguredDeviceModel } from './DeviceRenderer.js';
 import { createBatchedDeviceRenderer, getBatchableModelInfo } from './BatchDeviceRenderer.js';
 import { shouldOptimizeModelGroup } from './modelOptimization.js';
+import { deviceLocalToWorld, normalizeSpatialTransform } from '../utils/spatialLayout.js';
 
 function parseInstanceConfig(raw) {
     if (!raw) return {};
@@ -62,7 +63,14 @@ function getLineLayout(line) {
             sort_order: 0
         });
     }
-    return { version: 1, flowDirection, lanes, rails };
+    return {
+        version: Number(source.version || 1),
+        coordinateSpace: source.coordinateSpace || (Number(source.version || 0) >= 2 ? 'workshop_local' : 'legacy_world'),
+        transform: normalizeSpatialTransform(source.transform),
+        flowDirection,
+        lanes,
+        rails
+    };
 }
 
 function lineUsesStructuredLayout(line) {
@@ -70,7 +78,8 @@ function lineUsesStructuredLayout(line) {
     return !!source.version || Array.isArray(source.lanes) || Array.isArray(source.rails);
 }
 
-function getLineBaseZ(globalLineIndex) {
+function getLineBaseZ(globalLineIndex, line = null) {
+    if (Number(getLineLayout(line).version || 0) >= 2) return 0;
     return -numberOrDefault(globalLineIndex, 0) * 16;
 }
 
@@ -86,7 +95,7 @@ function resolveDeviceLayoutTarget(deviceCfg, line, globalLineIndex, options = {
     const layout = getLineLayout(line);
     const config = parseInstanceConfig(deviceCfg?.instance_config);
     const allowFallback = options.allowFallback !== false;
-    const baseZ = getLineBaseZ(globalLineIndex);
+    const baseZ = getLineBaseZ(globalLineIndex, line);
     const relativeZ = (numberOrDefault(deviceCfg?.pos_z, baseZ) - baseZ) / LINE_LAYOUT_Z_VISUAL_SCALE;
 
     if (isAuxiliaryDevice(deviceCfg)) {
@@ -123,12 +132,12 @@ function applyLineLayoutToDevice(deviceCfg, line, globalLineIndex, targetOverrid
 
     if (!target) {
         if (next.pos_z === undefined || next.pos_z === null || next.pos_z === '') {
-            next.pos_z = getLineBaseZ(globalLineIndex);
+            next.pos_z = getLineBaseZ(globalLineIndex, line);
         }
         return next;
     }
 
-    next.pos_z = getLineBaseZ(globalLineIndex) + layoutOffsetToSceneZ(target.item.offsetZ);
+    next.pos_z = getLineBaseZ(globalLineIndex, line) + layoutOffsetToSceneZ(target.item.offsetZ);
 
     if (target.type === 'rail') {
         config.role = next.model_type === 'transfer_cart' ? 'transfer_cart' : (config.role || 'auxiliary');
@@ -174,8 +183,17 @@ function flattenDeviceDefinitions(workshops) {
                     allowFallback: !lineUsesStructuredLayout(line)
                 });
                 if (lineUsesStructuredLayout(line) && !target) return;
+                const localDevice = applyLineLayoutToDevice(deviceCfg, line, lineInfo.gLineIdx, target);
+                const worldTransform = deviceLocalToWorld(localDevice, ws, line);
                 definitions.push({
-                    deviceCfg: applyLineLayoutToDevice(deviceCfg, line, lineInfo.gLineIdx, target),
+                    deviceCfg: {
+                        ...localDevice,
+                        pos_x: worldTransform.x,
+                        pos_y: worldTransform.y,
+                        pos_z: worldTransform.z,
+                        rotation_y: worldTransform.rotationY,
+                        coordinate_space: 'factory_world'
+                    },
                     devIdx,
                     wsIdx,
                     gLineIdx: lineInfo.gLineIdx,
@@ -196,8 +214,19 @@ function flattenDeviceDefinitions(workshops) {
                 })
                 : null;
             if (targetLine && lineUsesStructuredLayout(targetLine) && !target) return;
+            const localDevice = targetLine
+                ? applyLineLayoutToDevice(deviceCfg, targetLine, lineInfo.gLineIdx, target)
+                : deviceCfg;
+            const worldTransform = deviceLocalToWorld(localDevice, ws, targetLine);
             definitions.push({
-                deviceCfg: targetLine ? applyLineLayoutToDevice(deviceCfg, targetLine, lineInfo.gLineIdx, target) : deviceCfg,
+                deviceCfg: {
+                    ...localDevice,
+                    pos_x: worldTransform.x,
+                    pos_y: worldTransform.y,
+                    pos_z: worldTransform.z,
+                    rotation_y: worldTransform.rotationY,
+                    coordinate_space: 'factory_world'
+                },
                 devIdx,
                 wsIdx,
                 gLineIdx: lineInfo.gLineIdx,

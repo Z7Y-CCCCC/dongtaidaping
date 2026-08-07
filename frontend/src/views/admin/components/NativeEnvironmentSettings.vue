@@ -6,7 +6,10 @@ const props = defineProps({
     config: { type: Object, required: true },
     saving: { type: Boolean, default: false },
     message: { type: String, default: '' },
-    presetOptions: { type: Array, default: () => [] }
+    presetOptions: { type: Array, default: () => [] },
+    workshops: { type: Array, default: () => [] },
+    lines: { type: Array, default: () => [] },
+    devices: { type: Array, default: () => [] }
 })
 
 const emit = defineEmits(['save', 'apply-preset', 'reset'])
@@ -28,8 +31,55 @@ const presetDescription = computed(() => (
     || '当前为工程师自定义组合。'
 ))
 
-function applyPreset() {
-    emit('apply-preset', props.config.preset)
+const visualPresetOptions = computed(() => (
+    props.presetOptions.filter(option => option.value !== 'custom')
+))
+
+const showCustomPreview = computed(() => props.config.preset === 'custom')
+
+function clamp(value, minimum, maximum) {
+    return Math.min(maximum, Math.max(minimum, Number(value) || 0))
+}
+
+function presetPreviewStyle(option) {
+    const source = option?.preview || props.config
+    const brightness = clamp(
+        Number(source.sceneBrightness || 1) * Math.pow(2, Number(source.postExposure || 0) * 0.28),
+        0.65,
+        1.55
+    )
+    const saturation = clamp(1 + Number(source.saturation || 0) / 50, 0.65, 1.5)
+    const contrast = clamp(1 + Number(source.contrast || 0) / 60, 0.78, 1.5)
+    const fogOpacity = source.fogEnabled === false
+        ? 0
+        : clamp(0.13 + (420 - Number(source.fogEnd || 360)) / 1200, 0.06, 0.32)
+
+    return {
+        '--preview-sky': source.skyColor || '#607FAF',
+        '--preview-horizon': source.horizonColor || '#354A6A',
+        '--preview-fog': source.fogColor || '#26364F',
+        '--preview-key': source.keyLightColor || '#FFF0DC',
+        '--preview-fill': source.fillLightColor || '#B5D2FF',
+        '--preview-floor': source.floorColor || '#263442',
+        '--preview-grid': source.gridColor || '#1D4759',
+        '--preview-wall': source.wallColor || '#283B59',
+        '--preview-frame': source.frameColor || '#526A86',
+        '--preview-brightness': brightness.toFixed(2),
+        '--preview-saturation': saturation.toFixed(2),
+        '--preview-contrast': contrast.toFixed(2),
+        '--preview-fog-opacity': fogOpacity.toFixed(2),
+        '--preview-grid-opacity': source.showGrid === false ? '0' : '0.68',
+        '--preview-bloom-opacity': clamp(0.1 + Number(source.bloomIntensity || 0) * 1.8, 0.08, 0.48).toFixed(2),
+        '--preview-vignette-opacity': clamp(0.06 + Number(source.vignetteIntensity || 0) * 0.9, 0.06, 0.36).toFixed(2),
+        '--preview-glow-size': `${(7 * clamp(Number(source.reflectionIntensity || 1), 0.35, 1.6)).toFixed(1)}px`
+    }
+}
+
+const customPreviewStyle = computed(() => presetPreviewStyle({ preview: props.config }))
+
+function selectPreset(option) {
+    if (!option || option.value === 'custom' || props.saving) return
+    emit('apply-preset', option.value)
 }
 
 function saveCustom() {
@@ -53,20 +103,81 @@ function saveCustom() {
             </div>
         </div>
 
-        <div class="preset-row">
-            <label>视觉预设
-                <select v-model="config.preset" class="env-input" @change="applyPreset">
-                    <option v-for="option in presetOptions" :key="option.value" :value="option.value">
-                        {{ option.label }}
-                    </option>
-                </select>
-            </label>
-            <p>{{ presetDescription }}</p>
-            <label class="check-line"><input v-model="config.showGrid" type="checkbox" @change="saveCustom" /> 显示地面网格</label>
+        <div class="preset-panel">
+            <div class="preset-panel-heading">
+                <div>
+                    <strong>视觉预设</strong>
+                    <p>{{ presetDescription }}</p>
+                </div>
+                <label class="check-line"><input v-model="config.showGrid" type="checkbox" @change="saveCustom" /> 显示地面网格</label>
+            </div>
+
+            <div class="preset-gallery" role="radiogroup" aria-label="Unity 场景视觉预设">
+                <button
+                    v-for="option in visualPresetOptions"
+                    :key="option.value"
+                    type="button"
+                    class="preset-card"
+                    :class="{ 'is-active': config.preset === option.value }"
+                    :aria-checked="config.preset === option.value"
+                    :disabled="saving"
+                    role="radio"
+                    @click="selectPreset(option)"
+                >
+                    <span class="preset-thumbnail" :style="presetPreviewStyle(option)" aria-hidden="true">
+                        <span class="preset-scene">
+                            <i class="preset-sky"></i>
+                            <i class="preset-horizon"></i>
+                            <i class="preset-floor"></i>
+                            <i class="preset-floor-grid"></i>
+                            <i class="preset-machine is-back"></i>
+                            <i class="preset-machine is-middle"></i>
+                            <i class="preset-machine is-front"></i>
+                            <i class="preset-light"></i>
+                            <i class="preset-vignette"></i>
+                        </span>
+                        <b v-if="config.preset === option.value" class="preset-selected">✓</b>
+                    </span>
+                    <span class="preset-card-copy">
+                        <span class="preset-name-row">
+                            <strong>{{ option.label }}</strong>
+                            <small v-if="option.tag">{{ option.tag }}</small>
+                        </span>
+                        <span>{{ option.description }}</span>
+                    </span>
+                </button>
+
+                <div v-if="showCustomPreview" class="preset-card is-active is-custom" role="radio" aria-checked="true">
+                    <span class="preset-thumbnail" :style="customPreviewStyle" aria-hidden="true">
+                        <span class="preset-scene">
+                            <i class="preset-sky"></i>
+                            <i class="preset-horizon"></i>
+                            <i class="preset-floor"></i>
+                            <i class="preset-floor-grid"></i>
+                            <i class="preset-machine is-back"></i>
+                            <i class="preset-machine is-middle"></i>
+                            <i class="preset-machine is-front"></i>
+                            <i class="preset-light"></i>
+                            <i class="preset-vignette"></i>
+                        </span>
+                        <b class="preset-selected">✓</b>
+                    </span>
+                    <span class="preset-card-copy">
+                        <span class="preset-name-row"><strong>当前自定义</strong><small>工程师配置</small></span>
+                        <span>缩略图随下方亮度、颜色和后处理参数同步变化。</span>
+                    </span>
+                </div>
+            </div>
         </div>
 
         <div class="environment-grid">
-            <NativeWallEditor :config="config" @change="saveCustom" />
+            <NativeWallEditor
+                :config="config"
+                :workshops="workshops"
+                :lines="lines"
+                :devices="devices"
+                @change="saveCustom"
+            />
 
             <section class="environment-card">
                 <h4>总体亮度与照明</h4>
@@ -151,11 +262,39 @@ function saveCustom() {
 .env-btn.primary { color: #fff; background: #176b8b; border-color: #176b8b; }
 .env-btn:disabled { opacity: .55; cursor: wait; }
 .env-input { width: 100%; min-height: 38px; padding: 8px 10px; color: #1d1d1f; background: #fff; border: 1px solid #d2d2d7; border-radius: 6px; box-sizing: border-box; }
-.preset-row { display: grid; grid-template-columns: minmax(240px, 360px) minmax(260px, 1fr) auto; align-items: end; gap: 16px; margin-top: 20px; padding: 17px; background: #fff; border: 1px solid #dce6ed; border-radius: 10px; }
-.preset-row > label:not(.check-line) { display: flex; flex-direction: column; gap: 7px; color: #515154; font-size: 13px; font-weight: 500; }
-.preset-row > p { align-self: center; margin: 0; color: #6e6e73; font-size: 12px; line-height: 1.55; }
+.preset-panel { margin-top: 20px; padding: 17px; background: #fff; border: 1px solid #dce6ed; border-radius: 10px; }
+.preset-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.preset-panel-heading strong { color: #303033; font-size: 13px; }
+.preset-panel-heading p { margin: 5px 0 0; color: #6e6e73; font-size: 12px; line-height: 1.5; }
 .check-line { display: flex; align-items: center; gap: 7px; min-height: 38px; color: #515154; font-size: 12px; white-space: nowrap; }
 .check-line input { accent-color: #176b8b; }
+.preset-gallery { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+.preset-card { min-width: 0; padding: 0; overflow: hidden; color: inherit; font: inherit; text-align: left; background: #fff; border: 1px solid #dce3e8; border-radius: 9px; box-shadow: 0 1px 2px rgba(30, 54, 74, .05); cursor: pointer; transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease; }
+.preset-card:hover:not(:disabled) { transform: translateY(-2px); border-color: #91b9c9; box-shadow: 0 7px 18px rgba(31, 73, 92, .12); }
+.preset-card:focus-visible { outline: 3px solid rgba(41, 126, 162, .22); outline-offset: 2px; }
+.preset-card:disabled { opacity: .72; cursor: wait; }
+.preset-card.is-active { border-color: #297ea2; box-shadow: 0 0 0 2px rgba(41, 126, 162, .14), 0 7px 18px rgba(31, 73, 92, .1); }
+.preset-card.is-custom { cursor: default; }
+.preset-thumbnail { position: relative; display: block; height: 118px; overflow: hidden; background: var(--preview-sky); border-bottom: 1px solid rgba(27, 49, 65, .16); }
+.preset-scene { position: absolute; inset: 0; overflow: hidden; filter: brightness(var(--preview-brightness)) saturate(var(--preview-saturation)) contrast(var(--preview-contrast)); }
+.preset-sky { position: absolute; inset: 0 0 45%; background: linear-gradient(180deg, var(--preview-sky) 0%, var(--preview-horizon) 100%); }
+.preset-horizon { position: absolute; left: 0; right: 0; top: 36%; height: 38%; opacity: var(--preview-fog-opacity); background: linear-gradient(180deg, transparent 0%, var(--preview-fog) 52%, transparent 100%); filter: blur(5px); }
+.preset-floor { position: absolute; left: -10%; right: -10%; top: 45%; bottom: -8%; background: linear-gradient(180deg, color-mix(in srgb, var(--preview-floor) 76%, var(--preview-fill)) 0%, var(--preview-floor) 76%); clip-path: polygon(12% 0, 88% 0, 100% 100%, 0 100%); }
+.preset-floor-grid { position: absolute; left: -8%; right: -8%; top: 45%; bottom: -8%; opacity: var(--preview-grid-opacity); background-image: linear-gradient(90deg, transparent 48%, var(--preview-grid) 49%, var(--preview-grid) 52%, transparent 53%), linear-gradient(0deg, transparent 46%, var(--preview-grid) 48%, var(--preview-grid) 52%, transparent 54%); background-size: 21px 100%, 100% 17px; clip-path: polygon(12% 0, 88% 0, 100% 100%, 0 100%); transform: perspective(150px) rotateX(19deg); transform-origin: center top; }
+.preset-machine { position: absolute; width: 46px; height: 31px; background: linear-gradient(135deg, color-mix(in srgb, #fff 82%, var(--preview-fill)) 0%, color-mix(in srgb, #cbd2d8 72%, var(--preview-frame)) 100%); border: 1px solid color-mix(in srgb, var(--preview-frame) 65%, #1a2430); border-radius: 3px; box-shadow: 7px 8px 12px rgba(6, 14, 22, .34), inset -5px -5px 8px rgba(35, 55, 69, .16); }
+.preset-machine::before { content: ''; position: absolute; left: 5px; top: 5px; width: 18px; height: 22px; background: linear-gradient(180deg, #17212a, #05090d); border: 1px solid color-mix(in srgb, var(--preview-frame) 65%, #fff); border-radius: 2px; }
+.preset-machine::after { content: ''; position: absolute; right: 6px; top: 6px; width: 6px; height: 6px; background: var(--preview-key); border-radius: 50%; box-shadow: 0 0 var(--preview-glow-size) var(--preview-key), 0 11px 0 -1px var(--preview-frame); }
+.preset-machine.is-back { left: 65%; bottom: 47px; transform: scale(.67); opacity: .82; }
+.preset-machine.is-middle { left: 43%; bottom: 27px; transform: scale(.84); }
+.preset-machine.is-front { left: 17%; bottom: 8px; width: 53px; height: 36px; }
+.preset-light { position: absolute; top: -36px; right: -26px; width: 112px; height: 112px; opacity: var(--preview-bloom-opacity); background: radial-gradient(circle, var(--preview-key) 0%, transparent 68%); filter: blur(7px); }
+.preset-vignette { position: absolute; inset: 0; box-shadow: inset 0 0 32px rgba(0, 7, 14, var(--preview-vignette-opacity)); }
+.preset-selected { position: absolute; top: 8px; right: 8px; display: inline-flex; width: 23px; height: 23px; align-items: center; justify-content: center; color: #fff; background: #176b8b; border: 2px solid rgba(255,255,255,.9); border-radius: 50%; box-shadow: 0 2px 7px rgba(10, 42, 55, .28); font-size: 12px; }
+.preset-card-copy { display: grid; gap: 7px; padding: 12px 13px 13px; }
+.preset-card-copy > span:last-child { min-height: 38px; color: #6e6e73; font-size: 11px; line-height: 1.55; }
+.preset-name-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.preset-name-row strong { min-width: 0; color: #27272a; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preset-name-row small { flex: 0 0 auto; padding: 2px 6px; color: #27627a; background: #edf6f9; border-radius: 999px; font-size: 9px; font-weight: 600; }
 .environment-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }
 .environment-card { padding: 18px; background: #fff; border: 1px solid #e1e6ea; border-radius: 10px; }
 .environment-card h4 { margin: 0; color: #1d1d1f; font-size: 14px; }
@@ -182,9 +321,13 @@ function saveCustom() {
 
 @media (max-width: 1180px) {
     .environment-heading { flex-direction: column; }
-    .preset-row,
     .environment-grid,
     .color-grid { grid-template-columns: 1fr; }
+    .preset-gallery { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .color-card { grid-column: auto; }
+}
+@media (max-width: 680px) {
+    .preset-panel-heading { align-items: flex-start; flex-direction: column; }
+    .preset-gallery { grid-template-columns: 1fr; }
 }
 </style>

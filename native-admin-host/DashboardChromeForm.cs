@@ -8,6 +8,7 @@ internal sealed class DashboardChromeForm : Form
 
     private readonly ChromeSurface _surface;
     private IntPtr _parentHandle;
+    private Size _lastParentClientSize = Size.Empty;
 
     public DashboardChromeForm(Action<string, int, int> action)
     {
@@ -42,22 +43,25 @@ internal sealed class DashboardChromeForm : Form
         NativeMethods.SetWindowStyle(Handle, NativeMethods.GwlExStyle, exStyle);
         NativeMethods.SetParent(Handle, _parentHandle);
 
-        UpdateParentBounds();
+        UpdateParentBounds(force: true);
         UpdateState(maximized);
         Show();
         NativeMethods.ShowWindow(Handle, NativeMethods.SwShow);
     }
 
-    public void UpdateParentBounds()
+    public void UpdateParentBounds(bool force = false)
     {
         if (_parentHandle == IntPtr.Zero || !NativeMethods.IsWindow(_parentHandle)) return;
         if (!NativeMethods.GetClientRect(_parentHandle, out var client)) return;
+        var clientSize = new Size(Math.Max(1, client.Width), Math.Max(1, client.Height));
+        if (!force && clientSize == _lastParentClientSize) return;
+        _lastParentClientSize = clientSize;
         NativeMethods.SetWindowPos(
             Handle,
             NativeMethods.HwndTop,
             0,
             0,
-            Math.Max(1, client.Width),
+            clientSize.Width,
             ChromeHeight,
             NativeMethods.SwpFrameChanged | NativeMethods.SwpShowWindow
         );
@@ -87,7 +91,7 @@ internal sealed class DashboardChromeForm : Form
                 | ControlStyles.UserPaint,
                 true
             );
-            Cursor = Cursors.Default;
+            Cursor = Cursors.SizeAll;
         }
 
         public bool Maximized
@@ -103,6 +107,7 @@ internal sealed class DashboardChromeForm : Form
 
         private Rectangle DashboardTabRect => new(8, 6, 108, 35);
         private Rectangle DetachedChipRect => new(126, 10, 204, 29);
+        private Rectangle MinimizeRect => new(Math.Max(0, Width - ActionWidth * 3 - 6), 7, ActionWidth, 32);
         private Rectangle MaximizeRect => new(Math.Max(0, Width - ActionWidth * 2 - 6), 7, ActionWidth, 32);
         private Rectangle CloseRect => new(Math.Max(0, Width - ActionWidth - 6), 7, ActionWidth, 32);
 
@@ -177,10 +182,14 @@ internal sealed class DashboardChromeForm : Form
 
         private void DrawWindowActions(Graphics graphics)
         {
-            DrawActionBackground(graphics, MaximizeRect, _hoverZone == 2, false);
-            DrawActionBackground(graphics, CloseRect, _hoverZone == 3, true);
-            var iconColor = _hoverZone == 3 ? Color.White : Color.FromArgb(71, 84, 103);
+            DrawActionBackground(graphics, MinimizeRect, _hoverZone == 2, false);
+            DrawActionBackground(graphics, MaximizeRect, _hoverZone == 3, false);
+            DrawActionBackground(graphics, CloseRect, _hoverZone == 4, true);
+            var iconColor = _hoverZone == 4 ? Color.White : Color.FromArgb(71, 84, 103);
             using var pen = new Pen(iconColor, 1.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+
+            var minimize = MinimizeRect;
+            graphics.DrawLine(pen, minimize.Left + 13, minimize.Top + 21, minimize.Left + 27, minimize.Top + 21);
 
             var max = MaximizeRect;
             if (_maximized)
@@ -211,24 +220,34 @@ internal sealed class DashboardChromeForm : Form
             base.OnMouseMove(e);
             var zone = DetachedChipRect.Contains(e.Location)
                 ? 1
-                : MaximizeRect.Contains(e.Location)
+                : MinimizeRect.Contains(e.Location)
                     ? 2
+                : MaximizeRect.Contains(e.Location)
+                    ? 3
                     : CloseRect.Contains(e.Location)
-                        ? 3
+                        ? 4
                         : 0;
             if (_hoverZone != zone)
             {
                 _hoverZone = zone;
-                Cursor = zone == 0 ? Cursors.Default : Cursors.Hand;
+                Cursor = zone == 0 ? Cursors.SizeAll : Cursors.Hand;
                 Invalidate();
             }
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left || IsInteractiveZone(e.Location)) return;
+            var pointer = Cursor.Position;
+            _action("move_parent_native", pointer.X, pointer.Y);
         }
 
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
             _hoverZone = 0;
-            Cursor = Cursors.Default;
+            Cursor = Cursors.SizeAll;
             Invalidate();
         }
 
@@ -237,8 +256,17 @@ internal sealed class DashboardChromeForm : Form
             base.OnMouseUp(e);
             if (e.Button != MouseButtons.Left) return;
             if (DetachedChipRect.Contains(e.Location)) _action("focus_admin", Cursor.Position.X, Cursor.Position.Y);
+            else if (MinimizeRect.Contains(e.Location)) _action("minimize", Cursor.Position.X, Cursor.Position.Y);
             else if (MaximizeRect.Contains(e.Location)) _action("maximize", Cursor.Position.X, Cursor.Position.Y);
             else if (CloseRect.Contains(e.Location)) _action("close", Cursor.Position.X, Cursor.Position.Y);
+        }
+
+        private bool IsInteractiveZone(Point location)
+        {
+            return DetachedChipRect.Contains(location)
+                || MinimizeRect.Contains(location)
+                || MaximizeRect.Contains(location)
+                || CloseRect.Contains(location);
         }
 
         private static GraphicsPath RoundedPath(Rectangle rect, int radius)

@@ -18,6 +18,8 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             [JsonProperty("id")] public string Id { get; set; } = string.Empty;
             [JsonProperty("name")] public string Name { get; set; } = "围墙";
+            [JsonProperty("workshopId")] public string WorkshopId { get; set; } = string.Empty;
+            [JsonProperty("coordinateSpace")] public string CoordinateSpace { get; set; } = "workshop_local";
             [JsonProperty("enabled")] public bool Enabled { get; set; } = true;
             [JsonProperty("style")] public string Style { get; set; } = "solid_frame";
             [JsonProperty("x")] public float X { get; set; }
@@ -33,7 +35,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
 
         private sealed class NativeEnvironmentConfig
         {
-            [JsonProperty("version")] public int Version { get; set; } = 2;
+            [JsonProperty("version")] public int Version { get; set; } = 3;
             [JsonProperty("preset")] public string Preset { get; set; } = "bright_industrial";
             [JsonProperty("sceneBrightness")] public float SceneBrightness { get; set; } = 1.2f;
             [JsonProperty("ambientIntensity")] public float AmbientIntensity { get; set; } = 1.25f;
@@ -68,8 +70,11 @@ namespace HeatTreatment.DigitalTwin.Runtime
         }
 
         private Transform _environmentRoot;
-        private GameObject _gridObject;
-        private GameObject _wallsRoot;
+        private readonly Dictionary<string, Transform> _workshopEnvironmentRoots = new Dictionary<string, Transform>();
+        private readonly Dictionary<string, Transform> _lineEnvironmentRoots = new Dictionary<string, Transform>();
+        private readonly List<GameObject> _gridObjects = new List<GameObject>();
+        private readonly List<GameObject> _wallsRoots = new List<GameObject>();
+        private FactoryConfigDto _factoryConfig;
         private Material _groundMaterial;
         private Material _gridMaterial;
         private Material _railMaterial;
@@ -203,25 +208,71 @@ namespace HeatTreatment.DigitalTwin.Runtime
             IReadOnlyList<DeviceDto> devices,
             bool createReflectionProbe = true)
         {
+            _factoryConfig = config;
             if (_environmentRoot != null) Destroy(_environmentRoot.gameObject);
             var root = new GameObject("FactoryEnvironment");
             root.transform.SetParent(transform, false);
             _environmentRoot = root.transform;
-            _gridObject = null;
-            _wallsRoot = null;
+            _workshopEnvironmentRoots.Clear();
+            _lineEnvironmentRoots.Clear();
+            _gridObjects.Clear();
+            _wallsRoots.Clear();
             _reflectionProbe = null;
 
-            var layoutBounds = CalculateLayoutBounds(devices);
-            var width = Mathf.Max(54f, Mathf.Ceil(layoutBounds.size.x / 10f) * 10f + 32f);
-            var depth = Mathf.Max(54f, Mathf.Ceil(layoutBounds.size.z / 10f) * 10f + 42f);
-            var center = new Vector3(layoutBounds.center.x, -0.16f, layoutBounds.center.z);
-            CreateGround(center, width, depth);
-            CreateGrid(new Vector3(center.x, 0.015f, center.z), width, depth, 2f);
-            RebuildCustomWalls();
+            var workshops = config?.Workshops ?? new List<WorkshopDto>();
+            foreach (var workshop in workshops)
+            {
+                var workshopObject = new GameObject($"Workshop Environment - {workshop.Name ?? workshop.Id}");
+                workshopObject.transform.SetParent(_environmentRoot, false);
+                ApplyLayoutTransform(workshopObject.transform, workshop.LayoutObject);
+                if (!string.IsNullOrWhiteSpace(workshop.Id))
+                {
+                    _workshopEnvironmentRoots[workshop.Id] = workshopObject.transform;
+                }
+
+                var layout = workshop.LayoutObject;
+                var size = layout["size"] as JObject;
+                var boundary = layout["boundary"] as JObject;
+                var width = Mathf.Clamp(size?.Value<float?>("width") ?? 100f, 10f, 5000f);
+                var depth = Mathf.Clamp(size?.Value<float?>("depth") ?? 80f, 10f, 5000f);
+                var boundaryEnabled = boundary?.Value<bool?>("enabled") ?? true;
+                if (boundaryEnabled)
+                {
+                    CreateGround(workshopObject.transform, new Vector3(0f, -0.16f, 0f), width, depth);
+                    CreateGrid(workshopObject.transform, new Vector3(0f, 0.015f, 0f), width, depth, 2f);
+                }
+
+                foreach (var line in workshop.Lines ?? new List<LineDto>())
+                {
+                    var lineObject = new GameObject($"Line Environment - {line.Name ?? line.Id}");
+                    lineObject.transform.SetParent(workshopObject.transform, false);
+                    ApplyLayoutTransform(lineObject.transform, line.LayoutObject);
+                    if (!string.IsNullOrWhiteSpace(line.Id)) _lineEnvironmentRoots[line.Id] = lineObject.transform;
+                }
+            }
+
+            if (workshops.Count == 0)
+            {
+                var layoutBounds = CalculateLayoutBounds(devices);
+                var width = Mathf.Max(54f, Mathf.Ceil(layoutBounds.size.x / 10f) * 10f + 32f);
+                var depth = Mathf.Max(54f, Mathf.Ceil(layoutBounds.size.z / 10f) * 10f + 42f);
+                var center = new Vector3(layoutBounds.center.x, -0.16f, layoutBounds.center.z);
+                CreateGround(_environmentRoot, center, width, depth);
+                CreateGrid(_environmentRoot, new Vector3(center.x, 0.015f, center.z), width, depth, 2f);
+            }
+
             CreateLineLayouts(config);
+            RebuildCustomWalls();
+            var environmentBounds = CalculateRendererBounds(_environmentRoot);
             if (createReflectionProbe)
             {
-                CreateReflectionProbe(new Vector3(center.x, 4f, center.z), new Vector3(width, 12f, depth));
+                var probeCenter = environmentBounds.center;
+                probeCenter.y = Mathf.Max(4f, environmentBounds.center.y + 2f);
+                var probeSize = environmentBounds.size;
+                probeSize.x = Mathf.Max(54f, probeSize.x + 12f);
+                probeSize.y = Mathf.Max(12f, probeSize.y + 8f);
+                probeSize.z = Mathf.Max(54f, probeSize.z + 12f);
+                CreateReflectionProbe(probeCenter, probeSize);
             }
             ApplyVisualProfile();
             ApplyEnvironmentVisibility();
@@ -232,6 +283,36 @@ namespace HeatTreatment.DigitalTwin.Runtime
             if (_reflectionProbe == null || !isActiveAndEnabled) return;
             try { _reflectionProbe.RenderProbe(); }
             catch (Exception exception) { Debug.LogWarning($"[FactoryEnvironment] Reflection probe skipped: {exception.Message}"); }
+        }
+
+        private static void ApplyLayoutTransform(Transform target, JObject layout)
+        {
+            if (target == null) return;
+            var transformConfig = layout?["transform"] as JObject;
+            if (transformConfig == null)
+            {
+                target.localPosition = Vector3.zero;
+                target.localRotation = Quaternion.identity;
+                return;
+            }
+            target.localPosition = new Vector3(
+                transformConfig.Value<float?>("x") ?? 0f,
+                transformConfig.Value<float?>("y") ?? 0f,
+                transformConfig.Value<float?>("z") ?? 0f
+            );
+            var rotationY = transformConfig.Value<float?>("rotationY")
+                ?? transformConfig.Value<float?>("rotation_y")
+                ?? 0f;
+            target.localRotation = Quaternion.Euler(0f, -rotationY, 0f);
+        }
+
+        private static Bounds CalculateRendererBounds(Transform root)
+        {
+            var renderers = root != null ? root.GetComponentsInChildren<Renderer>() : Array.Empty<Renderer>();
+            if (renderers.Length == 0) return new Bounds(Vector3.zero, new Vector3(54f, 12f, 54f));
+            var bounds = renderers[0].bounds;
+            for (var index = 1; index < renderers.Length; index += 1) bounds.Encapsulate(renderers[index].bounds);
+            return bounds;
         }
 
         private void ConfigureSky()
@@ -367,15 +448,21 @@ namespace HeatTreatment.DigitalTwin.Runtime
 
         private void ApplyEnvironmentVisibility()
         {
-            if (_gridObject != null) _gridObject.SetActive(_environmentConfig.ShowGrid);
-            if (_wallsRoot != null) _wallsRoot.SetActive(_environmentConfig.ShowWalls);
+            foreach (var grid in _gridObjects.Where(item => item != null))
+            {
+                grid.SetActive(_environmentConfig.ShowGrid);
+            }
+            foreach (var wallsRoot in _wallsRoots.Where(item => item != null))
+            {
+                wallsRoot.SetActive(_environmentConfig.ShowWalls);
+            }
         }
 
         private static NativeEnvironmentConfig NormalizeEnvironmentConfig(NativeEnvironmentConfig value)
         {
             var defaults = new NativeEnvironmentConfig();
             var config = value ?? defaults;
-            config.Version = 2;
+            config.Version = 3;
             config.Preset = string.IsNullOrWhiteSpace(config.Preset) ? "custom" : config.Preset.Trim();
             config.SceneBrightness = Mathf.Clamp(config.SceneBrightness, 0.8f, 1.6f);
             config.AmbientIntensity = Mathf.Clamp(config.AmbientIntensity, 0.2f, 2.5f);
@@ -415,6 +502,8 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             wall.Id = string.IsNullOrWhiteSpace(wall.Id) ? $"wall_{index + 1}" : wall.Id.Trim();
             wall.Name = string.IsNullOrWhiteSpace(wall.Name) ? $"围墙 {index + 1}" : wall.Name.Trim();
+            wall.WorkshopId = (wall.WorkshopId ?? string.Empty).Trim();
+            wall.CoordinateSpace = "workshop_local";
             wall.Style = NormalizeWallStyle(wall.Style);
             wall.X = Mathf.Clamp(wall.X, -1000f, 1000f);
             wall.BaseY = Mathf.Clamp(wall.BaseY, -10f, 50f);
@@ -464,7 +553,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             );
         }
 
-        private void CreateGround(Vector3 center, float width, float depth)
+        private void CreateGround(Transform parent, Vector3 center, float width, float depth)
         {
             _groundMaterial = _groundMaterial ?? CreateLitMaterial(
                 "Factory epoxy floor",
@@ -474,15 +563,15 @@ namespace HeatTreatment.DigitalTwin.Runtime
             );
             var ground = GameObject.CreatePrimitive(PrimitiveType.Cube);
             ground.name = "Factory Floor";
-            ground.transform.SetParent(_environmentRoot, false);
-            ground.transform.position = center;
+            ground.transform.SetParent(parent, false);
+            ground.transform.localPosition = center;
             ground.transform.localScale = new Vector3(width, 0.3f, depth);
             ground.GetComponent<Renderer>().sharedMaterial = _groundMaterial;
             var collider = ground.GetComponent<Collider>();
             if (collider != null) Destroy(collider);
         }
 
-        private void CreateGrid(Vector3 center, float width, float depth, float spacing)
+        private void CreateGrid(Transform parent, Vector3 center, float width, float depth, float spacing)
         {
             _gridMaterial = _gridMaterial ?? CreateUnlitMaterial("Factory grid", GridColor());
             var vertices = new List<Vector3>();
@@ -509,19 +598,17 @@ namespace HeatTreatment.DigitalTwin.Runtime
             mesh.SetIndices(indices, MeshTopology.Lines, 0);
             mesh.RecalculateBounds();
             var grid = new GameObject("Factory Grid");
-            grid.transform.SetParent(_environmentRoot, false);
+            grid.transform.SetParent(parent, false);
             grid.AddComponent<MeshFilter>().sharedMesh = mesh;
             grid.AddComponent<MeshRenderer>().sharedMaterial = _gridMaterial;
-            _gridObject = grid;
+            _gridObjects.Add(grid);
         }
 
         private void RebuildCustomWalls()
         {
             if (_environmentRoot == null) return;
-            if (_wallsRoot != null) Destroy(_wallsRoot);
-
-            _wallsRoot = new GameObject("Factory Custom Walls");
-            _wallsRoot.transform.SetParent(_environmentRoot, false);
+            foreach (var previousRoot in _wallsRoots.Where(item => item != null)) Destroy(previousRoot);
+            _wallsRoots.Clear();
             _wallMaterial = _wallMaterial ?? CreateLitMaterial(
                 "Factory wall default",
                 WallColor(),
@@ -535,17 +622,40 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 0.46f
             );
 
-            foreach (var wall in _environmentConfig.Walls.Where(item => item.Enabled))
+            var firstWorkshopId = _factoryConfig?.Workshops?.FirstOrDefault()?.Id ?? string.Empty;
+            foreach (var pair in _workshopEnvironmentRoots)
             {
-                CreateCustomWall(wall);
+                var wallsRoot = new GameObject($"Custom Walls - {pair.Key}");
+                wallsRoot.transform.SetParent(pair.Value, false);
+                _wallsRoots.Add(wallsRoot);
+                foreach (var wall in _environmentConfig.Walls.Where(item => (
+                    item.Enabled
+                    && (item.WorkshopId == pair.Key
+                        || (string.IsNullOrWhiteSpace(item.WorkshopId) && pair.Key == firstWorkshopId))
+                )))
+                {
+                    CreateCustomWall(wallsRoot.transform, wall);
+                }
+                wallsRoot.SetActive(_environmentConfig.ShowWalls);
             }
-            _wallsRoot.SetActive(_environmentConfig.ShowWalls);
+
+            if (_workshopEnvironmentRoots.Count == 0)
+            {
+                var wallsRoot = new GameObject("Factory Custom Walls");
+                wallsRoot.transform.SetParent(_environmentRoot, false);
+                _wallsRoots.Add(wallsRoot);
+                foreach (var wall in _environmentConfig.Walls.Where(item => item.Enabled))
+                {
+                    CreateCustomWall(wallsRoot.transform, wall);
+                }
+                wallsRoot.SetActive(_environmentConfig.ShowWalls);
+            }
         }
 
-        private void CreateCustomWall(WallSegmentConfig wall)
+        private void CreateCustomWall(Transform parent, WallSegmentConfig wall)
         {
             var wallRoot = new GameObject($"Custom Wall - {wall.Name}");
-            wallRoot.transform.SetParent(_wallsRoot.transform, false);
+            wallRoot.transform.SetParent(parent, false);
             wallRoot.transform.localPosition = new Vector3(wall.X, wall.BaseY, wall.Z);
             wallRoot.transform.localRotation = Quaternion.Euler(0f, wall.RotationY, 0f);
 
@@ -633,39 +743,36 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 0.82f,
                 0.52f
             );
-            var lines = config.Workshops
-                .SelectMany(workshop => workshop.Lines ?? new List<LineDto>())
-                .ToList();
-            for (var lineIndex = 0; lineIndex < lines.Count; lineIndex += 1)
+            var lines = config.Workshops.SelectMany(workshop => workshop.Lines ?? new List<LineDto>());
+            foreach (var line in lines)
             {
-                var line = lines[lineIndex];
-                // Keep the native floor guides on the exact same world-coordinate convention
-                // as the admin composer/Web compatibility layer: each global line is spaced
-                // 16 metres along negative Z, while the lane/rail value is a relative offset.
-                var lineBaseZ = -lineIndex * 16f;
+                var parent = !string.IsNullOrWhiteSpace(line.Id)
+                    && _lineEnvironmentRoots.TryGetValue(line.Id, out var lineRoot)
+                        ? lineRoot
+                        : _environmentRoot;
                 var layout = line.LayoutObject;
                 foreach (var rail in layout["rails"] as JArray ?? new JArray())
                 {
                     var length = rail.Value<float?>("length") ?? 60f;
-                    var z = lineBaseZ + (rail.Value<float?>("offsetZ") ?? 0f);
-                    CreateRailPair(line.Name, length, z);
+                    var z = rail.Value<float?>("offsetZ") ?? 0f;
+                    CreateRailPair(parent, line.Name, length, z);
                 }
                 foreach (var lane in layout["lanes"] as JArray ?? new JArray())
                 {
                     var length = lane.Value<float?>("length") ?? 60f;
-                    var z = lineBaseZ + (lane.Value<float?>("offsetZ") ?? 0f);
-                    CreateLaneMarker(line.Name, length, z);
+                    var z = lane.Value<float?>("offsetZ") ?? 0f;
+                    CreateLaneMarker(parent, line.Name, length, z);
                 }
             }
         }
 
-        private void CreateRailPair(string lineName, float length, float z)
+        private void CreateRailPair(Transform parent, string lineName, float length, float z)
         {
             for (var side = -1; side <= 1; side += 2)
             {
                 var rail = GameObject.CreatePrimitive(PrimitiveType.Cube);
                 rail.name = $"{lineName} Rail";
-                rail.transform.SetParent(_environmentRoot, false);
+                rail.transform.SetParent(parent, false);
                 rail.transform.localPosition = new Vector3(0f, 0.08f, z + side * 0.68f);
                 rail.transform.localScale = new Vector3(length, 0.12f, 0.11f);
                 rail.GetComponent<Renderer>().sharedMaterial = _railMaterial;
@@ -674,14 +781,14 @@ namespace HeatTreatment.DigitalTwin.Runtime
             }
         }
 
-        private void CreateLaneMarker(string lineName, float length, float z)
+        private void CreateLaneMarker(Transform parent, string lineName, float length, float z)
         {
             var markerMaterial = CreateUnlitMaterial("Lane marker", new Color(0.15f, 0.42f, 0.55f));
             for (var side = -1; side <= 1; side += 2)
             {
                 var marker = GameObject.CreatePrimitive(PrimitiveType.Cube);
                 marker.name = $"{lineName} Lane Marker";
-                marker.transform.SetParent(_environmentRoot, false);
+                marker.transform.SetParent(parent, false);
                 marker.transform.localPosition = new Vector3(0f, 0.02f, z + side * 2.7f);
                 marker.transform.localScale = new Vector3(length, 0.018f, 0.045f);
                 marker.GetComponent<Renderer>().sharedMaterial = markerMaterial;

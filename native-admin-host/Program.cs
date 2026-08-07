@@ -11,6 +11,8 @@ internal sealed record HostOptions(
     IntPtr ParentWindowHandle,
     string? UserDataFolder,
     string? FixedRuntimeFolder,
+    string? DesktopControlUrl,
+    string? DesktopControlToken,
     bool StartInDashboardMode
 )
 {
@@ -24,6 +26,8 @@ internal sealed record HostOptions(
         var parentHandle = IntPtr.Zero;
         string? userData = null;
         string? fixedRuntime = null;
+        string? desktopControlUrl = null;
+        string? desktopControlToken = null;
         var startInDashboardMode = false;
 
         for (var index = 0; index < args.Length; index += 1)
@@ -40,11 +44,22 @@ internal sealed record HostOptions(
                     break;
                 case "--user-data": userData = value; index += 1; break;
                 case "--fixed-runtime": fixedRuntime = value; index += 1; break;
+                case "--desktop-control-url": desktopControlUrl = value; index += 1; break;
+                case "--desktop-control-token": desktopControlToken = value; index += 1; break;
                 case "--dashboard-mode": startInDashboardMode = true; break;
             }
         }
 
-        return new HostOptions(url, parentPid, parentHandle, userData, fixedRuntime, startInDashboardMode);
+        return new HostOptions(
+            url,
+            parentPid,
+            parentHandle,
+            userData,
+            fixedRuntime,
+            desktopControlUrl,
+            desktopControlToken,
+            startInDashboardMode
+        );
     }
 }
 
@@ -61,11 +76,20 @@ internal static class Program
         using var mutex = new Mutex(true, options.MutexName, out var isOwner);
         if (!isOwner)
         {
-            SignalExistingHost(options.PipeName, "show");
+            SignalExistingHost(options.PipeName, options.StartInDashboardMode ? "restore_dashboard" : "show");
             return;
         }
 
         ApplicationConfiguration.Initialize();
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, eventArgs) => LogUnhandledException("UI 线程异常", eventArgs.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (_, eventArgs) =>
+        {
+            if (eventArgs.ExceptionObject is Exception exception)
+            {
+                LogUnhandledException("未处理的宿主异常", exception);
+            }
+        };
         using var form = new AdminPanelForm(options);
         Application.Run(form);
     }
@@ -99,6 +123,27 @@ internal static class Program
         {
             // A previous process may have exited between mutex acquisition and the pipe connect.
             // The next menu click will start a fresh host.
+        }
+    }
+
+    private static void LogUnhandledException(string prefix, Exception exception)
+    {
+        try
+        {
+            var directory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "heat-treatment-digital-twin-desktop",
+                "logs"
+            );
+            Directory.CreateDirectory(directory);
+            File.AppendAllText(
+                Path.Combine(directory, "admin-host.log"),
+                $"[{DateTimeOffset.Now:O}] {prefix}: {exception}\n"
+            );
+        }
+        catch
+        {
+            // Error reporting must never become a second failure.
         }
     }
 }

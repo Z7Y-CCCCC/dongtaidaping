@@ -32,12 +32,19 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private const uint MonitorDefaultToNearest = 0x00000002;
         private const uint SwpFrameChanged = 0x0020;
         private const uint SwpShowWindow = 0x0040;
+        private const int DwmWindowCornerPreference = 33;
+        private const int DwmWindowCornerDoNotRound = 1;
+        private const int DwmWindowCornerRound = 2;
 
         private static readonly IntPtr HwndTop = IntPtr.Zero;
 
         private IntPtr _windowHandle;
         private int _openAdminRequested;
         private bool _installed;
+        private int _lastCornerWidth = -1;
+        private int _lastCornerHeight = -1;
+        private bool _lastCornerMaximized;
+        private float _nextCornerRefreshTime;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct NativeRect
@@ -97,6 +104,33 @@ namespace HeatTreatment.DigitalTwin.Runtime
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool DrawMenuBar(IntPtr window);
+
+        [DllImport("dwmapi.dll", PreserveSig = true)]
+        private static extern int DwmSetWindowAttribute(
+            IntPtr window,
+            int attribute,
+            ref int value,
+            int valueSize
+        );
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern IntPtr CreateRoundRectRgn(
+            int left,
+            int top,
+            int right,
+            int bottom,
+            int ellipseWidth,
+            int ellipseHeight
+        );
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int SetWindowRgn(IntPtr window, IntPtr region, bool redraw);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern bool DeleteObject(IntPtr handle);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetDpiForWindow(IntPtr window);
 #endif
 
         public void Configure(bool maximizeOnStart)
@@ -121,6 +155,11 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private void Update()
         {
 #if UNITY_STANDALONE_WIN && !UNITY_EDITOR
+            if (_installed && Time.unscaledTime >= _nextCornerRefreshTime)
+            {
+                _nextCornerRefreshTime = Time.unscaledTime + 0.2f;
+                RefreshWindowCorners(false);
+            }
             if (Input.GetKeyDown(KeyCode.F10)) Interlocked.Exchange(ref _openAdminRequested, 1);
             if (Interlocked.Exchange(ref _openAdminRequested, 0) == 1)
             {
@@ -137,8 +176,15 @@ namespace HeatTreatment.DigitalTwin.Runtime
             if (_windowHandle == IntPtr.Zero || !GetWindowRect(_windowHandle, out var originalBounds)) return;
 
             var style = GetWindowStyle(_windowHandle);
-            style &= ~(WsChild | WsCaption | WsThickFrame | WsMinimizeBox | WsMaximizeBox | WsSysMenu);
-            style |= WsPopup | WsVisible | WsClipChildren | WsClipSiblings;
+            style &= ~(WsChild | WsCaption);
+            style |= WsPopup
+                | WsVisible
+                | WsClipChildren
+                | WsClipSiblings
+                | WsThickFrame
+                | WsMinimizeBox
+                | WsMaximizeBox
+                | WsSysMenu;
             SetWindowStyle(_windowHandle, style);
             SetMenu(_windowHandle, IntPtr.Zero);
             DrawMenuBar(_windowHandle);
@@ -161,7 +207,80 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 SwpFrameChanged | SwpShowWindow
             );
             _installed = true;
+            RefreshWindowCorners(true);
             Debug.Log("[NativeWindowMenu] Borderless application shell installed; F10 opens the admin tab.");
+        }
+
+        private void RefreshWindowCorners(bool force)
+        {
+            if (_windowHandle == IntPtr.Zero || !GetWindowRect(_windowHandle, out var bounds)) return;
+            var monitor = MonitorFromWindow(_windowHandle, MonitorDefaultToNearest);
+            var maximized = false;
+            var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
+            if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info))
+            {
+                maximized = Math.Abs(bounds.Left - info.WorkArea.Left) <= 2
+                    && Math.Abs(bounds.Top - info.WorkArea.Top) <= 2
+                    && Math.Abs(bounds.Right - info.WorkArea.Right) <= 2
+                    && Math.Abs(bounds.Bottom - info.WorkArea.Bottom) <= 2;
+            }
+
+            if (!force
+                && bounds.Width == _lastCornerWidth
+                && bounds.Height == _lastCornerHeight
+                && maximized == _lastCornerMaximized)
+            {
+                return;
+            }
+            _lastCornerWidth = bounds.Width;
+            _lastCornerHeight = bounds.Height;
+            _lastCornerMaximized = maximized;
+
+            var preference = maximized ? DwmWindowCornerDoNotRound : DwmWindowCornerRound;
+            try
+            {
+                DwmSetWindowAttribute(
+                    _windowHandle,
+                    DwmWindowCornerPreference,
+                    ref preference,
+                    sizeof(int)
+                );
+            }
+            catch
+            {
+                // The explicit window region below is the compatibility fallback.
+            }
+
+            if (maximized)
+            {
+                SetWindowRgn(_windowHandle, IntPtr.Zero, true);
+                return;
+            }
+
+            var dpi = 96u;
+            try
+            {
+                var detected = GetDpiForWindow(_windowHandle);
+                if (detected > 0) dpi = detected;
+            }
+            catch
+            {
+                // Windows versions without GetDpiForWindow use 96 DPI.
+            }
+            var radius = Math.Max(12, (int)Math.Round(12d * dpi / 96d));
+            var region = CreateRoundRectRgn(
+                0,
+                0,
+                Math.Max(1, bounds.Width) + 1,
+                Math.Max(1, bounds.Height) + 1,
+                radius * 2,
+                radius * 2
+            );
+            if (region == IntPtr.Zero) return;
+            if (SetWindowRgn(_windowHandle, region, true) == 0)
+            {
+                DeleteObject(region);
+            }
         }
 
         private static long GetWindowStyle(IntPtr window)

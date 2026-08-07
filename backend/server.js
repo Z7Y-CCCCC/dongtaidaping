@@ -72,6 +72,10 @@ app.use('/api/platform', require('./routes/platform'));
 const runtimeController = { lanDisplay: null };
 app.use('/api/system/runtime', require('./routes/runtime')(runtimeController));
 
+// 局域网电视发现（SSDP）与 DLNA 一键投屏，同样只对本机开放。
+const castController = { discovery: null, screenCast: null };
+app.use('/api/system/cast', require('./routes/cast')(castController));
+
 const storage = multer.diskStorage({
     destination: uploadsDir,
     filename: (req, file, cb) => {
@@ -486,6 +490,13 @@ async function startServer() {
     const lanDisplay = new LanDisplayService({ app, wsServer, primaryPort: PORT });
     runtimeController.lanDisplay = lanDisplay;
 
+    const CastDiscoveryService = require('./services/castDiscovery');
+    const ScreenCastService = require('./services/screenCast');
+    const castDiscovery = new CastDiscoveryService();
+    const screenCast = new ScreenCastService({ port: Number(process.env.CAST_STREAM_PORT) || 8788 });
+    castController.discovery = castDiscovery;
+    castController.screenCast = screenCast;
+
     const DataEngine = require('./services/dataEngine');
     const dataEngine = new DataEngine(wsServer);
     global.dataEngine = dataEngine;
@@ -497,6 +508,7 @@ async function startServer() {
         const forceExit = setTimeout(() => process.exit(1), 12000);
         forceExit.unref?.();
         try { dataEngine.stop(); } catch (e) { /* ignore */ }
+        try { await screenCast.close(); } catch (e) { /* ignore */ }
         try { await lanDisplay.stop(); } catch (e) { /* ignore */ }
         try { wsServer.close(); } catch (e) { /* ignore */ }
         httpServer.close();
@@ -547,6 +559,14 @@ async function startServer() {
                     console.error('[DataEngine] 启动失败:', error.message);
                     console.error('[DataEngine] 可在后台“数据库连接”中修改并测试数据库配置。');
                 });
+            // 提前探测 ffmpeg 和局域网电视，后台页面一打开就能看到真实状态。
+            screenCast.resolveFfmpeg()
+                .then(found => {
+                    if (found) console.log(`[投屏] 已找到屏幕编码器: ${found}`);
+                    else console.log('[投屏] 未找到 ffmpeg，DLNA 一键投屏不可用；二维码网页投屏不受影响。');
+                })
+                .catch(() => {});
+            castDiscovery.scan({ timeoutMs: 3500 }).catch(() => {});
         }, 1000);
     });
 }

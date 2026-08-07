@@ -6,12 +6,14 @@ param(
     [string]$MySqlPassword = 'root',
     [string]$MySqlDatabase = 'dongtai_daping',
     [int]$BackendPort = 3001,
+    [int]$FrontendPort = 3423,
     [switch]$BackendOnly
 )
 
 $ErrorActionPreference = 'Stop'
 $projectDir = Split-Path -Parent $PSScriptRoot
 $backendDir = Join-Path $projectDir 'backend'
+$frontendDir = Join-Path $projectDir 'frontend'
 $tmpDir = Join-Path $projectDir 'tmp'
 $unityDir = Join-Path $projectDir 'unity-client\Builds\Windows'
 $unityExe = Join-Path $unityDir 'HeatTreatmentDigitalTwin.exe'
@@ -20,9 +22,12 @@ $adminHostExe = Join-Path $adminHostDir 'HeatTreatmentAdminHost.exe'
 $adminHostProjectDir = Join-Path $projectDir 'native-admin-host'
 $adminHostBuildScript = Join-Path $projectDir 'desktop\scripts\build-native-admin-host.cjs'
 $origin = "http://127.0.0.1:$BackendPort"
+$frontendOrigin = "http://127.0.0.1:$FrontendPort"
 $webSocketUrl = "ws://127.0.0.1:$BackendPort/ws"
 $backendOut = Join-Path $tmpDir 'native-dev-backend.out.log'
 $backendErr = Join-Path $tmpDir 'native-dev-backend.err.log'
+$frontendOut = Join-Path $tmpDir 'native-dev-frontend.out.log'
+$frontendErr = Join-Path $tmpDir 'native-dev-frontend.err.log'
 $unityLog = Join-Path $tmpDir 'native-dev-unity.log'
 
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
@@ -52,15 +57,28 @@ function Read-BackendHealth {
     }
 }
 
-function Assert-OriginalWebDatabase($health) {
-    if (-not $health) { throw 'Backend health check did not respond.' }
+function Test-AdminPage([string]$url) {
+    try {
+        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 3
+        return $response.StatusCode -eq 200 -and $response.Content -notmatch 'Cannot GET /admin'
+    } catch {
+        return $false
+    }
+}
+
+function Test-OriginalWebDatabase($health) {
+    if (-not $health) { return $false }
     $config = $health.db.config
-    $matches = $health.db.connected -eq $true `
+    return $health.db.connected -eq $true `
         -and $health.db.type -eq 'mysql' `
         -and $config.host -eq $MySqlHost `
         -and [int]$config.port -eq $MySqlPort `
         -and $config.database -eq $MySqlDatabase
-    if (-not $matches) {
+}
+
+function Assert-OriginalWebDatabase($health) {
+    if (-not $health) { throw 'Backend health check did not respond.' }
+    if (-not (Test-OriginalWebDatabase $health)) {
         throw "Port $BackendPort is occupied by a backend that is not connected to the original Web MySQL database (expected $MySqlHost`:$MySqlPort/$MySqlDatabase)."
     }
 }
@@ -121,7 +139,7 @@ if ($health) {
             throw "Backend exited with code $($backendProcess.ExitCode). See $backendErr"
         }
         $health = Read-BackendHealth
-    } while (-not $health -and (Get-Date) -lt $deadline)
+    } while (-not (Test-OriginalWebDatabase $health) -and (Get-Date) -lt $deadline)
     Assert-OriginalWebDatabase $health
     Write-Host "Backend started at $origin (PID $($backendProcess.Id))."
 }
@@ -135,6 +153,41 @@ $devices = @(
 )
 $pointCount = (@($devices | ForEach-Object { @($_.dataPoints) }) | Measure-Object).Count
 Write-Host "Loaded original Web configuration: $($devices.Count) devices, $pointCount PLC data points."
+
+$frontendProcess = $null
+$adminUrl = "$origin/admin"
+if (Test-AdminPage "$frontendOrigin/admin") {
+    $adminUrl = "$frontendOrigin/admin"
+    Write-Host "Reusing frontend at $frontendOrigin."
+} elseif (Test-AdminPage $adminUrl) {
+    Write-Host "Using backend-hosted frontend at $origin."
+} else {
+    $viteEntry = Join-Path $frontendDir 'node_modules\vite\bin\vite.js'
+    if (-not (Test-Path $viteEntry)) {
+        throw "后台 API 已启动，但没有可用的管理页面。请先在 $frontendDir 执行 npm install。"
+    }
+    $frontendProcess = Start-Process `
+        -FilePath $node.Source `
+        -ArgumentList @($viteEntry, '--host', '127.0.0.1', '--port', [string]$FrontendPort) `
+        -WorkingDirectory $frontendDir `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $frontendOut `
+        -RedirectStandardError $frontendErr `
+        -PassThru
+
+    $frontendDeadline = (Get-Date).AddSeconds(30)
+    do {
+        Start-Sleep -Milliseconds 300
+        if ($frontendProcess.HasExited) {
+            throw "Frontend exited with code $($frontendProcess.ExitCode). See $frontendErr"
+        }
+    } while (-not (Test-AdminPage "$frontendOrigin/admin") -and (Get-Date) -lt $frontendDeadline)
+    if (-not (Test-AdminPage "$frontendOrigin/admin")) {
+        throw "Frontend startup timed out. See $frontendErr"
+    }
+    $adminUrl = "$frontendOrigin/admin"
+    Write-Host "Frontend started at $frontendOrigin (PID $($frontendProcess.Id))."
+}
 
 if (-not $BackendOnly) {
     if (-not (Test-Path $unityExe)) {
@@ -154,7 +207,7 @@ if (-not $BackendOnly) {
             ALL_PROXY = ''
             DIGITAL_TWIN_BACKEND_HTTP_URL = $origin
             DIGITAL_TWIN_BACKEND_WEBSOCKET_URL = $webSocketUrl
-            DIGITAL_TWIN_ADMIN_URL = "$origin/admin"
+            DIGITAL_TWIN_ADMIN_URL = $adminUrl
             DIGITAL_TWIN_ADMIN_HOST_PATH = $adminHostExe
             DIGITAL_TWIN_ADMIN_FIXED_RUNTIME = (Join-Path $adminHostDir 'WebView2Runtime')
             DIGITAL_TWIN_MAXIMIZE_WINDOW = 'false'
@@ -178,9 +231,11 @@ if (-not $BackendOnly) {
 
 [pscustomobject]@{
     BackendUrl = $origin
+    AdminUrl = $adminUrl
     Database = "$MySqlHost`:$MySqlPort/$MySqlDatabase"
     DeviceCount = $devices.Count
     DataPointCount = $pointCount
     BackendPid = if ($backendProcess) { $backendProcess.Id } else { $null }
+    FrontendPid = if ($frontendProcess) { $frontendProcess.Id } else { $null }
     UnityPid = if ($unityProcess) { $unityProcess.Id } elseif ($existingUnity) { $existingUnity.ProcessId } else { $null }
 }

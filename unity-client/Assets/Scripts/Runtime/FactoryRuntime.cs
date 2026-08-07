@@ -34,6 +34,8 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private readonly Dictionary<string, DeviceStatusVisual> _visuals = new Dictionary<string, DeviceStatusVisual>();
         private readonly Dictionary<string, JObject> _latestDeviceFrames = new Dictionary<string, JObject>();
         private readonly Dictionary<string, Transform> _deviceRoots = new Dictionary<string, Transform>();
+        private readonly Dictionary<string, Transform> _workshopRoots = new Dictionary<string, Transform>();
+        private readonly Dictionary<string, Transform> _lineRoots = new Dictionary<string, Transform>();
         private readonly Dictionary<string, string> _deviceModelTypes = new Dictionary<string, string>();
         private readonly Dictionary<string, string> _deviceLineIds = new Dictionary<string, string>();
         private readonly Dictionary<string, string> _deviceWorkshopIds = new Dictionary<string, string>();
@@ -232,17 +234,21 @@ namespace HeatTreatment.DigitalTwin.Runtime
             );
         }
 
-        private static List<DevicePlacement> CreateHierarchy(FactoryConfigDto config, Transform root)
+        private List<DevicePlacement> CreateHierarchy(FactoryConfigDto config, Transform root)
         {
             var result = new List<DevicePlacement>();
             foreach (var workshop in config.Workshops ?? new List<WorkshopDto>())
             {
                 var workshopRoot = new GameObject(string.IsNullOrWhiteSpace(workshop.Name) ? workshop.Id : workshop.Name);
                 workshopRoot.transform.SetParent(root, false);
+                ApplySpatialTransform(workshopRoot.transform, workshop.LayoutObject);
+                if (!string.IsNullOrWhiteSpace(workshop.Id)) _workshopRoots[workshop.Id] = workshopRoot.transform;
                 foreach (var line in workshop.Lines ?? new List<LineDto>())
                 {
                     var lineRoot = new GameObject(string.IsNullOrWhiteSpace(line.Name) ? line.Id : line.Name);
                     lineRoot.transform.SetParent(workshopRoot.transform, false);
+                    ApplySpatialTransform(lineRoot.transform, line.LayoutObject);
+                    if (!string.IsNullOrWhiteSpace(line.Id)) _lineRoots[line.Id] = lineRoot.transform;
                     foreach (var device in line.Devices ?? new List<DeviceDto>())
                     {
                         result.Add(new DevicePlacement
@@ -256,16 +262,50 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 }
                 foreach (var device in workshop.Devices ?? new List<DeviceDto>())
                 {
+                    var configuredLineId = ResolveDeviceLineId(device);
                     result.Add(new DevicePlacement
                     {
                         Device = device,
-                        Parent = workshopRoot.transform,
+                        Parent = !string.IsNullOrWhiteSpace(configuredLineId)
+                            && _lineRoots.TryGetValue(configuredLineId, out var configuredLineRoot)
+                                ? configuredLineRoot
+                                : workshopRoot.transform,
                         WorkshopId = workshop.Id,
-                        LineId = device.LineId
+                        LineId = configuredLineId
                     });
                 }
             }
             return result;
+        }
+
+        private static void ApplySpatialTransform(Transform target, JObject layout)
+        {
+            if (target == null) return;
+            var transformConfig = layout?["transform"] as JObject;
+            if (transformConfig == null)
+            {
+                target.localPosition = Vector3.zero;
+                target.localRotation = Quaternion.identity;
+                return;
+            }
+            var x = transformConfig.Value<float?>("x") ?? 0f;
+            var y = transformConfig.Value<float?>("y") ?? 0f;
+            var z = transformConfig.Value<float?>("z") ?? 0f;
+            var rotationY = transformConfig.Value<float?>("rotationY")
+                ?? transformConfig.Value<float?>("rotation_y")
+                ?? 0f;
+            target.localPosition = new Vector3(x, y, z);
+            target.localRotation = Quaternion.Euler(0f, -rotationY, 0f);
+        }
+
+        private static string ResolveDeviceLineId(DeviceDto device)
+        {
+            if (device == null) return string.Empty;
+            if (!string.IsNullOrWhiteSpace(device.LineId)) return device.LineId;
+            var config = device.InstanceConfigObject;
+            return config.Value<string>("railLineId")
+                ?? config.Value<string>("laneLineId")
+                ?? string.Empty;
         }
 
         private void OnRealtimeMessage(JObject message)
@@ -337,15 +377,19 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 : payload["devices"]?.ToObject<List<DeviceDto>>() ?? new List<DeviceDto>();
             if (devices.Count == 0) devices = EnumerateConfigDevices(_config).ToList();
 
+            var includeLayout = reset || payload.Value<bool?>("includeLayout") == true;
+            var previewConfig = includeLayout
+                ? (reset ? _config : BuildPreviewConfig(payload["workshops"] as JArray, payload["lines"] as JArray))
+                : null;
+            if (previewConfig != null) ApplyHierarchyTransforms(previewConfig);
+
             foreach (var device in devices)
             {
                 ApplyPreviewDevice(device);
             }
 
-            var includeLayout = reset || payload.Value<bool?>("includeLayout") == true;
             if (includeLayout)
             {
-                var previewConfig = reset ? _config : BuildPreviewConfig(payload["lines"] as JArray);
                 _environment.RebuildFactoryFloor(previewConfig, devices, reset);
                 if (reset) _environment.RefreshReflectionProbe();
             }
@@ -371,6 +415,21 @@ namespace HeatTreatment.DigitalTwin.Runtime
             var configuredWorkshop = device.InstanceConfigObject.Value<string>("workshop_id")
                 ?? device.InstanceConfigObject.Value<string>("workshopId");
             if (!string.IsNullOrWhiteSpace(configuredWorkshop)) _deviceWorkshopIds[device.Id] = configuredWorkshop;
+
+            var configuredLineId = ResolveDeviceLineId(device);
+            if (!string.IsNullOrWhiteSpace(configuredLineId))
+            {
+                _deviceLineIds[device.Id] = configuredLineId;
+                var lineWorkshop = FindWorkshopForLine(configuredLineId);
+                if (!string.IsNullOrWhiteSpace(lineWorkshop)) _deviceWorkshopIds[device.Id] = lineWorkshop;
+            }
+            Transform nextParent = null;
+            if (!string.IsNullOrWhiteSpace(configuredLineId)) _lineRoots.TryGetValue(configuredLineId, out nextParent);
+            if (nextParent == null && !string.IsNullOrWhiteSpace(configuredWorkshop))
+            {
+                _workshopRoots.TryGetValue(configuredWorkshop, out nextParent);
+            }
+            if (nextParent != null && root.parent != nextParent) root.SetParent(nextParent, false);
 
             var nextModelType = device.ModelType ?? string.Empty;
             if (_deviceModelTypes.TryGetValue(device.Id, out var currentModelType)
@@ -434,23 +493,49 @@ namespace HeatTreatment.DigitalTwin.Runtime
             }
         }
 
-        private FactoryConfigDto BuildPreviewConfig(JArray linePatches)
+        private FactoryConfigDto BuildPreviewConfig(JArray workshopPatches, JArray linePatches)
         {
             var clone = JsonConvert.DeserializeObject<FactoryConfigDto>(JsonConvert.SerializeObject(_config))
                 ?? _config;
-            if (linePatches == null) return clone;
+            var workshopsById = (clone.Workshops ?? new List<WorkshopDto>())
+                .Where(workshop => !string.IsNullOrWhiteSpace(workshop.Id))
+                .ToDictionary(workshop => workshop.Id, workshop => workshop);
+            foreach (var token in workshopPatches ?? new JArray())
+            {
+                if (!(token is JObject patch)) continue;
+                var workshopId = patch.Value<string>("id");
+                if (string.IsNullOrWhiteSpace(workshopId) || !workshopsById.TryGetValue(workshopId, out var workshop)) continue;
+                workshop.Layout = (patch["layout_json"] ?? patch["layout"])?.DeepClone();
+            }
             var linesById = (clone.Workshops ?? new List<WorkshopDto>())
                 .SelectMany(workshop => workshop.Lines ?? new List<LineDto>())
                 .Where(line => !string.IsNullOrWhiteSpace(line.Id))
                 .ToDictionary(line => line.Id, line => line);
-            foreach (var token in linePatches)
+            foreach (var token in linePatches ?? new JArray())
             {
                 if (!(token is JObject patch)) continue;
                 var lineId = patch.Value<string>("id");
                 if (string.IsNullOrWhiteSpace(lineId) || !linesById.TryGetValue(lineId, out var line)) continue;
                 line.Layout = (patch["layout_json"] ?? patch["layout"])?.DeepClone();
+                var workshopId = patch.Value<string>("workshop_id");
+                if (!string.IsNullOrWhiteSpace(workshopId)) line.WorkshopId = workshopId;
             }
             return clone;
+        }
+
+        private void ApplyHierarchyTransforms(FactoryConfigDto config)
+        {
+            foreach (var workshop in config?.Workshops ?? new List<WorkshopDto>())
+            {
+                if (!_workshopRoots.TryGetValue(workshop.Id ?? string.Empty, out var workshopRoot)) continue;
+                ApplySpatialTransform(workshopRoot, workshop.LayoutObject);
+                foreach (var line in workshop.Lines ?? new List<LineDto>())
+                {
+                    if (!_lineRoots.TryGetValue(line.Id ?? string.Empty, out var lineRoot)) continue;
+                    if (lineRoot.parent != workshopRoot) lineRoot.SetParent(workshopRoot, false);
+                    ApplySpatialTransform(lineRoot, line.LayoutObject);
+                }
+            }
         }
 
         private void ApplyPreviewFocus(JObject focus, Bounds factoryBounds)
@@ -561,6 +646,14 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 if (!string.IsNullOrWhiteSpace(_settings?.adminHostFixedRuntimeFolder))
                 {
                     arguments += " --fixed-runtime " + QuoteProcessArgument(_settings.adminHostFixedRuntimeFolder);
+                }
+                if (!string.IsNullOrWhiteSpace(_settings?.desktopControlUrl))
+                {
+                    arguments += " --desktop-control-url " + QuoteProcessArgument(_settings.desktopControlUrl);
+                }
+                if (!string.IsNullOrWhiteSpace(_settings?.desktopControlToken))
+                {
+                    arguments += " --desktop-control-token " + QuoteProcessArgument(_settings.desktopControlToken);
                 }
                 if (!showAdmin) arguments += " --dashboard-mode";
 
@@ -704,6 +797,8 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _drivers.Clear();
             _visuals.Clear();
             _deviceRoots.Clear();
+            _workshopRoots.Clear();
+            _lineRoots.Clear();
             _deviceModelTypes.Clear();
             _deviceLineIds.Clear();
             _deviceWorkshopIds.Clear();

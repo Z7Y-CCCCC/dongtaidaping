@@ -84,17 +84,44 @@ function useFallbackConfig() {
                 model_file: null,
                 pos_x: (di - 2) * 14,
                 pos_y: 0,
-                pos_z: -li * 16,
+                pos_z: 0,
                 rotation_y: 0,
                 scale: 1.0,
+                coordinate_space: 'line_local',
                 sort_order: di,
                 dataPoints: []
             })
         }
-        return { id: lineId, name, workshop_id: 'ws_1', sort_order: li, devices }
+        return {
+            id: lineId,
+            name,
+            workshop_id: 'ws_1',
+            sort_order: li,
+            layout: {
+                version: 2,
+                coordinateSpace: 'workshop_local',
+                transform: { x: 0, y: 0, z: 24 - li * 16, rotationY: 0 },
+                flowDirection: 'right',
+                lanes: [{ id: 'lane_1', name: '设备线 1', type: 'device_lane', offsetZ: 0, length: 60, sort_order: 0 }],
+                rails: []
+            },
+            devices
+        }
     })
     
-    factoryConfig.workshops = [{ id: 'ws_1', name: '默认车间 1', sort_order: 0, lines: fallbackLines }]
+    factoryConfig.workshops = [{
+        id: 'ws_1',
+        name: '默认车间 1',
+        sort_order: 0,
+        layout: {
+            version: 2,
+            coordinateSpace: 'factory_world',
+            transform: { x: 0, y: 0, z: -24, rotationY: 0 },
+            size: { width: 100, depth: 100, height: 8 },
+            boundary: { enabled: true }
+        },
+        lines: fallbackLines
+    }]
     factoryConfig.lines = fallbackLines
     
     factoryConfig.models = []
@@ -203,6 +230,10 @@ export const adminApi = {
     async getRuntimeSettings() { return readApiJson(await fetch(`${API_BASE}/system/runtime`), '读取运行配置失败') },
     async saveRuntimeSettings(data) { return readApiJson(await fetch(`${API_BASE}/system/runtime`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存运行配置失败') },
     async rotateCastPin() { return readApiJson(await fetch(`${API_BASE}/system/runtime/rotate-pin`, { method: 'POST' }), '重新生成投屏码失败') },
+    async getCastDevices() { return readApiJson(await fetch(`${API_BASE}/system/cast/devices`), '读取局域网电视列表失败') },
+    async refreshCastDevices() { return readApiJson(await fetch(`${API_BASE}/system/cast/refresh`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' }), '搜索局域网电视失败') },
+    async startCast(deviceId) { return readApiJson(await fetch(`${API_BASE}/system/cast/start`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ deviceId }) }), '投屏到电视失败') },
+    async stopCast() { return readApiJson(await fetch(`${API_BASE}/system/cast/stop`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' }), '停止投屏失败') },
     async getNativePreviewStatus() { return readApiJson(await fetch(`${API_BASE}/native-preview/status`), '读取 Unity 实时预览状态失败') },
     async sendNativePreview(data) { return readApiJson(await fetch(`${API_BASE}/native-preview`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '推送 Unity 实时预览失败') },
     async getDatabaseConfig() { return (await fetch(`${API_BASE}/database/config`)).json() },

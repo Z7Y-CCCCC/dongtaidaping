@@ -10,7 +10,7 @@ import { RENDER_PROFILE_OPTIONS, normalizeRenderSettings } from '../../../runtim
 
 function createDefaultNativeEnvironmentConfig() {
     return {
-        version: 2,
+        version: 3,
         preset: 'bright_industrial',
         sceneBrightness: 1.2,
         ambientIntensity: 1.25,
@@ -47,13 +47,15 @@ const NATIVE_ENVIRONMENT_PRESETS = [
     {
         value: 'bright_industrial',
         label: '明亮工业蓝（推荐）',
-        description: '接近参考图 2，抬高暗部并保留实体 PBR 材质。',
+        tag: '通用推荐',
+        description: '明亮蓝灰环境，设备暗部更清楚，同时保留实体 PBR 材质。',
         config: createDefaultNativeEnvironmentConfig()
     },
     {
         value: 'neutral_factory',
         label: '中性真实厂房',
-        description: '色彩更克制，适合长期运行和现场监控。',
+        tag: '现场监控',
+        description: '低饱和灰蓝环境，颜色更自然，适合长时间运行和现场监控。',
         config: {
             ...createDefaultNativeEnvironmentConfig(),
             preset: 'neutral_factory',
@@ -81,7 +83,8 @@ const NATIVE_ENVIRONMENT_PRESETS = [
     {
         value: 'showcase_blue',
         label: '展厅增强蓝',
-        description: '反射和色彩更强，适合独显展厅机器。',
+        tag: '展厅效果',
+        description: '蓝色更鲜明，反射和高光更强，适合展厅或配置较高的电脑。',
         config: {
             ...createDefaultNativeEnvironmentConfig(),
             preset: 'showcase_blue',
@@ -108,7 +111,8 @@ const NATIVE_ENVIRONMENT_PRESETS = [
     {
         value: 'dark_technical',
         label: '深色科技监控',
-        description: '保留暗色风格，适合需要更强 UI 对比度的场景。',
+        tag: '高对比',
+        description: '深蓝黑环境与更强对比度，适合突出数据面板和设备状态。',
         config: {
             ...createDefaultNativeEnvironmentConfig(),
             preset: 'dark_technical',
@@ -136,6 +140,7 @@ const NATIVE_ENVIRONMENT_PRESETS = [
     {
         value: 'custom',
         label: '自定义参数',
+        tag: '工程师配置',
         description: '工程师手动调整后的组合。',
         config: null
     }
@@ -161,6 +166,8 @@ function normalizeWallSegment(value, index) {
     return {
         id: String(source.id || `wall_${index + 1}`).trim() || `wall_${index + 1}`,
         name: String(source.name || `围墙 ${index + 1}`).trim() || `围墙 ${index + 1}`,
+        workshopId: String(source.workshopId || source.workshop_id || '').trim(),
+        coordinateSpace: 'workshop_local',
         enabled: dashboardBoolean(source.enabled, true),
         style: normalizeWallStyle(source.style),
         x: dashboardNumber(source.x, 0, -1000, 1000),
@@ -180,7 +187,7 @@ function normalizeNativeEnvironmentConfig(value) {
     const source = parseDashboardSource(value)
     const fogStart = dashboardNumber(source.fogStart, defaults.fogStart, 0, 500)
     return {
-        version: 2,
+        version: 3,
         preset: String(source.preset || defaults.preset).trim() || 'custom',
         sceneBrightness: dashboardNumber(source.sceneBrightness, defaults.sceneBrightness, 0.8, 1.6),
         ambientIntensity: dashboardNumber(source.ambientIntensity, defaults.ambientIntensity, 0.2, 2.5),
@@ -220,7 +227,6 @@ function createDefaultNativeDashboardConfig() {
         sideMargin: 24,
         showHeader: true,
         showWorldLabels: true,
-        showBottomHints: true,
         overview: {
             left: { visible: true, width: 326, height: 824, opacity: 1 },
             right: { visible: true, width: 326, height: 824, opacity: 1, maxDevices: 20 }
@@ -294,7 +300,6 @@ function normalizeNativeDashboardConfig(value) {
         sideMargin: dashboardInteger(source.sideMargin, defaults.sideMargin, 8, 100),
         showHeader: dashboardBoolean(source.showHeader, defaults.showHeader),
         showWorldLabels: dashboardBoolean(source.showWorldLabels, defaults.showWorldLabels),
-        showBottomHints: dashboardBoolean(source.showBottomHints, defaults.showBottomHints),
         overview: {
             left: {
                 visible: dashboardBoolean(overviewLeft.visible, defaults.overview.left.visible),
@@ -367,10 +372,32 @@ export function useSystemSettings({
     const nativeEnvironmentConfig = reactive(createDefaultNativeEnvironmentConfig())
     const nativeEnvironmentSaving = ref(false)
     const nativeEnvironmentMessage = ref('')
-    const nativeEnvironmentPresetOptions = NATIVE_ENVIRONMENT_PRESETS.map(({ value, label, description }) => ({
+    const nativeEnvironmentPresetOptions = NATIVE_ENVIRONMENT_PRESETS.map(({ value, label, tag, description, config }) => ({
         value,
         label,
-        description
+        tag,
+        description,
+        preview: config ? {
+            sceneBrightness: config.sceneBrightness,
+            postExposure: config.postExposure,
+            contrast: config.contrast,
+            saturation: config.saturation,
+            bloomIntensity: config.bloomIntensity,
+            vignetteIntensity: config.vignetteIntensity,
+            reflectionIntensity: config.reflectionIntensity,
+            fogEnabled: config.fogEnabled,
+            fogEnd: config.fogEnd,
+            showGrid: config.showGrid,
+            skyColor: config.skyColor,
+            horizonColor: config.horizonColor,
+            fogColor: config.fogColor,
+            keyLightColor: config.keyLightColor,
+            fillLightColor: config.fillLightColor,
+            floorColor: config.floorColor,
+            gridColor: config.gridColor,
+            wallColor: config.wallColor,
+            frameColor: config.frameColor
+        } : null
     }))
     const nativeDashboardConfig = reactive(createDefaultNativeDashboardConfig())
     const nativeDashboardSaving = ref(false)

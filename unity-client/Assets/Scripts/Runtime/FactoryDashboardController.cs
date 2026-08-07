@@ -88,7 +88,6 @@ namespace HeatTreatment.DigitalTwin.Runtime
             [JsonProperty("sideMargin")] public float SideMargin { get; set; } = 24f;
             [JsonProperty("showHeader")] public bool ShowHeader { get; set; } = true;
             [JsonProperty("showWorldLabels")] public bool ShowWorldLabels { get; set; } = true;
-            [JsonProperty("showBottomHints")] public bool ShowBottomHints { get; set; } = true;
             [JsonProperty("overview")] public DashboardOverviewConfig Overview { get; set; } = new DashboardOverviewConfig();
             [JsonProperty("detail")] public DashboardDetailConfig Detail { get; set; } = new DashboardDetailConfig();
             [JsonProperty("deviceOverrides")] public Dictionary<string, DashboardDeviceOverride> DeviceOverrides { get; set; }
@@ -395,28 +394,13 @@ namespace HeatTreatment.DigitalTwin.Runtime
             return new Rect(DesignWidth - _dashboardConfig.SideMargin - panel.Width, DetailTop, panel.Width, panel.Height);
         }
 
-        private Rect BottomHintRect()
-        {
-            var left = _mode == DashboardMode.Detail ? DetailLeftRect() : OverviewLeftRect();
-            var right = _mode == DashboardMode.Detail ? DetailRightRect() : OverviewRightRect();
-            var leftVisible = _mode == DashboardMode.Detail
-                ? _dashboardConfig.Detail.Left.Visible
-                : _dashboardConfig.Overview.Left.Visible;
-            var rightVisible = _mode == DashboardMode.Detail
-                ? _dashboardConfig.Detail.Right.Visible
-                : _dashboardConfig.Overview.Right.Visible;
-            var x = leftVisible ? left.xMax + 20f : _dashboardConfig.SideMargin;
-            var rightEdge = rightVisible ? right.x - 20f : DesignWidth - _dashboardConfig.SideMargin;
-            return new Rect(x, 1005f, Mathf.Max(320f, rightEdge - x), 48f);
-        }
-
         private Rect DetailTrendRect()
         {
             var left = DetailLeftRect();
             var right = DetailRightRect();
             var x = _dashboardConfig.Detail.Left.Visible ? left.xMax + 30f : _dashboardConfig.SideMargin;
             var rightEdge = _dashboardConfig.Detail.Right.Visible ? right.x - 30f : DesignWidth - _dashboardConfig.SideMargin;
-            var bottom = _dashboardConfig.ShowBottomHints ? BottomHintRect().y - 15f : DesignHeight - 24f;
+            var bottom = DesignHeight - 24f;
             return new Rect(
                 x,
                 bottom - _dashboardConfig.Detail.Trends.Height,
@@ -457,10 +441,6 @@ namespace HeatTreatment.DigitalTwin.Runtime
             if (_dashboardConfig.Overview.Left.Visible) DrawOverviewLeftPanel();
             if (_dashboardConfig.Overview.Right.Visible) DrawOverviewDeviceList();
             if (_dashboardConfig.ShowWorldLabels) DrawWorldLabels();
-            if (_dashboardConfig.ShowBottomHints)
-            {
-                DrawBottomHint("顶部菜单栏“设置”进入管理后台   |   单击设备进入详情   |   左键拖动旋转   |   右键/中键平移   |   滚轮缩放");
-            }
         }
 
         private void DrawOverviewLeftPanel()
@@ -587,10 +567,6 @@ namespace HeatTreatment.DigitalTwin.Runtime
             if (_dashboardConfig.Detail.Left.Visible) DrawDetailLeft(device);
             if (_dashboardConfig.Detail.Right.Visible) DrawDetailRight(device);
             if (_dashboardConfig.Detail.Trends.Visible) DrawDetailTrends(device);
-            if (_dashboardConfig.ShowBottomHints)
-            {
-                DrawBottomHint("ESC 返回总览   |   左键拖动查看设备   |   滚轮缩放   |   F1/F2/F3 画质   |   F9 诊断信息");
-            }
         }
 
         private void DrawDetailLeft(DeviceView device)
@@ -749,13 +725,6 @@ namespace HeatTreatment.DigitalTwin.Runtime
             }
         }
 
-        private void DrawBottomHint(string text)
-        {
-            var rect = BottomHintRect();
-            DrawSolid(rect, new Color(0.014f, 0.04f, 0.06f, 0.9f));
-            GUI.Label(new Rect(rect.x + 20f, rect.y + 12f, rect.width - 40f, 24f), text, _centerStyle);
-        }
-
         private void ShowDetail(DeviceView device)
         {
             if (device == null || device.Root == null) return;
@@ -807,7 +776,6 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             if (pointer.x < 0f || pointer.y < 0f || pointer.x > DesignWidth || pointer.y > DesignHeight) return true;
             if (_dashboardConfig.ShowHeader && new Rect(20f, 18f, 1880f, 66f).Contains(pointer)) return true;
-            if (_dashboardConfig.ShowBottomHints && BottomHintRect().Contains(pointer)) return true;
             if (_mode == DashboardMode.Overview)
             {
                 if (_dashboardConfig.Overview.Left.Visible && OverviewLeftRect().Contains(pointer)) return true;
