@@ -8164,19 +8164,24 @@ const mainTabs = [
 .line-panel-title,
 .line-structure-title {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
     gap: 10px;
     margin-bottom: 12px;
 }
 .line-panel-title strong,
 .line-structure-title strong {
+    flex: 0 0 auto;
     color: #172027;
     font-size: 15px;
 }
 .line-panel-title span {
+    min-width: 0;
     color: #77818a;
     font-size: 12px;
+    line-height: 1.45;
+    text-align: right;
+    overflow-wrap: anywhere;
 }
 .line-create-row,
 .line-selector-list,
@@ -8227,7 +8232,7 @@ const mainTabs = [
 }
 .line-card-fields {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(120px, 150px) 64px 58px;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr);
     gap: 8px;
     padding: 0 10px 10px 13px;
 }
@@ -8237,7 +8242,7 @@ const mainTabs = [
     padding: 5px 8px;
 }
 .line-card-fields .btn {
-    width: 58px;
+    width: 100%;
     padding: 7px 0;
 }
 .line-basic-grid {
@@ -8260,15 +8265,21 @@ const mainTabs = [
     align-self: end;
 }
 .line-structure-section {
+    min-width: 0;
     margin-bottom: 0;
+    overflow: hidden;
 }
 .line-structure-title .btn {
     background: #eef1f4;
     color: #245c7a;
 }
 .line-flow-hint {
+    min-width: 0;
     color: #77818a;
     font-size: 12px;
+    line-height: 1.45;
+    text-align: right;
+    overflow-wrap: anywhere;
 }
 .line-flow-controls {
     display: grid;
@@ -11127,6 +11138,92 @@ button:enabled:active {
     .voice-rule-actions { justify-content: flex-start; }
 }
 
+@media (max-width: 900px) {
+    .admin-container.line-planner-active .admin-content {
+        padding: 8px;
+    }
+    .line-planner-header {
+        align-items: stretch;
+        flex-direction: column;
+        gap: 10px;
+        padding: 14px;
+    }
+    .line-native-actions {
+        justify-content: flex-start;
+    }
+    .line-planner-steps {
+        overflow-x: auto;
+        padding: 8px 14px;
+        scrollbar-width: thin;
+    }
+    .line-planner-steps span {
+        flex: 0 0 auto;
+    }
+    .line-planner-layout {
+        min-height: 0;
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: auto auto;
+    }
+    .line-planner-editor {
+        max-height: none;
+        overflow: visible;
+        border-right: 0;
+    }
+    .line-planner-preview {
+        min-height: 640px;
+    }
+    .line-editor-float-toggle {
+        left: 12px;
+        top: 12px;
+        transform: none;
+    }
+    .line-preview-toolbar {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+    .line-preview-metrics {
+        justify-content: flex-start;
+    }
+}
+
+@media (max-width: 520px) {
+    .admin-container.line-planner-active .admin-nav {
+        width: 68px;
+        flex: 0 0 68px;
+        padding: 16px 8px 24px;
+        align-items: center;
+    }
+    .admin-container.line-planner-active .nav-item {
+        justify-content: center;
+        width: 44px;
+        padding: 10px;
+    }
+    .admin-container.line-planner-active .nav-group,
+    .admin-container.line-planner-active .nav-submenu {
+        align-items: center;
+        padding-left: 0;
+    }
+    .admin-container.line-planner-active .nav-label,
+    .admin-container.line-planner-active .nav-chevron {
+        display: none;
+    }
+    .admin-container.line-planner-active .nav-collapse-btn {
+        left: 50px;
+    }
+    .line-transform-grid,
+    .line-card-fields,
+    .line-flow-controls {
+        grid-template-columns: 1fr;
+    }
+    .line-layout-row {
+        grid-template-columns: minmax(0, 1fr) 82px;
+    }
+    .line-layout-row .btn {
+        grid-column: 1 / -1;
+        width: 100%;
+    }
+}
+
 @media (prefers-reduced-motion: reduce) {
     .nav-item,
     .nav-collapse-btn,
@@ -11209,10 +11306,11 @@ button:enabled:active {
 .workshop-spatial-grid > label, .line-transform-grid > label { display: flex; flex-direction: column; gap: 6px; color: #475467; font-size: 12px; font-weight: 500; }
 .workshop-spatial-grid .workshop-boundary-toggle { flex-direction: row; align-items: center; min-height: 38px; padding: 8px 10px; align-self: end; background: #fff; border: 1px solid #d0d5dd; border-radius: 7px; }
 .workshop-boundary-toggle input { accent-color: #176b8b; }
-.line-transform-grid { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 10px; margin-top: 12px; }
+.line-transform-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+.line-transform-grid .input { width: 100%; min-width: 0; box-sizing: border-box; }
 @media (max-width: 1180px) {
     .workshop-spatial-heading { flex-direction: column; }
-    .workshop-spatial-grid, .line-transform-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
+    .workshop-spatial-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
 }
 @media (max-width: 720px) {
     .spatial-rule-banner { align-items: flex-start; flex-direction: column; }
