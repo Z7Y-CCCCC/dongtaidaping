@@ -244,6 +244,8 @@ export const adminApi = {
     async restoreDatabaseBackup(filename) { return readApiJson(await fetch(`${API_BASE}/database/backups/${pathId(filename)}/restore`, { method: 'POST' }), '恢复数据库备份失败') },
     databaseBackupDownloadUrl(filename) { return `${API_BASE}/database/backups/${pathId(filename)}/download` },
     async getSiteBackups() { return readApiJson(await fetch(`${API_BASE}/site-backups`), '读取整站灾备状态失败') },
+    async getSiteBackupConfig() { return readApiJson(await fetch(`${API_BASE}/site-backups/config`), '读取整站灾备配置失败') },
+    async saveSiteBackupConfig(config) { return readApiJson(await fetch(`${API_BASE}/site-backups/config`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }), '保存整站灾备配置失败') },
     async createSiteBackup() { return readApiJson(await fetch(`${API_BASE}/site-backups/export`, { method: 'POST' }), '导出整站灾备失败') },
     async restoreSiteBackup(file) {
         const formData = new FormData()

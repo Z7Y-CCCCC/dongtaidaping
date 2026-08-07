@@ -67,6 +67,22 @@ async function main() {
     if (event.payload?.devices?.[0]?.pos_x !== 12.5) throw new Error('设备实时位置未正确转发');
     if (event.payload?.lines?.[0]?.layout_json?.rails?.[0]?.length !== 60) throw new Error('产线布局未正确转发');
 
+    const returnEventPromise = waitForEvent(socket, 'native_scene_preview');
+    const returnResponse = await fetch(`${baseUrl}/api/native-preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            action: 'focus',
+            source: 'dashboard_overlay',
+            focus: { mode: 'line', lineId: '' }
+        })
+    });
+    const returnResult = await returnResponse.json();
+    const returnEvent = await returnEventPromise;
+    if (!returnResult.success || returnEvent.payload?.focus?.mode !== 'line') {
+        throw new Error('返回产线视角指令未正确转发');
+    }
+
     socket.close();
     console.log(JSON.stringify({
         success: true,
@@ -74,7 +90,8 @@ async function main() {
         action: event.payload.action,
         unityClients: result.unityClients,
         deviceX: event.payload.devices[0].pos_x,
-        lineId: event.payload.lines[0].id
+        lineId: event.payload.lines[0].id,
+        returnMode: returnEvent.payload.focus.mode
     }, null, 2));
 }
 

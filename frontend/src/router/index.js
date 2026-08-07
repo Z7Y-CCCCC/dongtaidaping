@@ -1,8 +1,12 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import App from '../App.vue'
 
 const routes = [
-    { name: 'dashboard', path: '/', component: App, meta: { title: '热处理数字孪生大屏' } },
+    {
+        name: 'dashboard',
+        path: '/',
+        component: () => import('../App.vue'),
+        meta: { title: '热处理数字孪生大屏' }
+    },
     {
         name: 'admin',
         path: '/admin',

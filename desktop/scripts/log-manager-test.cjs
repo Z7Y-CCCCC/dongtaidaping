@@ -44,12 +44,25 @@ async function main() {
     cleanupLogArchives(root, { retentionDays: 30, maxArchives: 2 });
     const finalArchives = fs.readdirSync(root).filter(name => name.endsWith('.log.gz'));
 
+    for (let index = 0; index < 4; index += 1) {
+        const filename = path.join(root, `backend-quota-${index}.log.gz`);
+        fs.writeFileSync(filename, zlib.gzipSync(Buffer.alloc(512, index + 1)));
+        const modified = new Date(Date.now() + 10000 + index * 1000);
+        fs.utimesSync(filename, modified, modified);
+    }
+    cleanupLogArchives(root, { retentionDays: 30, maxArchives: 20, maxTotalBytes: 70 });
+    const quotaArchives = fs.readdirSync(root)
+        .filter(name => name.endsWith('.log.gz'))
+        .map(name => ({ name, size: fs.statSync(path.join(root, name)).size }));
+    const quotaBytes = quotaArchives.reduce((sum, item) => sum + item.size, 0);
+
     const checks = {
         previousSessionCompressed: archivedText.includes('previous-session'),
         sizeRotationCompressed: archivedText.includes('12345678901234567890'),
         activeLogContinuesAfterRotation: currentText.includes('abcdefghijklmnopqrst'),
         expiredArchiveDeleted: !fs.existsSync(agedArchive),
-        archiveCountCapped: finalArchives.length === 2
+        archiveCountCapped: finalArchives.length === 2,
+        archiveDirectorySizeCapped: quotaArchives.length === 1 || quotaBytes <= 70
     };
     const failed = Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name);
     const result = { success: failed.length === 0, checks, directory: root };

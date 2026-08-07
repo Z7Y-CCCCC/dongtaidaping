@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$MySqlHost = '127.0.0.1',
     [int]$MySqlPort = 3307,
@@ -33,19 +33,24 @@ $unityLog = Join-Path $tmpDir 'native-dev-unity.log'
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
 $node = Get-Command node -ErrorAction Stop
 
-$adminHostSources = Get-ChildItem $adminHostProjectDir -File -ErrorAction SilentlyContinue | Where-Object {
-    $_.Extension -in @('.cs', '.csproj')
-}
-$adminHostNeedsBuild = -not (Test-Path $adminHostExe)
-if (-not $adminHostNeedsBuild -and $adminHostSources) {
-    $adminHostTimestamp = (Get-Item $adminHostExe).LastWriteTimeUtc
-    $adminHostNeedsBuild = ($adminHostSources | Where-Object { $_.LastWriteTimeUtc -gt $adminHostTimestamp }).Count -gt 0
-}
-if ($adminHostNeedsBuild) {
-    Write-Host 'Building Unity embedded admin host...'
-    & $node.Source $adminHostBuildScript
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $adminHostExe)) {
-        throw 'Unity embedded admin host build failed.'
+# The backend-only workflow must not touch the embedded AdminHost.  Its DLLs can
+# be locked by a running Unity window, and rebuilding it is unrelated to starting
+# the Node service.  Only the full Unity workflow needs this freshness check.
+if (-not $BackendOnly) {
+    $adminHostSources = Get-ChildItem $adminHostProjectDir -File -ErrorAction SilentlyContinue | Where-Object {
+        $_.Extension -in @('.cs', '.csproj')
+    }
+    $adminHostNeedsBuild = -not (Test-Path $adminHostExe)
+    if (-not $adminHostNeedsBuild -and $adminHostSources) {
+        $adminHostTimestamp = (Get-Item $adminHostExe).LastWriteTimeUtc
+        $adminHostNeedsBuild = ($adminHostSources | Where-Object { $_.LastWriteTimeUtc -gt $adminHostTimestamp }).Count -gt 0
+    }
+    if ($adminHostNeedsBuild) {
+        Write-Host 'Building Unity embedded admin host...'
+        & $node.Source $adminHostBuildScript
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $adminHostExe)) {
+            throw 'Unity embedded admin host build failed.'
+        }
     }
 }
 

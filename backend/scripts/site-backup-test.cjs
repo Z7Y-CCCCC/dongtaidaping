@@ -77,6 +77,7 @@ async function main() {
     const resultFile = path.join(runDirectory, 'result.json');
     const dataDir = path.join(runDirectory, 'data');
     const uploadsDir = path.join(runDirectory, 'uploads');
+    const mirrorDir = path.join(runDirectory, 'external-mirror');
     const modelsDir = path.join(uploadsDir, 'models');
     const databaseFile = path.join(dataDir, 'factory.db');
     const startedAt = Date.now();
@@ -112,9 +113,22 @@ async function main() {
         });
         await waitForHttp(`${backendOrigin}/api/health`, 30000);
 
+        const configured = await requestJson(`${backendOrigin}/api/site-backups/config`, {
+            method: 'PUT',
+            body: JSON.stringify({
+                autoEnabled: true,
+                intervalHours: 24,
+                mirrorDirectory: mirrorDir
+            })
+        });
+        if (!configured.success || path.resolve(configured.config?.mirrorDirectory || '') !== path.resolve(mirrorDir)) {
+            throw new Error('External backup mirror configuration was not persisted');
+        }
+
         await putSetting(ORIGINAL_SETTING);
         const exported = await requestJson(`${backendOrigin}/api/site-backups/export`, { method: 'POST' });
         if (!exported.success || !exported.backup?.filename) throw new Error('Export API did not return a backup filename');
+        const mirroredArchive = path.join(mirrorDir, exported.backup.filename);
 
         const downloadResponse = await fetch(`${backendOrigin}/api/site-backups/${encodeURIComponent(exported.backup.filename)}/download`);
         if (!downloadResponse.ok) throw new Error(`Backup download failed: HTTP ${downloadResponse.status}`);
@@ -146,7 +160,7 @@ async function main() {
         const corruptedImport = await importArchive(corruptedArchive);
 
         const checks = {
-            manifestFormatValid: manifest.format === 'heat-treatment-digital-twin-site-backup' && manifest.version === 1,
+            manifestFormatValid: manifest.format === 'heat-treatment-digital-twin-site-backup' && manifest.version === 2,
             databaseIncluded: archivePaths.has('database/factory.db'),
             uploadedModelIncluded: archivePaths.has(`uploads/models/${MODEL_FILENAME}`),
             databaseSettingRestored: settingAfterRestore === ORIGINAL_SETTING && databaseAfterRestore.setting === ORIGINAL_SETTING,
@@ -154,7 +168,12 @@ async function main() {
             databaseIntegrityValid: databaseAfterRestore.quickCheck === 'ok',
             corruptedArchiveRejected: !corruptedImport.ok && corruptedImport.status === 400,
             rollbackBackupCreated: imported.body?.rollback?.filename?.includes('-before-restore.db') === true,
-            archiveHashMatches: crypto.createHash('sha256').update(fs.readFileSync(downloadedArchive)).digest('hex') === exported.backup.sha256
+            archiveHashMatches: crypto.createHash('sha256').update(fs.readFileSync(downloadedArchive)).digest('hex') === exported.backup.sha256,
+            externalMirrorCreated: fs.existsSync(mirroredArchive) && exported.backup.mirror?.filename === exported.backup.filename,
+            externalMirrorHashMatches: fs.existsSync(mirroredArchive)
+                && crypto.createHash('sha256').update(fs.readFileSync(mirroredArchive)).digest('hex') === exported.backup.sha256,
+            externalMirrorAtomic: fs.existsSync(mirrorDir)
+                && !fs.readdirSync(mirrorDir).some(name => name.endsWith('.tmp'))
         };
         const failed = Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name);
         if (failed.length) throw new Error(`Site backup checks failed: ${failed.join(', ')}`);
@@ -165,6 +184,7 @@ async function main() {
             checks,
             artifacts: {
                 archive: downloadedArchive,
+                mirror: mirroredArchive,
                 result: resultFile,
                 log: path.join(runDirectory, 'backend.log')
             }

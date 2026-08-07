@@ -10,6 +10,8 @@ const {
     importDatabaseBackupFile,
     restoreDatabaseBackup,
     resolveDatabaseBackupPath,
+    getDatabaseBackupStatus,
+    verifyDatabaseBackupFile,
     verifySqliteFile,
     loadDatabaseConfig
 } = require('../db/database');
@@ -19,15 +21,24 @@ const DATA_DIR = process.env.APP_DATA_DIR
     : path.join(__dirname, '..', 'data');
 const SITE_BACKUP_DIR = path.resolve(process.env.SITE_BACKUP_DIR || path.join(DATA_DIR, 'site-backups'));
 const SITE_IMPORT_DIR = path.resolve(process.env.SITE_IMPORT_DIR || path.join(DATA_DIR, 'site-imports'));
+const SITE_BACKUP_CONFIG_PATH = path.join(DATA_DIR, 'site-backup-config.json');
 const SITE_BACKUP_RETENTION = positiveInteger(process.env.SITE_BACKUP_RETENTION, 5);
+const SITE_BACKUP_MAX_TOTAL_BYTES = positiveInteger(process.env.SITE_BACKUP_MAX_TOTAL_BYTES, 20 * 1024 * 1024 * 1024);
+const SITE_BACKUP_MIRROR_RETENTION = positiveInteger(process.env.SITE_BACKUP_MIRROR_RETENTION, 30);
 const SITE_BACKUP_FORMAT = 'heat-treatment-digital-twin-site-backup';
-const SITE_BACKUP_VERSION = 1;
+const SITE_BACKUP_VERSION = 2;
 const UPLOAD_GROUPS = ['models', 'audio'];
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 10000;
 const MAX_ARCHIVE_FILE_BYTES = 512 * 1024 * 1024;
 const MAX_ARCHIVE_CONTENT_BYTES = 2 * 1024 * 1024 * 1024;
 let activeSiteBackupOperation = null;
+let siteBackupTimer = null;
+let siteBackupInitialTimer = null;
+let maintenanceUploadsRootDir = null;
+let lastAutomaticBackup = null;
+let lastSiteBackupError = null;
+let lastMirrorCopy = null;
 
 function positiveInteger(value, fallback) {
     const parsed = Number(value);
@@ -37,6 +48,48 @@ function positiveInteger(value, fallback) {
 function ensureDirectory(directory) {
     fs.mkdirSync(directory, { recursive: true });
     return directory;
+}
+
+function clampNumber(value, min, max, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
+}
+
+function loadSiteBackupConfig() {
+    let stored = {};
+    try {
+        if (fs.existsSync(SITE_BACKUP_CONFIG_PATH)) stored = JSON.parse(fs.readFileSync(SITE_BACKUP_CONFIG_PATH, 'utf8'));
+    } catch (error) {
+        lastSiteBackupError = { at: new Date().toISOString(), operation: '读取灾备配置', error: error.message };
+    }
+    const configuredMirror = String(stored.mirrorDirectory || process.env.SITE_BACKUP_MIRROR_DIR || '').trim();
+    return {
+        autoEnabled: stored.autoEnabled !== undefined
+            ? stored.autoEnabled !== false
+            : process.env.SITE_BACKUP_AUTO_ENABLED !== 'false',
+        intervalHours: clampNumber(
+            stored.intervalHours ?? process.env.SITE_BACKUP_INTERVAL_HOURS,
+            1,
+            168,
+            24
+        ),
+        mirrorDirectory: configuredMirror ? path.resolve(configuredMirror) : ''
+    };
+}
+
+function saveSiteBackupConfig(input = {}) {
+    ensureDirectory(DATA_DIR);
+    const config = {
+        autoEnabled: input.autoEnabled !== false,
+        intervalHours: clampNumber(input.intervalHours, 1, 168, 24),
+        mirrorDirectory: String(input.mirrorDirectory || '').trim()
+            ? path.resolve(String(input.mirrorDirectory).trim())
+            : ''
+    };
+    const temporary = `${SITE_BACKUP_CONFIG_PATH}.${process.pid}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(config, null, 2), 'utf8');
+    fs.renameSync(temporary, SITE_BACKUP_CONFIG_PATH);
+    return config;
 }
 
 function timestampToken(date = new Date()) {
@@ -51,6 +104,47 @@ function sha256File(filename) {
         stream.on('data', chunk => hash.update(chunk));
         stream.on('end', () => resolve(hash.digest('hex')));
     });
+}
+
+function pruneMirrorBackups(directory) {
+    if (!fs.existsSync(directory)) return;
+    const files = fs.readdirSync(directory, { withFileTypes: true })
+        .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.zip'))
+        .map(entry => {
+            const filename = path.join(directory, entry.name);
+            return { filename, stat: fs.statSync(filename) };
+        })
+        .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+    for (const item of files.slice(SITE_BACKUP_MIRROR_RETENTION)) fs.rmSync(item.filename, { force: true });
+}
+
+async function mirrorSiteBackup(filename, mirrorDirectory) {
+    const targetRoot = path.resolve(mirrorDirectory);
+    const localRoot = path.resolve(SITE_BACKUP_DIR);
+    if (!targetRoot || targetRoot === localRoot || targetRoot.startsWith(`${localRoot}${path.sep}`)) {
+        throw new Error('异地灾备目录不能位于软件本机灾备目录内部');
+    }
+    ensureDirectory(targetRoot);
+    const destination = path.join(targetRoot, path.basename(filename));
+    const temporary = `${destination}.${process.pid}.tmp`;
+    fs.rmSync(temporary, { force: true });
+    try {
+        fs.copyFileSync(filename, temporary);
+        const sourceHash = await sha256File(filename);
+        const copiedHash = await sha256File(temporary);
+        if (sourceHash !== copiedHash) throw new Error('异地灾备副本哈希校验失败');
+        fs.renameSync(temporary, destination);
+        pruneMirrorBackups(targetRoot);
+        lastMirrorCopy = {
+            at: new Date().toISOString(),
+            directory: targetRoot,
+            filename: path.basename(destination),
+            sha256: sourceHash
+        };
+        return lastMirrorCopy;
+    } finally {
+        fs.rmSync(temporary, { force: true });
+    }
 }
 
 function listFiles(directory) {
@@ -90,6 +184,13 @@ function pruneSiteBackups() {
     for (const backup of listSiteBackups().slice(SITE_BACKUP_RETENTION)) {
         fs.rmSync(path.join(SITE_BACKUP_DIR, backup.filename), { force: true });
     }
+    const retained = listSiteBackups();
+    let totalBytes = retained.reduce((sum, backup) => sum + Number(backup.size || 0), 0);
+    for (const backup of retained.slice(1).reverse()) {
+        if (totalBytes <= SITE_BACKUP_MAX_TOTAL_BYTES) break;
+        fs.rmSync(path.join(SITE_BACKUP_DIR, backup.filename), { force: true });
+        totalBytes -= Number(backup.size || 0);
+    }
 }
 
 function resolveSiteBackupPath(filename) {
@@ -106,16 +207,25 @@ function resolveSiteBackupPath(filename) {
 }
 
 function getSiteBackupStatus() {
-    const supported = String(loadDatabaseConfig().type || '').toLowerCase() === 'sqlite';
+    const databaseStatus = getDatabaseBackupStatus();
+    const config = loadSiteBackupConfig();
     return {
-        supported,
+        supported: databaseStatus.supported,
+        databaseType: databaseStatus.type,
         format: SITE_BACKUP_FORMAT,
         version: SITE_BACKUP_VERSION,
         retention: SITE_BACKUP_RETENTION,
+        maxTotalBytes: SITE_BACKUP_MAX_TOTAL_BYTES,
         localDirectory: SITE_BACKUP_DIR,
         externalCopyRequired: true,
+        config,
+        lastAutomaticBackup,
+        lastError: lastSiteBackupError,
+        lastMirrorCopy,
+        mirrorConfigured: Boolean(config.mirrorDirectory),
+        toolError: databaseStatus.toolError || null,
         busy: activeSiteBackupOperation?.name || null,
-        backups: supported ? listSiteBackups() : []
+        backups: databaseStatus.supported ? listSiteBackups() : []
     };
 }
 
@@ -147,12 +257,16 @@ async function createSiteBackup(uploadsRootDir) {
 
 async function createSiteBackupUnlocked(uploadsRootDir) {
     if (!getSiteBackupStatus().supported) {
-        throw new Error('整站灾备导出仅支持安装版 SQLite 数据库');
+        throw new Error(getSiteBackupStatus().toolError || '当前数据库不支持整站灾备导出');
     }
 
     ensureDirectory(SITE_BACKUP_DIR);
     const databaseBackup = await createDatabaseBackup('site-export');
     const databaseFilename = resolveDatabaseBackupPath(databaseBackup.filename);
+    const databaseType = String(loadDatabaseConfig().type || '').toLowerCase();
+    const databaseArchivePath = databaseType === 'mysql'
+        ? 'database/mysql.sql.gz'
+        : 'database/factory.db';
     const uploadsRoot = path.resolve(uploadsRootDir);
     ensureDirectory(SITE_IMPORT_DIR);
     const exportStaging = path.join(SITE_IMPORT_DIR, `export-${timestampToken()}-${process.pid}-${crypto.randomBytes(4).toString('hex')}`);
@@ -167,7 +281,7 @@ async function createSiteBackupUnlocked(uploadsRootDir) {
             return { filename, relative };
         }));
         const manifestFiles = [];
-        await addArchiveFile(manifestFiles, 'database/factory.db', databaseFilename);
+        await addArchiveFile(manifestFiles, databaseArchivePath, databaseFilename);
 
         for (const file of uploadedFiles) {
             await addArchiveFile(manifestFiles, `uploads/${file.relative}`, file.filename);
@@ -178,7 +292,8 @@ async function createSiteBackupUnlocked(uploadsRootDir) {
             format: SITE_BACKUP_FORMAT,
             version: SITE_BACKUP_VERSION,
             createdAt: createdAt.toISOString(),
-            databaseType: 'sqlite',
+            databaseType,
+            databasePath: databaseArchivePath,
             uploadGroups: UPLOAD_GROUPS,
             uploadedFileCount: uploadedFiles.length,
             files: manifestFiles
@@ -198,7 +313,7 @@ async function createSiteBackupUnlocked(uploadsRootDir) {
                 if (error.code !== 'ENOENT') reject(error);
             });
             archive.pipe(output);
-            archive.file(databaseFilename, { name: 'database/factory.db' });
+            archive.file(databaseFilename, { name: databaseArchivePath });
             for (const file of uploadedFiles) {
                 archive.file(file.filename, { name: `uploads/${file.relative}` });
             }
@@ -207,12 +322,24 @@ async function createSiteBackupUnlocked(uploadsRootDir) {
         });
         fs.renameSync(temporary, destination);
         pruneSiteBackups();
-        return {
+        const backup = {
             ...backupDescriptor(destination),
             sha256: await sha256File(destination),
             uploadedFileCount: uploadedFiles.length,
             manifestCreatedAt: manifest.createdAt
         };
+        const config = loadSiteBackupConfig();
+        if (config.mirrorDirectory) {
+            try {
+                backup.mirror = await mirrorSiteBackup(destination, config.mirrorDirectory);
+                lastSiteBackupError = null;
+            } catch (error) {
+                lastSiteBackupError = { at: new Date().toISOString(), operation: '异地复制', error: error.message };
+                // 本机包仍然可用，但明确把异地失败返回给运维界面。
+                backup.mirrorError = error.message;
+            }
+        }
+        return backup;
     } finally {
         if (temporary) fs.rmSync(temporary, { force: true });
         fs.rmSync(exportStaging, { recursive: true, force: true });
@@ -232,12 +359,16 @@ function normalizeArchivePath(value) {
 }
 
 function validateManifest(manifest) {
-    if (!manifest || manifest.format !== SITE_BACKUP_FORMAT || manifest.version !== SITE_BACKUP_VERSION) {
+    if (!manifest || manifest.format !== SITE_BACKUP_FORMAT || ![1, SITE_BACKUP_VERSION].includes(Number(manifest.version))) {
         throw new Error('不是受支持的整站备份包');
     }
-    if (manifest.databaseType !== 'sqlite' || !Array.isArray(manifest.files)) {
+    if (!['sqlite', 'mysql'].includes(String(manifest.databaseType || '').toLowerCase()) || !Array.isArray(manifest.files)) {
         throw new Error('整站备份清单不完整');
     }
+    const databaseType = String(manifest.databaseType).toLowerCase();
+    const databasePath = String(manifest.databasePath || (databaseType === 'mysql' ? 'database/mysql.sql.gz' : 'database/factory.db'));
+    const expectedDatabasePath = databaseType === 'mysql' ? 'database/mysql.sql.gz' : 'database/factory.db';
+    if (databasePath !== expectedDatabasePath) throw new Error('整站备份数据库文件路径不合法');
     if (manifest.uploadGroups !== undefined) {
         if (!Array.isArray(manifest.uploadGroups)
             || manifest.uploadGroups.some(group => !UPLOAD_GROUPS.includes(String(group)))) {
@@ -254,15 +385,15 @@ function validateManifest(manifest) {
         if (!Number.isSafeInteger(size) || size < 0 || size > MAX_ARCHIVE_FILE_BYTES || !/^[a-f0-9]{64}$/.test(sha256)) {
             throw new Error(`整站备份文件校验信息无效: ${archivePath}`);
         }
-        if (archivePath !== 'database/factory.db' && !UPLOAD_GROUPS.some(group => archivePath.startsWith(`uploads/${group}/`))) {
+        if (archivePath !== databasePath && !UPLOAD_GROUPS.some(group => archivePath.startsWith(`uploads/${group}/`))) {
             throw new Error(`整站备份包含不允许恢复的文件: ${archivePath}`);
         }
         totalSize += size;
         if (totalSize > MAX_ARCHIVE_CONTENT_BYTES) throw new Error('整站备份解压后体积超过安全限制');
         declared.set(archivePath, { path: archivePath, size, sha256 });
     }
-    if (!declared.has('database/factory.db')) throw new Error('整站备份缺少 SQLite 数据库');
-    return declared;
+    if (!declared.has(databasePath)) throw new Error('整站备份缺少数据库文件');
+    return { declared, databaseType, databasePath };
 }
 
 async function extractValidatedArchive(archiveFilename, stagingDirectory) {
@@ -281,7 +412,7 @@ async function extractValidatedArchive(archiveFilename, stagingDirectory) {
         throw new Error('整站备份缺少有效清单');
     }
     const manifest = JSON.parse((await readEntryBuffer(manifestEntry, MAX_MANIFEST_BYTES)).toString('utf8'));
-    const declared = validateManifest(manifest);
+    const { declared, databaseType, databasePath } = validateManifest(manifest);
 
     for (const archivePath of entryMap.keys()) {
         if (archivePath !== 'manifest.json' && !declared.has(archivePath)) {
@@ -300,8 +431,14 @@ async function extractValidatedArchive(archiveFilename, stagingDirectory) {
         await streamEntryToFile(entry, destination, file.size, file.sha256);
     }
 
-    const databaseFilename = path.join(stagingDirectory, 'database', 'factory.db');
-    const verification = verifySqliteFile(databaseFilename);
+    const databaseFilename = path.join(stagingDirectory, ...databasePath.split('/'));
+    const activeDatabaseType = String(loadDatabaseConfig().type || '').toLowerCase();
+    if (activeDatabaseType !== databaseType) {
+        throw new Error(`灾备包数据库类型为 ${databaseType}，当前现场配置为 ${activeDatabaseType}，请先切换数据库类型`);
+    }
+    const verification = databaseType === 'sqlite'
+        ? verifySqliteFile(databaseFilename)
+        : await verifyDatabaseBackupFile(databaseFilename);
     if (!verification.valid) throw new Error(`整站备份数据库校验失败: ${verification.error}`);
     return { manifest, databaseFilename };
 }
@@ -353,7 +490,7 @@ async function restoreSiteBackup(archiveFilename, uploadsRootDir) {
 
 async function restoreSiteBackupUnlocked(archiveFilename, uploadsRootDir) {
     if (!getSiteBackupStatus().supported) {
-        throw new Error('整站灾备恢复仅支持安装版 SQLite 数据库');
+        throw new Error(getSiteBackupStatus().toolError || '当前数据库不支持整站灾备恢复');
     }
 
     ensureDirectory(SITE_IMPORT_DIR);
@@ -410,9 +547,72 @@ async function restoreSiteBackupUnlocked(archiveFilename, uploadsRootDir) {
     }
 }
 
+async function runAutomaticSiteBackup() {
+    if (!maintenanceUploadsRootDir) return null;
+    const config = loadSiteBackupConfig();
+    if (!config.autoEnabled) return null;
+    try {
+        const backup = await createSiteBackup(maintenanceUploadsRootDir);
+        lastAutomaticBackup = {
+            at: new Date().toISOString(),
+            filename: backup.filename,
+            mirror: backup.mirror || null,
+            mirrorError: backup.mirrorError || null
+        };
+        if (backup.mirrorError) {
+            lastSiteBackupError = { at: new Date().toISOString(), operation: '异地复制', error: backup.mirrorError };
+        } else {
+            lastSiteBackupError = null;
+        }
+        return backup;
+    } catch (error) {
+        lastSiteBackupError = { at: new Date().toISOString(), operation: '自动整站备份', error: error.message };
+        throw error;
+    }
+}
+
+async function startSiteBackupMaintenance(uploadsRootDir) {
+    maintenanceUploadsRootDir = path.resolve(uploadsRootDir);
+    if (siteBackupTimer) clearInterval(siteBackupTimer);
+    if (siteBackupInitialTimer) clearTimeout(siteBackupInitialTimer);
+    siteBackupTimer = null;
+    siteBackupInitialTimer = null;
+    const config = loadSiteBackupConfig();
+    if (!config.autoEnabled || process.env.NODE_ENV === 'test') return getSiteBackupStatus();
+
+    const intervalMs = Math.max(60 * 60 * 1000, config.intervalHours * 60 * 60 * 1000);
+    const latest = listSiteBackups()[0];
+    const due = !latest || (Date.now() - new Date(latest.createdAt).getTime() >= intervalMs);
+    if (due) {
+        // 启动阶段先让数据库/PLC稳定，再在后台生成，不阻塞界面打开。
+        siteBackupInitialTimer = setTimeout(() => {
+            siteBackupInitialTimer = null;
+            runAutomaticSiteBackup().catch(() => {});
+        }, 15000);
+        siteBackupInitialTimer.unref?.();
+    }
+    siteBackupTimer = setInterval(() => {
+        runAutomaticSiteBackup().catch(() => {});
+    }, intervalMs);
+    siteBackupTimer.unref?.();
+    return getSiteBackupStatus();
+}
+
+function stopSiteBackupMaintenance() {
+    if (siteBackupTimer) clearInterval(siteBackupTimer);
+    if (siteBackupInitialTimer) clearTimeout(siteBackupInitialTimer);
+    siteBackupTimer = null;
+    siteBackupInitialTimer = null;
+    maintenanceUploadsRootDir = null;
+}
+
 module.exports = {
     createSiteBackup,
     restoreSiteBackup,
+    loadSiteBackupConfig,
+    saveSiteBackupConfig,
+    startSiteBackupMaintenance,
+    stopSiteBackupMaintenance,
     getSiteBackupStatus,
     resolveSiteBackupPath,
     SITE_IMPORT_DIR

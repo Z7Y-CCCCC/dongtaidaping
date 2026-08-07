@@ -669,6 +669,12 @@ export function useSystemSettings({
         externalCopyRequired: true,
         backups: []
     })
+    const siteBackupConfig = reactive({
+        autoEnabled: true,
+        intervalHours: 24,
+        mirrorDirectory: ''
+    })
+    const siteBackupConfigSaving = ref(false)
     const databaseDefaultPorts = {
         mysql: 3307,
         postgres: 5432,
@@ -690,8 +696,27 @@ export function useSystemSettings({
             const status = await adminApi.getSiteBackups()
             if (status?.error) throw new Error(status.error)
             Object.assign(siteBackupStatus, status, { backups: status.backups || [] })
+            if (status.config) Object.assign(siteBackupConfig, status.config)
         } catch (e) {
             siteBackupMessage.value = `整站灾备状态读取失败：${e.message || e}`
+        }
+    }
+
+    async function saveSiteBackupConfiguration() {
+        siteBackupConfigSaving.value = true
+        siteBackupMessage.value = '正在保存自动灾备配置...'
+        try {
+            const result = await adminApi.saveSiteBackupConfig(siteBackupConfig)
+            if (result?.error || !result?.success) throw new Error(result?.error || '后端没有返回成功状态')
+            Object.assign(siteBackupConfig, result.config || {})
+            Object.assign(siteBackupStatus, result.status || {}, { backups: result.status?.backups || [] })
+            siteBackupMessage.value = siteBackupConfig.mirrorDirectory
+                ? `自动灾备已保存，将同步到：${siteBackupConfig.mirrorDirectory}`
+                : '自动灾备已保存；尚未配置外部目录，电脑丢失时本机副本无法使用。'
+        } catch (e) {
+            siteBackupMessage.value = `自动灾备配置保存失败：${e.message || e}`
+        } finally {
+            siteBackupConfigSaving.value = false
         }
     }
 
@@ -1042,8 +1067,11 @@ export function useSystemSettings({
         siteBackupBusy,
         siteBackupMessage,
         siteBackupStatus,
+        siteBackupConfig,
+        siteBackupConfigSaving,
         loadDatabaseConfig,
         loadSiteBackups,
+        saveSiteBackupConfiguration,
         downloadSiteBackup,
         exportSiteBackup,
         chooseSiteBackupFile,

@@ -635,7 +635,11 @@ export class SceneManager {
         const line = workshop?.lines?.find(item => item.id === range.lineId);
         const div = document.createElement('div');
         div.className = 'factory-guide-label';
-        div.innerHTML = `<span>${workshop?.name || '车间'}</span><strong>${line?.name || `产线 ${range.globalLineIndex + 1}`}</strong>`;
+        const workshopLabel = document.createElement('span');
+        workshopLabel.textContent = workshop?.name || '车间';
+        const lineLabel = document.createElement('strong');
+        lineLabel.textContent = line?.name || `产线 ${range.globalLineIndex + 1}`;
+        div.append(workshopLabel, lineLabel);
         const label = new CSS2DObject(div);
         label.userData.isFactoryGuideLabel = true;
         label.position.set(x, 0.25, z);

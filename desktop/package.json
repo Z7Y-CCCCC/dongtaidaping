@@ -13,6 +13,8 @@
     "build:unity": "node scripts/build-unity-client.cjs",
     "build:admin-host": "node scripts/build-native-admin-host.cjs",
     "test:logs": "node scripts/log-manager-test.cjs",
+    "test:supervisor": "node scripts/backend-supervisor-test.cjs",
+    "test:admin-host-parent": "node scripts/admin-host-parent-test.cjs",
     "dist": "npm run build:frontend && npm run build:unity && npm run build:admin-host && npm run prepare:resources && electron-builder --win nsis --x64"
   },
   "devDependencies": {

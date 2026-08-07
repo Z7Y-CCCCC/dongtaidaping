@@ -7,6 +7,7 @@ const { pipeline } = require('stream/promises');
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_MAX_ARCHIVES = 60;
+const DEFAULT_MAX_TOTAL_BYTES = 250 * 1024 * 1024;
 let archiveSequence = 0;
 
 function positiveInteger(value, fallback) {
@@ -31,13 +32,14 @@ function archiveFilename(filename) {
 function archiveOptions(options = {}) {
     return {
         retentionDays: positiveInteger(options.retentionDays ?? process.env.LOG_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
-        maxArchives: positiveInteger(options.maxArchives ?? process.env.LOG_MAX_ARCHIVES, DEFAULT_MAX_ARCHIVES)
+        maxArchives: positiveInteger(options.maxArchives ?? process.env.LOG_MAX_ARCHIVES, DEFAULT_MAX_ARCHIVES),
+        maxTotalBytes: positiveInteger(options.maxTotalBytes ?? process.env.LOG_MAX_TOTAL_BYTES, DEFAULT_MAX_TOTAL_BYTES)
     };
 }
 
 function cleanupLogArchives(directory, options = {}) {
     fs.mkdirSync(directory, { recursive: true });
-    const { retentionDays, maxArchives } = archiveOptions(options);
+    const { retentionDays, maxArchives, maxTotalBytes } = archiveOptions(options);
     const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
     const archives = fs.readdirSync(directory, { withFileTypes: true })
         .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.log.gz'))
@@ -55,6 +57,17 @@ function cleanupLogArchives(directory, options = {}) {
         .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
     for (const archive of retained.slice(maxArchives)) {
         fs.rmSync(archive.filename, { force: true });
+    }
+
+    const capped = retained
+        .filter(archive => fs.existsSync(archive.filename))
+        .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+    let totalBytes = capped.reduce((sum, archive) => sum + archive.stat.size, 0);
+    // 始终保留最新一份压缩日志；其余按时间从旧到新删除，避免异常刷屏吃满现场磁盘。
+    for (const archive of capped.slice(1).reverse()) {
+        if (totalBytes <= maxTotalBytes) break;
+        fs.rmSync(archive.filename, { force: true });
+        totalBytes -= archive.stat.size;
     }
 }
 
@@ -106,6 +119,7 @@ class RotatingLogWriter extends Writable {
         this.maxBytes = positiveInteger(options.maxBytes ?? process.env.LOG_MAX_BYTES, DEFAULT_MAX_BYTES);
         this.retentionDays = positiveInteger(options.retentionDays ?? process.env.LOG_RETENTION_DAYS, DEFAULT_RETENTION_DAYS);
         this.maxArchives = positiveInteger(options.maxArchives ?? process.env.LOG_MAX_ARCHIVES, DEFAULT_MAX_ARCHIVES);
+        this.maxTotalBytes = positiveInteger(options.maxTotalBytes ?? process.env.LOG_MAX_TOTAL_BYTES, DEFAULT_MAX_TOTAL_BYTES);
         this.fd = null;
         this.bytes = 0;
         this.open();
@@ -167,6 +181,7 @@ module.exports = {
     DEFAULT_MAX_BYTES,
     DEFAULT_RETENTION_DAYS,
     DEFAULT_MAX_ARCHIVES,
+    DEFAULT_MAX_TOTAL_BYTES,
     cleanupLogArchives,
     createRotatingLogWriter
 };

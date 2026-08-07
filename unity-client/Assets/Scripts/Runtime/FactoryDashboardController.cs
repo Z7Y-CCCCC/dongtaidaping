@@ -162,6 +162,8 @@ namespace HeatTreatment.DigitalTwin.Runtime
             set => _plcState = string.IsNullOrWhiteSpace(value) ? "unknown" : value;
         }
 
+        public string SelectedDeviceId => _selected?.Device?.Id ?? string.Empty;
+
         public void Initialize(
             Camera runtimeCamera,
             OrbitCameraController orbit,

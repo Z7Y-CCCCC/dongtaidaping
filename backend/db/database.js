@@ -21,6 +21,13 @@ const {
     effectiveDeviceLineId,
     configuredDeviceWorkshopId
 } = require('../utils/spatialLayout');
+const {
+    createMysqlDump,
+    resolveMysqlTools,
+    restoreMysqlDump,
+    verifyMysqlDumpFile,
+    verifyMysqlDumpFileSync
+} = require('../services/mysqlBackup');
 
 const DATA_DIR = process.env.APP_DATA_DIR
     ? path.resolve(process.env.APP_DATA_DIR)
@@ -30,6 +37,8 @@ const BACKUP_DIR = path.resolve(process.env.DB_BACKUP_DIR || path.join(DATA_DIR,
 const RECOVERY_DIR = path.resolve(process.env.DB_RECOVERY_DIR || path.join(DATA_DIR, 'recovery'));
 const BACKUP_INTERVAL_MS = positiveInteger(process.env.DB_BACKUP_INTERVAL_MS, 6 * 60 * 60 * 1000);
 const BACKUP_RETENTION = positiveInteger(process.env.DB_BACKUP_RETENTION, 10);
+const BACKUP_MAX_TOTAL_BYTES = positiveInteger(process.env.DB_BACKUP_MAX_TOTAL_BYTES, 20 * 1024 * 1024 * 1024);
+const BACKUP_MIN_FREE_BYTES = positiveInteger(process.env.DB_BACKUP_MIN_FREE_BYTES, 512 * 1024 * 1024);
 
 const DEFAULT_CONFIG = {
     type: 'mysql',
@@ -56,6 +65,7 @@ let backupTimer;
 let backupPromise;
 let lastBackup = null;
 let lastRecovery = null;
+let lastBackupError = null;
 
 function positiveInteger(value, fallback) {
     const parsed = Number(value);
@@ -145,21 +155,46 @@ function backupDescriptor(filename, options = {}) {
     };
 }
 
+function backupExtension(config = activeConfig || loadDatabaseConfig()) {
+    return dialectName(config) === 'mysql' ? '.sql.gz' : '.db';
+}
+
+function backupMatchesConfig(filename, config = activeConfig || loadDatabaseConfig()) {
+    const lower = String(filename || '').toLowerCase();
+    return lower.endsWith(backupExtension(config));
+}
+
+function ensureBackupDiskSpace(directory) {
+    if (typeof fs.statfsSync !== 'function') return;
+    try {
+        const stats = fs.statfsSync(directory);
+        const available = Number(stats.bavail || 0) * Number(stats.bsize || 0);
+        if (available > 0 && available < BACKUP_MIN_FREE_BYTES) {
+            throw new Error(`备份磁盘可用空间不足（至少需要 ${Math.round(BACKUP_MIN_FREE_BYTES / 1024 / 1024)} MB）`);
+        }
+    } catch (error) {
+        if (error.message.includes('可用空间不足')) throw error;
+        // 某些 Windows 文件系统不提供 statfs，不能因此阻断备份。
+    }
+}
+
 function listDatabaseBackups({ validate = true } = {}) {
     ensureDirectory(BACKUP_DIR);
     return fs.readdirSync(BACKUP_DIR, { withFileTypes: true })
-        .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.db'))
+        .filter(entry => entry.isFile() && backupMatchesConfig(entry.name))
         .map(entry => path.join(BACKUP_DIR, entry.name))
         .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)
         .map(filename => {
-            const verification = validate ? verifySqliteFile(filename) : { valid: null, error: null };
+            const verification = validate
+                ? (backupExtension() === '.db' ? verifySqliteFile(filename) : verifyMysqlDumpFileSync(filename))
+                : { valid: null, error: null };
             return backupDescriptor(filename, verification);
         });
 }
 
 function resolveDatabaseBackupPath(filename) {
     const name = path.basename(String(filename || ''));
-    if (!name || name !== filename || !name.toLowerCase().endsWith('.db')) {
+    if (!name || name !== filename || !backupMatchesConfig(name)) {
         throw new Error('备份文件名不合法');
     }
     const resolved = path.join(BACKUP_DIR, name);
@@ -636,6 +671,14 @@ function pruneDatabaseBackups() {
     for (const backup of backups.slice(BACKUP_RETENTION)) {
         fs.rmSync(path.join(BACKUP_DIR, backup.filename), { force: true });
     }
+
+    const retained = listDatabaseBackups({ validate: false });
+    let totalBytes = retained.reduce((sum, backup) => sum + Number(backup.size || 0), 0);
+    for (const backup of retained.slice(1).reverse()) {
+        if (totalBytes <= BACKUP_MAX_TOTAL_BYTES) break;
+        fs.rmSync(path.join(BACKUP_DIR, backup.filename), { force: true });
+        totalBytes -= Number(backup.size || 0);
+    }
 }
 
 async function createDatabaseBackup(reason = 'manual') {
@@ -643,20 +686,29 @@ async function createDatabaseBackup(reason = 'manual') {
 
     backupPromise = (async () => {
         await getDb();
-        if (dialectName() !== 'sqlite' || !sqliteDb) {
-            throw new Error('自动文件备份仅支持 SQLite 数据库');
-        }
-
         ensureDirectory(BACKUP_DIR);
+        ensureBackupDiskSpace(BACKUP_DIR);
         const safeReason = sanitizeBackupReason(reason);
-        const filename = `factory-${timestampToken()}-${safeReason}.db`;
+        const isMysql = dialectName() === 'mysql';
+        if (!isMysql && (dialectName() !== 'sqlite' || !sqliteDb)) {
+            throw new Error('自动文件备份当前支持 SQLite 和 MySQL 数据库');
+        }
+        const filename = `factory-${timestampToken()}-${safeReason}${isMysql ? '.sql.gz' : '.db'}`;
         const destination = path.join(BACKUP_DIR, filename);
         const temporary = `${destination}.${process.pid}.tmp`;
         fs.rmSync(temporary, { force: true });
 
         try {
-            await sqliteDb.backup(temporary);
-            const verification = verifySqliteFile(temporary);
+            let verification;
+            if (isMysql) {
+                let serverVersion = '';
+                try { serverVersion = String((await makeDbClient().get('SELECT VERSION() AS version'))?.version || ''); } catch (error) { /* tool selection can fall back */ }
+                await createMysqlDump(activeConfig, temporary, { serverVersion });
+                verification = await verifyMysqlDumpFile(temporary);
+            } else {
+                await sqliteDb.backup(temporary);
+                verification = verifySqliteFile(temporary);
+            }
             if (!verification.valid) throw new Error(verification.error);
             fs.renameSync(temporary, destination);
             pruneDatabaseBackups();
@@ -664,8 +716,12 @@ async function createDatabaseBackup(reason = 'manual') {
                 ...backupDescriptor(destination, { valid: true }),
                 reason: safeReason
             };
-            console.log(`[DB] SQLite 备份完成: ${destination}`);
+            lastBackupError = null;
+            console.log(`[DB] ${isMysql ? 'MySQL' : 'SQLite'} 备份完成: ${destination}`);
             return lastBackup;
+        } catch (error) {
+            lastBackupError = { at: new Date().toISOString(), reason: safeReason, error: error.message };
+            throw error;
         } finally {
             fs.rmSync(temporary, { force: true });
         }
@@ -678,24 +734,29 @@ async function createDatabaseBackup(reason = 'manual') {
 
 async function importDatabaseBackupFile(sourceFilename, reason = 'site-import') {
     await getDb();
-    if (dialectName() !== 'sqlite') {
-        throw new Error('外部文件恢复仅支持 SQLite 数据库');
-    }
-
     const source = path.resolve(String(sourceFilename || ''));
-    const verification = verifySqliteFile(source);
+    const isMysql = dialectName() === 'mysql';
+    if (!isMysql && dialectName() !== 'sqlite') {
+        throw new Error('外部文件恢复当前支持 SQLite 和 MySQL 数据库');
+    }
+    const expectedExtension = isMysql ? '.sql.gz' : '.db';
+    if (!source.toLowerCase().endsWith(expectedExtension)) {
+        throw new Error(`导入备份格式与当前 ${isMysql ? 'MySQL' : 'SQLite'} 数据库不匹配`);
+    }
+    const verification = isMysql ? await verifyMysqlDumpFile(source) : verifySqliteFile(source);
     if (!verification.valid) throw new Error(`导入数据库完整性检查失败: ${verification.error}`);
 
     ensureDirectory(BACKUP_DIR);
+    ensureBackupDiskSpace(BACKUP_DIR);
     const safeReason = sanitizeBackupReason(reason);
-    const filename = `factory-${timestampToken()}-${safeReason}.db`;
+    const filename = `factory-${timestampToken()}-${safeReason}${expectedExtension}`;
     const destination = path.join(BACKUP_DIR, filename);
     const temporary = `${destination}.${process.pid}.tmp`;
     fs.rmSync(temporary, { force: true });
 
     try {
         fs.copyFileSync(source, temporary);
-        const copiedVerification = verifySqliteFile(temporary);
+        const copiedVerification = isMysql ? await verifyMysqlDumpFile(temporary) : verifySqliteFile(temporary);
         if (!copiedVerification.valid) throw new Error(copiedVerification.error);
         fs.renameSync(temporary, destination);
         pruneDatabaseBackups();
@@ -708,11 +769,58 @@ async function importDatabaseBackupFile(sourceFilename, reason = 'site-import') 
     }
 }
 
+async function restoreMysqlDatabaseBackup(filename) {
+    const source = resolveDatabaseBackupPath(filename);
+    const verification = await verifyMysqlDumpFile(source);
+    if (!verification.valid) throw new Error(`备份完整性检查失败: ${verification.error}`);
+
+    const config = { ...activeConfig };
+    ensureDirectory(RECOVERY_DIR);
+    const restoreSource = path.join(RECOVERY_DIR, `restore-source-${timestampToken()}-${process.pid}.sql.gz`);
+    fs.rmSync(restoreSource, { force: true });
+
+    try {
+        fs.copyFileSync(source, restoreSource);
+        const copiedVerification = await verifyMysqlDumpFile(restoreSource);
+        if (!copiedVerification.valid) throw new Error(`恢复源复制后校验失败: ${copiedVerification.error}`);
+
+        const rollback = await createDatabaseBackup('before-restore');
+        const rollbackSource = path.join(BACKUP_DIR, rollback.filename);
+        let serverVersion = '';
+        try { serverVersion = String((await makeDbClient().get('SELECT VERSION() AS version'))?.version || ''); } catch (error) { /* tool selection can fall back */ }
+        await closeDb();
+
+        try {
+            await restoreMysqlDump(config, restoreSource, { serverVersion });
+            await getDb();
+            const requiredTable = await makeDbClient().get('SELECT COUNT(*) AS cnt FROM settings');
+            if (!requiredTable || Number(requiredTable.cnt) < 1) throw new Error('恢复后的 MySQL 数据库缺少系统设置');
+            lastRecovery = {
+                reason: 'manual_restore',
+                sourceType: 'backup',
+                source: path.basename(source),
+                recoveredAt: new Date().toISOString()
+            };
+            return { success: true, recovery: lastRecovery, rollback };
+        } catch (error) {
+            await closeDb();
+            try {
+                await restoreMysqlDump(config, rollbackSource, { serverVersion });
+                await getDb();
+            } catch (rollbackError) {
+                throw new Error(`${error.message}；自动回滚也失败：${rollbackError.message}`);
+            }
+            throw error;
+        }
+    } finally {
+        fs.rmSync(restoreSource, { force: true });
+    }
+}
+
 async function restoreDatabaseBackup(filename) {
     await getDb();
-    if (dialectName() !== 'sqlite') {
-        throw new Error('文件恢复仅支持 SQLite 数据库');
-    }
+    if (dialectName() === 'mysql') return restoreMysqlDatabaseBackup(filename);
+    if (dialectName() !== 'sqlite') throw new Error('文件恢复当前支持 SQLite 和 MySQL 数据库');
 
     if (backupPromise) await backupPromise;
     const source = resolveDatabaseBackupPath(filename);
@@ -759,29 +867,36 @@ async function restoreDatabaseBackup(filename) {
 
 function getDatabaseBackupStatus() {
     const config = activeConfig || loadDatabaseConfig();
-    const supported = dialectName(config) === 'sqlite';
+    const type = dialectName(config);
+    const mysqlTools = type === 'mysql' ? resolveMysqlTools() : null;
+    const supported = type === 'sqlite' || (type === 'mysql' && mysqlTools.available);
     return {
+        type,
         supported,
         automatic: supported,
         intervalMs: BACKUP_INTERVAL_MS,
         retention: BACKUP_RETENTION,
+        maxTotalBytes: BACKUP_MAX_TOTAL_BYTES,
         directory: BACKUP_DIR,
         lastBackup,
+        lastBackupError,
         lastRecovery,
+        toolAvailable: type !== 'mysql' || mysqlTools.available,
+        toolError: type === 'mysql' ? mysqlTools.error : null,
         backups: supported ? listDatabaseBackups({ validate: true }) : []
     };
 }
 
 async function startDatabaseMaintenance() {
     await getDb();
-    if (dialectName() !== 'sqlite') return getDatabaseBackupStatus();
+    if (!['sqlite', 'mysql'].includes(dialectName())) return getDatabaseBackupStatus();
     if (backupTimer) clearInterval(backupTimer);
 
-    try {
-        await createDatabaseBackup('startup');
-    } catch (error) {
+    // MySQL 全量 dump 可能需要数分钟，不能阻塞 PLC 数据引擎启动。
+    // 后台发起并由 backupPromise 串行化；退出流程仍会等待它完成或超时。
+    createDatabaseBackup('startup').catch(error => {
         console.error('[DB] 启动备份失败:', error.message);
-    }
+    });
 
     backupTimer = setInterval(() => {
         createDatabaseBackup('scheduled').catch(error => {
@@ -798,6 +913,12 @@ async function stopDatabaseMaintenance(options = {}) {
         backupTimer = null;
     }
     if (options.backup !== false && sqliteDb && dialectName() === 'sqlite') {
+        try {
+            await createDatabaseBackup(options.reason || 'shutdown');
+        } catch (error) {
+            console.error('[DB] 退出备份失败:', error.message);
+        }
+    } else if (options.backup !== false && pool && dialectName() === 'mysql') {
         try {
             await createDatabaseBackup(options.reason || 'shutdown');
         } catch (error) {
@@ -2083,6 +2204,9 @@ module.exports = {
     startDatabaseMaintenance,
     stopDatabaseMaintenance,
     verifySqliteFile,
+    verifyDatabaseBackupFile: async (filename) => dialectName() === 'mysql'
+        ? verifyMysqlDumpFile(filename)
+        : verifySqliteFile(filename),
     loadDatabaseConfig,
     saveDatabaseConfig,
     publicDatabaseConfig,

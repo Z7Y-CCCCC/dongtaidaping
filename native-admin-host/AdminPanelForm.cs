@@ -51,12 +51,15 @@ internal sealed class AdminPanelForm : Form
     private Point _dragPointerOffset;
     private Rectangle _dragStartBounds;
     private IntPtr _parentHandle;
+    private readonly DateTime? _parentProcessStartTimeUtc;
+    private bool _waitingForParentWindow;
     private Task? _pipeTask;
 
     public AdminPanelForm(HostOptions options)
     {
         _options = options;
         _parentHandle = options.ParentWindowHandle;
+        _parentProcessStartTimeUtc = ReadProcessStartTimeUtc(options.ParentProcessId);
         _defaultDetachedBounds = new Rectangle(120, 90, 1320, 820);
         _embeddedBounds = Rectangle.Empty;
         _savedDetachedBounds = _defaultDetachedBounds;
@@ -84,7 +87,11 @@ internal sealed class AdminPanelForm : Form
             await InitializeWebViewAsync();
             BeginInvoke(ApplyInitialPlacement);
         };
-        FormClosed += (_, _) => _pipeCancellation.Cancel();
+        FormClosed += (_, _) =>
+        {
+            _parentTimer.Stop();
+            _pipeCancellation.Cancel();
+        };
     }
 
     private void BuildChrome()
@@ -361,17 +368,44 @@ internal sealed class AdminPanelForm : Form
     {
         if (TryResolveParentWindow())
         {
+            _waitingForParentWindow = false;
+            _parentTimer.Interval = 33;
             InitializeParentWindowState();
             AttachToParent(false);
-            _parentTimer.Start();
         }
         else
         {
             _attached = false;
             _adminVisible = true;
+            _waitingForParentWindow = _options.ParentProcessId > 0;
+            _parentTimer.Interval = 500;
             Bounds = _defaultDetachedBounds;
             ShowPanel();
         }
+        if (_options.ParentProcessId > 0) _parentTimer.Start();
+    }
+
+    private static DateTime? ReadProcessStartTimeUtc(int processId)
+    {
+        if (processId <= 0) return null;
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            if (process.HasExited) return null;
+            return process.StartTime.ToUniversalTime();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private bool IsParentProcessRunning()
+    {
+        var currentStartTime = ReadProcessStartTimeUtc(_options.ParentProcessId);
+        if (!currentStartTime.HasValue) return false;
+        return !_parentProcessStartTimeUtc.HasValue
+            || currentStartTime.Value == _parentProcessStartTimeUtc.Value;
     }
 
     private bool TryResolveParentWindow()
@@ -397,9 +431,26 @@ internal sealed class AdminPanelForm : Form
 
     private void MaintainParentWindow()
     {
-        if (!TryResolveParentWindow())
+        if (!IsParentProcessRunning())
         {
             Close();
+            return;
+        }
+        if (!TryResolveParentWindow())
+        {
+            // Unity can take several seconds to create its main HWND (and smoke/
+            // batch mode may never create one).  Keep monitoring the process at a
+            // low rate instead of becoming an orphan or closing during startup.
+            _waitingForParentWindow = true;
+            _parentTimer.Interval = 500;
+            return;
+        }
+        if (_waitingForParentWindow)
+        {
+            _waitingForParentWindow = false;
+            _parentTimer.Interval = 33;
+            InitializeParentWindowState();
+            AttachToParent(false);
             return;
         }
         RefreshParentWindowState();

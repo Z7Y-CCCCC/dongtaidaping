@@ -233,8 +233,11 @@ const {
     siteBackupBusy,
     siteBackupMessage,
     siteBackupStatus,
+    siteBackupConfig,
+    siteBackupConfigSaving,
     loadDatabaseConfig,
     loadSiteBackups,
+    saveSiteBackupConfiguration,
     downloadSiteBackup,
     exportSiteBackup,
     chooseSiteBackupFile,
@@ -7250,17 +7253,21 @@ const mainTabs = [
                                 </span>
                             </div>
 
-                            <div v-if="databaseConfig.type === 'sqlite' && databaseBackupStatus.supported" class="database-backup-panel">
+                            <div v-if="databaseBackupStatus.supported" class="database-backup-panel">
                                 <div class="database-backup-header">
                                     <div>
-                                        <strong>本机自动备份（仅防断电或数据库损坏）</strong>
+                                        <strong>{{ databaseBackupStatus.type === 'mysql' ? 'MySQL 自动压缩备份' : 'SQLite 本机自动备份' }}（仅防断电或数据库损坏）</strong>
                                         <p>
-                                            WAL 全同步写入；每 {{ formatBackupInterval(databaseBackupStatus.intervalMs) }} 自动备份，
+                                            {{ databaseBackupStatus.type === 'mysql' ? '使用一致性 mysqldump 并 gzip 压缩；' : 'WAL 全同步写入；' }}
+                                            每 {{ formatBackupInterval(databaseBackupStatus.intervalMs) }} 自动备份，
                                             保留最近 {{ databaseBackupStatus.retention }} 份，退出时再备份一次。
                                         </p>
                                     </div>
                                     <button @click="createDatabaseBackup" class="btn" :disabled="databaseBackupBusy">立即备份</button>
                                 </div>
+                                <p v-if="databaseBackupStatus.lastBackupError" class="database-recovery-notice">
+                                    最近一次自动备份失败：{{ databaseBackupStatus.lastBackupError.error }}
+                                </p>
                                 <p v-if="databaseBackupStatus.lastRecovery" class="database-recovery-notice">
                                     最近恢复：{{ new Date(databaseBackupStatus.lastRecovery.recoveredAt).toLocaleString() }}，
                                     来源 {{ databaseBackupStatus.lastRecovery.source }}
@@ -7284,8 +7291,13 @@ const mainTabs = [
                                     <div v-if="databaseBackupStatus.backups.length === 0" class="empty-hint">暂无备份</div>
                                 </div>
                             </div>
+                            <div v-else-if="databaseConfig.type === 'mysql'" class="database-backup-panel">
+                                <p class="database-local-only-notice">
+                                    MySQL 已连接，但未找到 mysqldump/mysql 客户端工具，自动备份暂不可用。请安装 MySQL 客户端工具，或在服务环境配置 MYSQLDUMP_PATH、MYSQL_CLIENT_PATH 后重启软件。
+                                </p>
+                            </div>
 
-                            <div v-if="databaseConfig.type === 'sqlite' && siteBackupStatus.supported" class="site-backup-panel">
+                            <div v-if="siteBackupStatus.supported" class="site-backup-panel">
                                 <div class="site-backup-header">
                                     <div>
                                         <strong>整站灾备（防电脑丢失）</strong>
@@ -7299,6 +7311,26 @@ const mainTabs = [
                                 </div>
                                 <p class="site-backup-external-notice">
                                     导出时请保存到 U 盘、移动硬盘或 NAS。只保存在现场电脑上，仍然不能防止整机丢失。
+                                </p>
+                                <div class="site-backup-auto-config">
+                                    <label class="site-backup-auto-toggle">
+                                        <input v-model="siteBackupConfig.autoEnabled" type="checkbox" />
+                                        自动整站备份
+                                    </label>
+                                    <label>间隔（小时）
+                                        <input v-model.number="siteBackupConfig.intervalHours" class="input input-small" type="number" min="1" max="168" />
+                                    </label>
+                                    <label class="site-backup-mirror-field">外部备份目录（U 盘 / NAS）
+                                        <input v-model="siteBackupConfig.mirrorDirectory" class="input" placeholder="例如 E:\\数字孪生备份 或 \\\\NAS\\factory-backup" />
+                                    </label>
+                                    <button type="button" class="btn btn-small" :disabled="siteBackupConfigSaving" @click="saveSiteBackupConfiguration">保存自动灾备</button>
+                                </div>
+                                <p v-if="siteBackupStatus.lastAutomaticBackup" class="database-backup-message">
+                                    最近自动备份：{{ siteBackupStatus.lastAutomaticBackup.filename }}
+                                    <span v-if="siteBackupStatus.lastAutomaticBackup.mirror">（已同步外部目录）</span>
+                                </p>
+                                <p v-if="siteBackupStatus.lastError" class="database-recovery-notice">
+                                    灾备提醒：{{ siteBackupStatus.lastError.error }}
                                 </p>
                                 <p v-if="siteBackupMessage" class="database-backup-message">{{ siteBackupMessage }}</p>
                                 <div v-if="siteBackupStatus.backups.length" class="site-backup-history">
@@ -7648,7 +7680,7 @@ const mainTabs = [
 * { box-sizing: border-box; }
 
 .admin-container {
-    width: 100vw; height: 100vh; height: 100dvh; min-height: 0;
+    width: 100%; height: 100%; min-width: 0; min-height: 0;
     background: #f5f5f7; color: #1d1d1f;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
     display: flex; flex-direction: column;
@@ -11003,6 +11035,11 @@ button:enabled:active {
 .site-backup-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; }
 .site-backup-file-input { display: none; }
 .site-backup-external-notice { margin: 16px 0 0; padding: 12px 14px; color: #173f2b; background: #edf8f1; border-left: 3px solid #24834f; font-size: 13px; line-height: 1.55; }
+.site-backup-auto-config { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-top: 14px; padding: 12px 14px; background: #f7f7f8; border: 1px solid #e1e1e4; border-radius: 8px; }
+.site-backup-auto-config label { display: flex; flex-direction: column; gap: 5px; color: #515154; font-size: 12px; }
+.site-backup-auto-toggle { flex-direction: row !important; align-items: center; padding-bottom: 8px; color: #1d1d1f !important; }
+.site-backup-mirror-field { flex: 1 1 360px; min-width: 260px; }
+.site-backup-auto-config .input-small { width: 90px; }
 .site-backup-history { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 8px 14px; align-items: start; margin-top: 16px; padding-top: 14px; border-top: 1px solid #e5e5e7; }
 .site-backup-history > span { padding-top: 8px; color: #6e6e73; font-size: 12px; }
 .site-backup-history-item { grid-column: 2; display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; min-width: 0; padding: 8px 10px; color: #1d1d1f; background: transparent; border: 1px solid transparent; border-radius: 6px; text-align: left; cursor: pointer; transition: background-color 160ms ease, border-color 160ms ease; }

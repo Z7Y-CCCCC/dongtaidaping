@@ -4,17 +4,22 @@
 
 1. 双击安装包并完成安装。
 2. 从桌面或开始菜单打开“热处理数字孪生大屏”。
-3. 软件首次启动会自动创建本地 SQLite 数据库，无需安装 Node.js、MySQL 或浏览器。
+3. 正式生产默认连接 MySQL / MariaDB（默认 `127.0.0.1:3307`）；现场需预先安装并启动数据库服务。Node.js、浏览器和 Unity 运行时均由安装包提供。
 4. 安装版会注册为当前 Windows 用户登录后自动启动。
+
+正式现场不要使用 MySQL `root` 账号。应创建仅限 `localhost`、仅拥有本项目数据库权限的专用账号，并在 MySQL `my.ini` 中设置 `bind-address=127.0.0.1`。数据库端口不得通过路由器端口映射、云安全组或 Windows 防火墙暴露到公网。
 
 ## 数据位置
 
 客户配置、SQLite 数据库、上传模型和运行日志保存在当前 Windows 用户的应用数据目录中，卸载软件默认不会删除客户数据。
 
 ```text
-%APPDATA%\heat-treatment-digital-twin-desktop\data\factory.db
+%APPDATA%\heat-treatment-digital-twin-desktop\data\database-config.json
+%APPDATA%\heat-treatment-digital-twin-desktop\data\factory.db（离线应急快照）
 %APPDATA%\heat-treatment-digital-twin-desktop\data\backups\
 %APPDATA%\heat-treatment-digital-twin-desktop\data\recovery\
+%APPDATA%\heat-treatment-digital-twin-desktop\data\site-backups\
+%APPDATA%\heat-treatment-digital-twin-desktop\data\site-backup-config.json
 %APPDATA%\heat-treatment-digital-twin-desktop\uploads\models\
 %APPDATA%\heat-treatment-digital-twin-desktop\uploads\audio\
 %APPDATA%\heat-treatment-digital-twin-desktop\logs\backend.log
@@ -25,11 +30,11 @@
 
 ## 断电恢复与备份
 
-- 数据库使用 WAL 和全同步写入，启动时自动执行完整性检查。
-- 启动、每 6 小时和正常退出时自动备份，默认轮转保留最近 10 份。
-- 数据库损坏时，程序会把损坏文件移到 `recovery`，再从最新校验通过的备份恢复。
+- SQLite 应急库使用 WAL 和全同步写入，启动时自动执行完整性检查；损坏时会隔离损坏文件并从最新有效备份恢复。
+- MySQL 生产库使用一致性 `mysqldump`，生成 `.sql.gz`；SQLite 生成 `.db`。两种数据库都会在启动、每 6 小时和正常退出时备份，默认保留最近 10 份。
+- MySQL 备份密码通过短生命周期客户端配置文件传递，不写入命令行和日志；恢复前自动创建回滚备份，恢复失败会自动回滚。
 - `backend.log` 记录后端正常运行输出，`backend-error.log` 单独记录后端错误输出，`desktop-error.log` 记录桌面壳启动和子进程异常；三类日志都按时间戳保留。
-- 单个活动日志默认达到 10 MB 自动切卷并 gzip；压缩日志默认保留 30 天、最多保留 60 个，程序运行期间每 6 小时自动清理一次。
+- 单个活动日志默认达到 10 MB 自动切卷并 gzip；压缩日志默认保留 30 天、最多 60 个、总计不超过 250 MB，程序运行期间每 6 小时自动清理一次。
 - 工程师做隔离诊断时可设置 `APP_USER_DATA_DIR` 指定应用数据目录；正常客户部署无需设置。
 - 后台“数据库连接 → 本机自动备份”可立即备份、下载或恢复；恢复前会自动创建回滚备份。
 - 本机自动备份与现场电脑存放在一起，只能防断电或数据库损坏，不能防电脑丢失、硬盘损坏或整机报废。
@@ -37,18 +42,18 @@
 
 ## 整站灾备与新电脑恢复
 
-后台“数据库连接 → 整站灾备（防电脑丢失）”可导出一个 ZIP 灾备包，其中包含：
+后台“数据库连接 → 整站灾备（防电脑丢失）”可导出一个 ZIP 灾备包，并可配置每 1～168 小时自动生成、同步到 U 盘或 NAS。灾备包包含：
 
-- 一致性 SQLite 数据库，以及数据库中的车间、产线、设备、PLC 点位、性能设置和平台编排等全部现场配置。
+- 一致性 MySQL 压缩 dump 或 SQLite 数据库，以及车间、产线、设备、PLC 点位、历史数据、性能设置和平台编排等全部现场数据。
 - 现场自行上传的 GLB/GLTF 模型文件。内置模型随安装包提供，不重复写入灾备包。
 - 点位语音播报所生成或上传的 WAV、MP3、OGG、M4A 文件。
 - 文件清单、大小和 SHA-256，用于导入前完整性校验。
 
 现场备份步骤：
 
-1. 点击“导出整站备份”。
-2. 在安装版弹出的“另存为”窗口中选择 U 盘、移动硬盘或 NAS。不要只保存在现场电脑上。
-3. 定期把最新 ZIP 复制到另一处受控存储，并按现场制度保管。
+1. 填写“外部备份目录”，例如 `E:\数字孪生备份` 或 `\\NAS\factory-backup`，设置自动间隔并保存。
+2. 点击“导出整站备份”做首次校验；后台应显示“已同步外部目录”。
+3. 定期抽查外部目录中的 ZIP，并在备用电脑做恢复演练。未配置外部目录时，本机自动备份不能防电脑丢失。
 
 现场电脑丢失或更换后的恢复步骤：
 
@@ -84,19 +89,24 @@
 
 ## 交付前实测结果
 
-2026-07-22 使用外部 Snap7 仿真器完成隔离测试：
+2026-08-07 使用外部 Snap7 仿真器和独立临时数据库完成隔离测试：
 
-- `WORD/BOOL/REAL` 三类点位以 250/500/1000ms 持续采集 45 秒，共收到 306 帧，最大帧间隔 267ms。
-- 24 次 PLC 写入到 WebSocket 的延迟：p50 143ms、p95 158ms、最大 220ms。
-- 强杀 PLC 后 79ms 发布坏质量、4.126 秒判离线；PLC 恢复后 994ms 出现首个好帧、1.105 秒恢复在线。
+- `WORD/BOOL/REAL` 三类点位以 250/500/1000ms 持续采集，最近一轮延迟 p50 143ms、p95 161ms，最大帧间隔 267ms。
+- 强杀 PLC 后 0.207 秒发布坏质量、4.182 秒判离线；PLC 恢复后 1.064 秒出现首个好帧、1.065 秒恢复在线，随后连续读取 8/8 成功。
 - 高频写入中强杀后端，重启后最后一次已确认写入仍存在，数据库 `quick_check=ok`。
 - 人为损坏主数据库后已验证自动恢复、损坏文件隔离、备份下载、手工恢复和恢复前回滚备份。
-- 已验证整站 ZIP 导出、配置与上传模型的异机式恢复、SQLite 完整性、SHA-256 校验、损坏包拒绝和恢复前回滚。
+- 已验证 MySQL `.sql.gz` 创建、校验、恢复、失败回滚，以及 MySQL/SQLite 两类整站 ZIP 对数据库和上传模型的恢复。
+- 已验证整站 ZIP 向外置目录临时复制、SHA-256 校验和原子改名，复制中断的半成品不会被当作正式备份。
+- 已验证安全响应头、严格 CORS、5 MB 普通 JSON 上限、路径穿越拒绝、上传目录不可枚举，以及误绑定 `0.0.0.0` 时非本机写请求仍被拒绝。
+- PLC 换算公式使用受限数学解析器，只允许 `x`、数字、四则运算和括号，不执行 JavaScript。
+- 已验证桌面后端异常退出后自动恢复，以及 Unity 父进程退出后后台宿主自动清理。
+- 后台与旧 Web 三维大屏已按需加载；进入 Unity 内嵌后台时不再预加载旧 Web 三维场景，基础入口包约 100.55 KB。
 
 ## 商业交付注意事项
 
 - 当前安装包未进行商业代码签名，Windows 可能显示“未知发布者”。正式对外销售建议使用企业代码签名证书重新签名。
 - 软件默认只监听本机回环地址，不应直接暴露到公网。
-- 当前版本已通过仿真 PLC、备份恢复和进程强杀测试，可生成客户安装即用的部署包。
+- 当前版本已通过仿真 PLC、MySQL/SQLite 灾备恢复、进程强杀和生产安全边界测试。
 - 仿真测试不能替代客户现场 PLC 型号、网络、点表和断电来电流程验收，正式上线仍需按现场点表逐点确认。
-- 当前安装包使用本地 SQLite；如现场改用 MySQL/PostgreSQL/SQL Server，文件级自动备份功能不适用，应使用对应数据库服务器的备份方案。
+- MySQL 生产备份要求现场存在兼容版本的 `mysqldump.exe` 和 `mysql.exe`。标准 MySQL Server 安装会同时提供；若安装在非标准目录，可配置 `MYSQLDUMP_PATH` 与 `MYSQL_CLIENT_PATH`。
+- PostgreSQL 和 SQL Server 仍需使用数据库服务器自身的备份体系；后台会明确显示“不支持”，不会伪装成已备份。

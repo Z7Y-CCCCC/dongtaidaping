@@ -9,6 +9,7 @@
 
 const nodes7 = require('nodes7');
 const { getDb } = require('../db/database');
+const { evaluateMathExpression } = require('../utils/mathExpression');
 
 const DATA_GROUPS = ['analog', 'status', 'motors', 'doors', 'mechanisms', 'gas'];
 const MIN_SAMPLE_INTERVAL_MS = 100;
@@ -790,11 +791,9 @@ class PlcReader {
     _applyExpression(value, point) {
         const expression = String(point.expression || '').trim();
         if (!expression || typeof value !== 'number' || Number.isNaN(value)) return value;
-        if (!/^[xX0-9+\-*/().\s]+$/.test(expression)) return value;
 
         try {
-            const fn = new Function('x', `"use strict"; return (${expression});`);
-            const result = Number(fn(value));
+            const result = Number(evaluateMathExpression(expression, value));
             return Number.isFinite(result) ? parseFloat(result.toFixed(3)) : value;
         } catch (e) {
             return value;

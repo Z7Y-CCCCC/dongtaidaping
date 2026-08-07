@@ -226,7 +226,12 @@ async function main() {
 
         const checks = {
             startupBackupCreated: initialBackupStatus.backups.some(item => item.valid && item.filename.includes('-startup.db')),
-            acknowledgedWriteSurvivedPowerCut: recoveredAcknowledged === lastAcknowledged,
+            // A request can commit durably just before the test process is killed but
+            // finish its HTTP response after the client stops tracking acknowledgements.
+            // Recovery may therefore be ahead of the last observed acknowledgement;
+            // it must never be behind it.
+            acknowledgedWriteSurvivedPowerCut: Number.isFinite(recoveredAcknowledged)
+                && recoveredAcknowledged >= lastAcknowledged,
             walRecoveryQuickCheckOk: postCutInspection.quickCheck === 'ok',
             walModeEnabled: String(postCutInspection.journalMode).toLowerCase() === 'wal',
             restartBackupCreated: postCutBackupStatus.backups.length > backupCountBeforeRestart,

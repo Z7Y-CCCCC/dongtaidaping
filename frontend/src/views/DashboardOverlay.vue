@@ -8,6 +8,7 @@ import WidgetRenderer from '../runtime/WidgetRenderer.vue'
 const rootRef = ref(null)
 const selectedWidgetId = ref('')
 const hostConnected = ref(false)
+const lineReturnBusy = ref(false)
 
 const dataStore = createDashboardDataStore({
     metricsRefreshIntervalMs: 5000,
@@ -196,7 +197,7 @@ function eventQueryConfig() {
 
 async function focusNativeScene(mode, event = {}) {
     try {
-        await fetch(`${API_BASE}/native-preview`, {
+        const response = await fetch(`${API_BASE}/native-preview`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -210,8 +211,21 @@ async function focusNativeScene(mode, event = {}) {
                 }
             })
         })
+        return response.ok
     } catch {
         // Unity 不在线时不影响数据组件本身。
+        return false
+    }
+}
+
+async function returnToLineView() {
+    if (lineReturnBusy.value) return
+    lineReturnBusy.value = true
+    try {
+        // lineId 留空时，Unity 会依据当前设备自动解析所属产线。
+        await focusNativeScene('line')
+    } finally {
+        lineReturnBusy.value = false
     }
 }
 
@@ -308,6 +322,24 @@ onUnmounted(() => {
         <div class="overlay-canvas">
             <button
                 type="button"
+                class="overlay-line-return"
+                :class="{ 'is-busy': lineReturnBusy }"
+                :disabled="lineReturnBusy"
+                aria-label="返回产线视角"
+                title="返回产线视角"
+                data-overlay-hit="true"
+                @pointerdown.stop
+                @click.stop="returnToLineView"
+            >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M10 6 4 12l6 6" />
+                    <path d="M5 12h8.5a5.5 5.5 0 0 1 5.5 5.5V19" />
+                    <path class="line-mark" d="M15.5 5.5h3v3h-3zM15.5 10.5h3v3h-3z" />
+                </svg>
+            </button>
+
+            <button
+                type="button"
                 class="overlay-status"
                 :class="{ online: dataStore.wsConnected.value && hostConnected }"
                 data-overlay-hit="true"
@@ -377,6 +409,51 @@ body,
     position: absolute;
     inset: 0;
 }
+
+.overlay-line-return {
+    position: absolute;
+    top: 20px;
+    left: 20px;
+    z-index: 35;
+    width: 42px;
+    height: 42px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 1px solid rgba(128, 185, 232, 0.3);
+    border-radius: 12px;
+    color: #d9efff;
+    background: linear-gradient(145deg, rgba(25, 55, 78, 0.9), rgba(7, 24, 39, 0.84));
+    box-shadow: 0 12px 30px rgba(0, 8, 18, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(12px) saturate(118%);
+    pointer-events: auto;
+    cursor: pointer;
+    transition: transform 160ms ease, border-color 160ms ease, background 160ms ease, opacity 160ms ease;
+}
+
+.overlay-line-return:hover:not(:disabled) {
+    transform: translateY(-1px);
+    border-color: rgba(103, 198, 255, 0.68);
+    background: linear-gradient(145deg, rgba(31, 76, 108, 0.94), rgba(8, 31, 50, 0.9));
+}
+
+.overlay-line-return:active:not(:disabled) { transform: translateY(0) scale(0.97); }
+.overlay-line-return:focus-visible { outline: 2px solid rgba(99, 196, 255, 0.92); outline-offset: 2px; }
+.overlay-line-return:disabled { opacity: 0.62; cursor: wait; }
+.overlay-line-return svg {
+    width: 23px;
+    height: 23px;
+    overflow: visible;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    transition: transform 160ms ease;
+}
+.overlay-line-return:hover:not(:disabled) svg { transform: translateX(-1px); }
+.overlay-line-return .line-mark { fill: rgba(94, 193, 247, 0.18); stroke-width: 1.35; }
+.overlay-line-return.is-busy svg { animation: overlayReturnPulse 700ms ease-in-out infinite alternate; }
 
 .overlay-status {
     position: absolute;
@@ -594,11 +671,17 @@ body,
     to { transform: translateX(-50%); }
 }
 
+@keyframes overlayReturnPulse {
+    from { opacity: 0.45; }
+    to { opacity: 1; }
+}
+
 @media (max-width: 1180px), (max-height: 680px) {
     .overlay-canvas { inset: 12px 16px 16px; }
     .overlay-widget .widget-shell { padding: 10px; border-radius: 10px; }
     .overlay-widget .widget-title { margin-bottom: 7px; font-size: 12px; }
     .overlay-widget .metric-row { padding: 5px 7px; font-size: 11px; }
     .overlay-status { min-height: 30px; padding: 5px 10px; }
+    .overlay-line-return { top: 0; left: 0; width: 38px; height: 38px; border-radius: 10px; }
 }
 </style>

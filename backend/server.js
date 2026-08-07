@@ -1,9 +1,15 @@
 const express = require('express');
-const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const multer = require('multer');
+const crypto = require('crypto');
+const {
+    createCorsMiddleware,
+    createOperationRateLimiter,
+    protectManagementWrites,
+    securityHeaders
+} = require('./middleware/security');
 const {
     getDb,
     closeDb,
@@ -26,11 +32,16 @@ const {
     createSiteBackup,
     restoreSiteBackup,
     getSiteBackupStatus,
+    loadSiteBackupConfig,
+    saveSiteBackupConfig,
+    startSiteBackupMaintenance,
+    stopSiteBackupMaintenance,
     resolveSiteBackupPath,
     SITE_IMPORT_DIR
 } = require('./services/siteBackup');
 
 const app = express();
+app.disable('x-powered-by');
 const PORT = Number(process.env.PORT || 3001);
 const HOST = process.env.HOST || '127.0.0.1';
 
@@ -51,10 +62,12 @@ for (const dir of [uploadsDir, audioUploadsDir, assetModelsDir]) {
     }
 }
 
-if (process.env.ENABLE_CORS !== 'false') app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use('/uploads', express.static(uploadsRootDir));
-app.use('/assets', express.static(assetsDir));
+app.use(securityHeaders);
+if (process.env.ENABLE_CORS !== 'false') app.use(createCorsMiddleware());
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '5mb', strict: true }));
+app.use(protectManagementWrites);
+app.use('/uploads', express.static(uploadsRootDir, { dotfiles: 'deny', index: false }));
+app.use('/assets', express.static(assetsDir, { dotfiles: 'deny', index: false }));
 
 app.use('/api/config', require('./routes/config'));
 app.use('/api/workshops', require('./routes/workshops'));
@@ -79,7 +92,8 @@ app.use('/api/system/cast', require('./routes/cast')(castController));
 const storage = multer.diskStorage({
     destination: uploadsDir,
     filename: (req, file, cb) => {
-        const uniqueName = Date.now() + '-' + file.originalname;
+        const extension = path.extname(file.originalname || '').toLowerCase();
+        const uniqueName = `${Date.now()}-${crypto.randomBytes(12).toString('hex')}${extension}`;
         cb(null, uniqueName);
     }
 });
@@ -98,6 +112,7 @@ const upload = multer({
 });
 
 fs.mkdirSync(SITE_IMPORT_DIR, { recursive: true });
+const backupOperationLimiter = createOperationRateLimiter({ name: 'backup-operation', limit: 20 });
 const siteBackupUpload = multer({
     dest: SITE_IMPORT_DIR,
     fileFilter: (req, file, cb) => {
@@ -141,6 +156,34 @@ function resolveModelFileDeletePlan(modelFilePath) {
     throw new Error('模型文件路径不合法');
 }
 
+function validateUploadedModelFile(file) {
+    const extension = path.extname(file?.filename || '').toLowerCase();
+    if (extension === '.glb') {
+        const handle = fs.openSync(file.path, 'r');
+        try {
+            const header = Buffer.alloc(12);
+            if (fs.readSync(handle, header, 0, header.length, 0) !== header.length
+                || header.toString('ascii', 0, 4) !== 'glTF'
+                || header.readUInt32LE(4) !== 2
+                || header.readUInt32LE(8) !== file.size) {
+                throw new Error('GLB 文件头或长度校验失败');
+            }
+        } finally {
+            fs.closeSync(handle);
+        }
+        return;
+    }
+    if (extension === '.gltf') {
+        let document;
+        try { document = JSON.parse(fs.readFileSync(file.path, 'utf8')); } catch (error) { throw new Error('GLTF 文件不是有效 JSON'); }
+        if (!document || typeof document !== 'object' || !String(document.asset?.version || '').startsWith('2')) {
+            throw new Error('仅支持 glTF 2.x 模型');
+        }
+        return;
+    }
+    throw new Error('模型文件扩展名不合法');
+}
+
 app.post('/api/models/upload', upload.single('modelFile'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: '未收到文件' });
@@ -151,6 +194,7 @@ app.post('/api/models/upload', upload.single('modelFile'), async (req, res) => {
     const modelName = name || req.file.originalname;
 
     try {
+        validateUploadedModelFile(req.file);
         const db = await getDb();
         const normalizedMetadata = stringifyModelMetadata(metadata || '{}', { name: modelName });
         await db.upsert('models', {
@@ -165,6 +209,7 @@ app.post('/api/models/upload', upload.single('modelFile'), async (req, res) => {
         }, 'id');
         res.json({ success: true, filePath });
     } catch (e) {
+        if (req.file?.path) fs.rmSync(req.file.path, { force: true });
         res.status(400).json({ error: e.message });
     }
 });
@@ -347,7 +392,7 @@ app.get('/api/database/config', (req, res) => {
     res.json(publicDatabaseConfig(loadDatabaseConfig()));
 });
 
-app.post('/api/database/test', async (req, res) => {
+app.post('/api/database/test', backupOperationLimiter, async (req, res) => {
     try {
         await testDatabaseConfig(req.body || {});
         res.json({ success: true });
@@ -356,7 +401,7 @@ app.post('/api/database/test', async (req, res) => {
     }
 });
 
-app.put('/api/database/config', async (req, res) => {
+app.put('/api/database/config', backupOperationLimiter, async (req, res) => {
     try {
         await stopDatabaseMaintenance({ backup: true, reason: 'before-config-change' });
         const config = saveDatabaseConfig(req.body || {});
@@ -379,7 +424,7 @@ app.get('/api/database/backups', (req, res) => {
     }
 });
 
-app.post('/api/database/backups', async (req, res) => {
+app.post('/api/database/backups', backupOperationLimiter, async (req, res) => {
     try {
         const backup = await createDatabaseBackup('manual');
         res.json({ success: true, backup, status: getDatabaseBackupStatus() });
@@ -397,7 +442,7 @@ app.get('/api/database/backups/:filename/download', (req, res) => {
     }
 });
 
-app.post('/api/database/backups/:filename/restore', async (req, res) => {
+app.post('/api/database/backups/:filename/restore', backupOperationLimiter, async (req, res) => {
     const dataEngine = global.dataEngine;
     try {
         dataEngine?.stop();
@@ -420,7 +465,25 @@ app.get('/api/site-backups', (req, res) => {
     }
 });
 
-app.post('/api/site-backups/export', async (req, res) => {
+app.get('/api/site-backups/config', (req, res) => {
+    try {
+        res.json(loadSiteBackupConfig());
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.put('/api/site-backups/config', backupOperationLimiter, async (req, res) => {
+    try {
+        const config = saveSiteBackupConfig(req.body || {});
+        await startSiteBackupMaintenance(uploadsRootDir);
+        res.json({ success: true, config, status: getSiteBackupStatus() });
+    } catch (e) {
+        res.status(400).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/site-backups/export', backupOperationLimiter, async (req, res) => {
     try {
         const backup = await createSiteBackup(uploadsRootDir);
         res.json({ success: true, backup, status: getSiteBackupStatus() });
@@ -438,7 +501,7 @@ app.get('/api/site-backups/:filename/download', (req, res) => {
     }
 });
 
-app.post('/api/site-backups/import', receiveSiteBackup, async (req, res) => {
+app.post('/api/site-backups/import', backupOperationLimiter, receiveSiteBackup, async (req, res) => {
     if (!req.file) return res.status(400).json({ success: false, error: '未收到整站备份文件' });
 
     const dataEngine = global.dataEngine;
@@ -471,6 +534,10 @@ app.post('/api/site-backups/import', receiveSiteBackup, async (req, res) => {
 
 async function startServer() {
     const httpServer = http.createServer(app);
+    httpServer.headersTimeout = Math.max(5000, Number(process.env.HTTP_HEADERS_TIMEOUT_MS || 15000));
+    httpServer.requestTimeout = Math.max(30000, Number(process.env.HTTP_REQUEST_TIMEOUT_MS || 10 * 60 * 1000));
+    httpServer.keepAliveTimeout = Math.max(1000, Number(process.env.HTTP_KEEP_ALIVE_TIMEOUT_MS || 5000));
+    httpServer.maxHeadersCount = Math.max(32, Number(process.env.HTTP_MAX_HEADERS || 100));
     httpServer.on('error', (error) => {
         if (error.code === 'EADDRINUSE') {
             console.error(`\n后端端口 ${PORT} 已被占用。`);
@@ -511,6 +578,7 @@ async function startServer() {
         try { dataEngine.stop(); } catch (e) { /* ignore */ }
         try { await screenCast.close(); } catch (e) { /* ignore */ }
         try { await lanDisplay.stop(); } catch (e) { /* ignore */ }
+        try { stopSiteBackupMaintenance(); } catch (e) { /* ignore */ }
         try { wsServer.close(); } catch (e) { /* ignore */ }
         if (global.wsServer === wsServer) global.wsServer = null;
         httpServer.close();
@@ -543,6 +611,30 @@ async function startServer() {
     process.once('SIGTERM', shutdown);
     process.once('SIGINT', shutdown);
 
+    // 这些兜底处理必须在动态注册的本机安全退出路由之后，避免误吞掉该路由。
+    app.use((req, res) => {
+        if (req.path.startsWith('/api/')) {
+            res.status(404).json({ success: false, error: '接口不存在' });
+            return;
+        }
+        res.status(404).send('Not Found');
+    });
+    app.use((error, req, res, next) => {
+        if (res.headersSent) {
+            next(error);
+            return;
+        }
+        const status = error?.type === 'entity.too.large' || error?.code === 'LIMIT_FILE_SIZE'
+            ? 413
+            : (Number.isInteger(error?.statusCode) ? error.statusCode : 400);
+        const message = status === 413
+            ? '请求或上传文件超过大小限制'
+            : (error?.message || '请求处理失败');
+        // 只记录服务端日志，不把堆栈、绝对路径和数据库连接细节返回给客户端。
+        console.error(`[HTTP ${status}] ${req.method} ${req.originalUrl}: ${message}`);
+        res.status(status).json({ success: false, error: message });
+    });
+
     httpServer.listen(PORT, HOST, () => {
         console.log(`\n数字孪生后端服务已启动: http://${HOST}:${PORT}`);
         const dbConfig = publicDatabaseConfig(loadDatabaseConfig());
@@ -556,6 +648,7 @@ async function startServer() {
             getDb()
                 .then(() => startDatabaseMaintenance())
                 .then(() => lanDisplay.loadFromSettings())
+                .then(() => startSiteBackupMaintenance(uploadsRootDir))
                 .then(() => dataEngine.start())
                 .catch((error) => {
                     console.error('[DataEngine] 启动失败:', error.message);

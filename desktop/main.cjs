@@ -39,6 +39,14 @@ let isQuitting = false;
 let quitReady = false;
 let hasShownTrayHint = false;
 let mainWindowClosePromptActive = false;
+let backendRestartTimer = null;
+let backendRestartResetTimer = null;
+let backendRestartAttempts = 0;
+let backendHealthFailures = 0;
+let backendRestartInProgress = false;
+let applicationShutdownForceTimer = null;
+const BACKEND_RESTART_DELAYS_MS = [1000, 3000, 10000];
+const BACKEND_RESTART_RESET_MS = 60 * 1000;
 
 function resourcePath(...parts) {
     const root = app.isPackaged ? process.resourcesPath : path.join(__dirname, 'resources');
@@ -129,10 +137,18 @@ function findAvailablePort(startPort = 3001) {
     });
 }
 
-function waitForHealth(url, timeoutMs = 30000) {
+function waitForHealth(url, timeoutMs = 30000, processToWatch = null) {
     const deadline = Date.now() + timeoutMs;
     return new Promise((resolve, reject) => {
         const check = () => {
+            if (processToWatch && (
+                processToWatch.killed
+                || processToWatch.exitCode !== null
+                || processToWatch.signalCode
+            )) {
+                reject(new Error('后端进程在健康探测完成前已退出'));
+                return;
+            }
             const request = http.get(url, (response) => {
                 response.resume();
                 if (response.statusCode === 200) {
@@ -232,7 +248,28 @@ function stopDesktopControlServer() {
     desktopControlOrigin = null;
     desktopControlToken = null;
     if (!server) return Promise.resolve();
-    return new Promise(resolve => server.close(() => resolve()));
+    return new Promise(resolve => {
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(forceTimer);
+            resolve();
+        };
+        const forceTimer = setTimeout(() => {
+            // A WebView may leave a keep-alive request open while the desktop app
+            // is quitting.  Do not let that connection block a production shutdown.
+            try { server.closeIdleConnections?.(); } catch (error) { /* ignore */ }
+            try { server.closeAllConnections?.(); } catch (error) { /* ignore */ }
+            finish();
+        }, 3000);
+        try {
+            server.close(finish);
+            server.closeIdleConnections?.();
+        } catch (error) {
+            finish();
+        }
+    });
 }
 
 function readRuntimeSettings(port) {
@@ -263,10 +300,28 @@ function readRuntimeSettings(port) {
     });
 }
 
+function probeBackendHealth(port) {
+    return new Promise((resolve, reject) => {
+        const request = http.get({
+            host: '127.0.0.1',
+            port,
+            path: '/api/health',
+            headers: { Accept: 'application/json' }
+        }, response => {
+            response.resume();
+            if (response.statusCode === 200) resolve();
+            else reject(new Error(`后端健康探测失败: HTTP ${response.statusCode}`));
+        });
+        request.setTimeout(2500, () => request.destroy(new Error('后端健康探测超时')));
+        request.on('error', reject);
+    });
+}
+
 async function syncDesktopSettings() {
     if (!backendPort) return;
     try {
         const runtime = await readRuntimeSettings(backendPort);
+        backendHealthFailures = 0;
         if (runtime?.auto_start_supported) {
             const enabled = runtime.auto_start_enabled === true;
             if (appliedAutoStartSetting !== enabled && configureAutoStart(enabled)) {
@@ -276,6 +331,23 @@ async function syncDesktopSettings() {
     } catch (error) {
         // 后端刚启动、正在重启或开发版不支持时，不打断桌面程序。
         logDesktopError('runtime-settings-sync', error);
+        if (backendRestartInProgress) return;
+        try {
+            // Runtime settings may be delayed by a MySQL backup or PLC refresh.
+            // Only restart the process when the lightweight health endpoint also
+            // fails, otherwise a busy but healthy backend would be killed.
+            await probeBackendHealth(backendPort);
+            backendHealthFailures = 0;
+            return;
+        } catch (healthError) {
+            logDesktopError('backend-health-probe', healthError);
+        }
+        backendHealthFailures += 1;
+        if (backendHealthFailures >= 3 && backendProcess && !isQuitting) {
+            backendHealthFailures = 0;
+            logDesktopError('backend-watchdog', new Error('后端健康探测连续失败，准备自动重启'));
+            try { backendProcess.kill(); } catch (killError) { /* exit handler will retry */ }
+        }
     }
 }
 
@@ -314,6 +386,59 @@ function guardLogStream(stream, label) {
         } catch (dialogError) { /* application may already be shutting down */ }
     });
     return stream;
+}
+
+function clearBackendRestartTimers() {
+    if (backendRestartTimer) clearTimeout(backendRestartTimer);
+    if (backendRestartResetTimer) clearTimeout(backendRestartResetTimer);
+    backendRestartTimer = null;
+    backendRestartResetTimer = null;
+}
+
+function scheduleBackendRestart(writable, port, reason) {
+    if (isQuitting || backendRestartTimer) return;
+    if (backendRestartAttempts >= BACKEND_RESTART_DELAYS_MS.length) {
+        const message = `本地数据服务连续 ${backendRestartAttempts} 次自动恢复失败`;
+        logDesktopError('backend-restart-exhausted', new Error(`${message}：${reason || '未知原因'}`));
+        try {
+            dialog.showErrorBox(APP_NAME, `${message}。\n请查看用户数据目录中的 logs/backend-error.log。`);
+        } catch (error) { /* app may already be closing */ }
+        app.quit();
+        return;
+    }
+
+    const attempt = backendRestartAttempts;
+    const delay = BACKEND_RESTART_DELAYS_MS[attempt];
+    backendRestartAttempts += 1;
+    logDesktopError('backend-restart-scheduled', new Error(`第 ${backendRestartAttempts} 次自动恢复将在 ${delay}ms 后执行：${reason || '进程退出'}`));
+    backendRestartTimer = setTimeout(async () => {
+        backendRestartTimer = null;
+        if (isQuitting) return;
+        backendRestartInProgress = true;
+        backendHealthFailures = 0;
+        try {
+            const restartedProcess = await startBackend(port, writable);
+            await waitForHealth(`${applicationOrigin}/api/health`, 60000, restartedProcess);
+            if (backendProcess !== restartedProcess || restartedProcess.exitCode !== null) {
+                throw new Error('后端进程在健康探测完成前已退出');
+            }
+            backendHealthFailures = 0;
+            logDesktopError('backend-restart-success', new Error(`后端已自动恢复（第 ${attempt + 1} 次尝试）`));
+            if (backendRestartResetTimer) clearTimeout(backendRestartResetTimer);
+            backendRestartResetTimer = setTimeout(() => {
+                backendRestartAttempts = 0;
+                backendRestartResetTimer = null;
+            }, BACKEND_RESTART_RESET_MS);
+            backendRestartResetTimer.unref?.();
+        } catch (error) {
+            logDesktopError('backend-restart-failed', error);
+            backendRestartInProgress = false;
+            scheduleBackendRestart(writable, port, error.message);
+            return;
+        }
+        backendRestartInProgress = false;
+    }, delay);
+    backendRestartTimer.unref?.();
 }
 
 function nativeClientDirectory() {
@@ -507,7 +632,6 @@ async function startBackend(port, writable) {
     const frontendDir = app.isPackaged
         ? resourcePath('frontend')
         : path.resolve(__dirname, '..', 'frontend', 'dist');
-    const errorLogPath = path.join(writable.logsDir, 'backend-error.log');
     backendPort = port;
     backendShutdownToken = crypto.randomBytes(32).toString('hex');
     const logStreams = await Promise.all([
@@ -517,7 +641,7 @@ async function startBackend(port, writable) {
     backendLogStream = guardLogStream(logStreams[0], '运行日志');
     backendErrorLogStream = guardLogStream(logStreams[1], '后端错误日志');
 
-    backendProcess = spawn(nodeBinary, [path.join(backendDir, 'server.js')], {
+    const child = spawn(nodeBinary, [path.join(backendDir, 'server.js')], {
         cwd: backendDir,
         windowsHide: true,
         env: {
@@ -543,21 +667,33 @@ async function startBackend(port, writable) {
         stdio: ['ignore', 'pipe', 'pipe']
     });
 
-    backendProcess.stdout.pipe(backendLogStream, { end: false });
-    backendProcess.stderr.pipe(backendErrorLogStream, { end: false });
-    backendProcess.once('exit', (code) => {
-        backendProcess = null;
-        if (!isQuitting && code !== 0) {
-            const error = new Error(`本地数据服务异常退出（代码 ${code}）`);
+    backendProcess = child;
+    child.stdout.pipe(backendLogStream, { end: false });
+    child.stderr.pipe(backendErrorLogStream, { end: false });
+    child.once('exit', (code, signal) => {
+        const wasCurrent = backendProcess === child;
+        if (wasCurrent) backendProcess = null;
+        if (wasCurrent) closeBackendLogStreams();
+        if (!isQuitting && wasCurrent) {
+            const error = new Error(`本地数据服务异常退出（代码 ${code ?? 'null'}，信号 ${signal || 'none'}）`);
             logDesktopError('backend-exit', error);
-            dialog.showErrorBox(APP_NAME, `${error.message}。\n错误日志：${errorLogPath}`);
-            app.quit();
+            // During an active recovery attempt the awaiting health probe owns the
+            // retry chain.  Let it fail fast and schedule the next backoff once.
+            if (!backendRestartInProgress) scheduleBackendRestart(writable, port, error.message);
         }
     });
-    await new Promise((resolve, reject) => {
-        backendProcess.once('spawn', resolve);
-        backendProcess.once('error', reject);
-    });
+    try {
+        await new Promise((resolve, reject) => {
+            child.once('spawn', resolve);
+            child.once('error', reject);
+        });
+    } catch (error) {
+        if (backendProcess === child) backendProcess = null;
+        try { child.kill(); } catch (killError) { /* ignore */ }
+        closeBackendLogStreams();
+        throw error;
+    }
+    return child;
 }
 
 function requestBackendShutdown(port, token) {
@@ -586,6 +722,10 @@ function requestBackendShutdown(port, token) {
 }
 
 function stopBackend() {
+    clearBackendRestartTimers();
+    backendRestartAttempts = 0;
+    backendHealthFailures = 0;
+    backendRestartInProgress = false;
     const processToStop = backendProcess;
     const port = backendPort;
     const token = backendShutdownToken;
@@ -786,8 +926,8 @@ async function launchApplication() {
     // cast can switch the embedded host back to the Unity dashboard before
     // the desktop region is captured.
     await startDesktopControlServer();
-    await startBackend(port, writable);
-    await waitForHealth(`${origin}/api/health`);
+    const initialBackendProcess = await startBackend(port, writable);
+    await waitForHealth(`${origin}/api/health`, 60000, initialBackendProcess);
     startDesktopSettingsSync();
     createTray();
     try {
@@ -798,10 +938,16 @@ async function launchApplication() {
         showAdminWindow();
     }
     if (process.argv.includes('--admin')) showNativeAdminPanel();
+    const smokeCrashBackendAfterMs = Number(process.env.DESKTOP_SMOKE_CRASH_BACKEND_AFTER_MS || 0);
+    if (Number.isFinite(smokeCrashBackendAfterMs) && smokeCrashBackendAfterMs > 0) {
+        setTimeout(() => {
+            if (backendProcess && !isQuitting) backendProcess.kill();
+        }, smokeCrashBackendAfterMs);
+    }
     const smokeExitAfterMs = Number(process.env.DESKTOP_SMOKE_EXIT_AFTER_MS || 0);
     if (Number.isFinite(smokeExitAfterMs) && smokeExitAfterMs > 0)
     {
-        setTimeout(() => app.quit(), smokeExitAfterMs).unref?.();
+        setTimeout(() => app.quit(), smokeExitAfterMs);
     }
 }
 
@@ -824,12 +970,25 @@ if (!app.requestSingleInstanceLock()) {
         if (quitReady) return;
         event.preventDefault();
         isQuitting = true;
+        if (!applicationShutdownForceTimer) {
+            applicationShutdownForceTimer = setTimeout(() => {
+                logDesktopError('forced-shutdown', new Error('安全退出超过 25 秒，强制结束残留进程'));
+                try { backendProcess?.kill(); } catch (error) { /* ignore */ }
+                try { nativeProcess?.kill(); } catch (error) { /* ignore */ }
+                try { desktopControlServer?.closeIdleConnections?.(); } catch (error) { /* ignore */ }
+                try { desktopControlServer?.closeAllConnections?.(); } catch (error) { /* ignore */ }
+                app.exit(0);
+            }, 25000);
+        }
+        clearBackendRestartTimers();
         if (desktopSettingsTimer) clearInterval(desktopSettingsTimer);
         desktopSettingsTimer = null;
         stopNativeClient().then(() => Promise.all([
             stopDesktopControlServer(),
             stopBackend()
         ])).finally(() => {
+            if (applicationShutdownForceTimer) clearTimeout(applicationShutdownForceTimer);
+            applicationShutdownForceTimer = null;
             if (logCleanupTimer) clearInterval(logCleanupTimer);
             logCleanupTimer = null;
             tray?.destroy();
@@ -837,7 +996,10 @@ if (!app.requestSingleInstanceLock()) {
             desktopErrorLogStream?.end();
             desktopErrorLogStream = null;
             quitReady = true;
-            app.quit();
+            // All managed children and local servers are already stopped.  Exit
+            // directly so stray Chromium/Node handles cannot keep the tray process
+            // alive for another minute after the user chose "完全退出".
+            app.exit(0);
         });
     });
 }

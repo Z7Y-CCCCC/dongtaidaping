@@ -556,14 +556,26 @@ namespace HeatTreatment.DigitalTwin.Runtime
             var mode = focus?.Value<string>("mode") ?? "factory";
             if (string.Equals(mode, "device", StringComparison.OrdinalIgnoreCase))
             {
-                _dashboard.FocusPreviewDevice(focus?.Value<string>("deviceId"));
+                var deviceId = focus?.Value<string>("deviceId");
+                _dashboard.FocusPreviewDevice(deviceId);
+                Debug.Log($"[FactoryRuntime] Native focus applied: mode=device, target={deviceId ?? string.Empty}");
                 return;
             }
 
             IEnumerable<Transform> roots = _deviceRoots.Values.Where(root => root != null);
+            var targetId = string.Empty;
             if (string.Equals(mode, "line", StringComparison.OrdinalIgnoreCase))
             {
                 var lineId = focus?.Value<string>("lineId");
+                if (string.IsNullOrWhiteSpace(lineId))
+                {
+                    var selectedDeviceId = _dashboard?.SelectedDeviceId;
+                    if (!string.IsNullOrWhiteSpace(selectedDeviceId))
+                    {
+                        _deviceLineIds.TryGetValue(selectedDeviceId, out lineId);
+                    }
+                }
+                targetId = lineId ?? string.Empty;
                 roots = _deviceRoots
                     .Where(pair => _deviceLineIds.TryGetValue(pair.Key, out var value) && value == lineId)
                     .Select(pair => pair.Value)
@@ -572,6 +584,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             else if (string.Equals(mode, "workshop", StringComparison.OrdinalIgnoreCase))
             {
                 var workshopId = focus?.Value<string>("workshopId");
+                targetId = workshopId ?? string.Empty;
                 roots = _deviceRoots
                     .Where(pair => _deviceWorkshopIds.TryGetValue(pair.Key, out var value) && value == workshopId)
                     .Select(pair => pair.Value)
@@ -582,6 +595,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _dashboard.FocusPreviewBounds(selectedRoots.Count > 0
                 ? CalculateRendererBounds(selectedRoots)
                 : factoryBounds);
+            Debug.Log($"[FactoryRuntime] Native focus applied: mode={mode}, target={targetId}, roots={selectedRoots.Count}");
         }
 
         private void ApplyPreviewCameraAction(JObject payload)
@@ -832,7 +846,9 @@ namespace HeatTreatment.DigitalTwin.Runtime
 
         private static Bounds CalculateRendererBounds(Transform root)
         {
-            var renderers = root.GetComponentsInChildren<Renderer>(false)
+            // 设备详情视角会暂时隐藏其它设备；返回产线/工厂时仍必须把这些
+            // inactive 设备计入镜头包围盒，否则镜头看起来仍停留在单台设备上。
+            var renderers = root.GetComponentsInChildren<Renderer>(true)
                 .Where(renderer => renderer.enabled)
                 .ToArray();
             if (renderers.Length == 0) return new Bounds(Vector3.zero, new Vector3(40f, 10f, 30f));
@@ -846,7 +862,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             var renderers = (roots ?? Enumerable.Empty<Transform>())
                 .Where(root => root != null)
-                .SelectMany(root => root.GetComponentsInChildren<Renderer>(false))
+                .SelectMany(root => root.GetComponentsInChildren<Renderer>(true))
                 .Where(renderer => renderer.enabled)
                 .ToArray();
             if (renderers.Length == 0) return new Bounds(Vector3.zero, new Vector3(40f, 10f, 30f));
