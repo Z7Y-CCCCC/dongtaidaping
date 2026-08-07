@@ -169,6 +169,7 @@ const activeTab = ref(storedAdminUiState.activeTab || 'composer')
 const isAdminNavCollapsed = ref(!!storedAdminUiState.isAdminNavCollapsed)
 const isFactoryMenuOpen = ref(true)
 const isDataMenuOpen = ref(true)
+const isLegacyWebRenderSettingsOpen = ref(false)
 const navIconPaths = {
     composer: ['M4 5h16v14H4z', 'M8 9h8', 'M8 13h5', 'M16 13h1', 'M8 17h8'],
     factory: ['M4 20V9l4-3 4 3 4-3 4 3v11', 'M8 20v-6h3v6', 'M16 20v-6h3v6', 'M12 20V9'],
@@ -229,6 +230,20 @@ const {
     databaseBackupBusy,
     databaseBackupMessage,
     databaseBackupStatus,
+    dataSourceConnections,
+    dataSourceEditor,
+    dataSourceBusy,
+    dataSourceMessage,
+    dataSourceBackupBusy,
+    dataSourceBackupConfig,
+    dataSourceBackupStatus,
+    resetDataSourceEditor,
+    editDataSource,
+    testExternalDataSource,
+    saveExternalDataSource,
+    removeExternalDataSource,
+    saveDataSourceBackupConfiguration,
+    runSelectedDatabaseBackups,
     siteBackupFileInput,
     siteBackupBusy,
     siteBackupMessage,
@@ -3187,9 +3202,25 @@ async function loadPlatform() {
     }
 }
 
+const activeSceneDisplayTitle = computed({
+    get: () => {
+        const scene = platform.value.activeScene
+        return String(scene?.theme?.title || settings.factory_name || scene?.name || '').trim()
+    },
+    set: value => {
+        const scene = platform.value.activeScene
+        if (!scene) return
+        if (!scene.theme || typeof scene.theme !== 'object') scene.theme = {}
+        scene.theme.title = String(value ?? '')
+    }
+})
+
 async function saveActiveScene() {
     const scene = platform.value.activeScene
     if (!scene) return
+    if (!scene.camera || typeof scene.camera !== 'object') scene.camera = {}
+    if (!scene.theme || typeof scene.theme !== 'object') scene.theme = {}
+    scene.theme.title = activeSceneDisplayTitle.value || scene.name
     const result = await adminApi.updateScene(scene.id, {
         name: scene.name,
         scene_type: scene.scene_type,
@@ -3201,6 +3232,19 @@ async function saveActiveScene() {
     })
     if (result?.error) return alert(result.error, { title: '场景保存失败', type: 'danger' })
     if (!result?.success) return alert('场景保存失败：后端没有返回成功状态', { title: '场景保存失败', type: 'danger' })
+
+    // 当前场景是唯一配置源；同步旧字段仅用于仍在运行的 Unity / 旧 Web 客户端兼容。
+    const compatibilitySettings = {
+        factory_name: scene.theme.title,
+        camera_mode: scene.camera.mode || 'auto',
+        realtime_stale_ms: String(Number(scene.camera.staleMs) || 6000),
+        display_mode: scene.theme.preset || 'industrial_twin'
+    }
+    const compatibilityResult = await adminApi.saveSettings(compatibilitySettings)
+    if (compatibilityResult?.error) {
+        return alert(`场景已保存，但运行端兼容参数同步失败：${compatibilityResult.error}`, { title: '部分保存成功', type: 'warning' })
+    }
+    Object.assign(settings, compatibilitySettings)
     await alert('场景配置已保存', { title: '保存成功', type: 'success' })
     await loadPlatform()
 }
@@ -3312,6 +3356,11 @@ let composerPreviewTimer = null
 let composerPreviewSeq = 0
 let composerResizeObserver = null
 let composerDragActive = false
+let composerPreviewBuilding = false
+let composerPreviewQueued = false
+let composerPreviewWatchdogTimer = null
+let composerPreviewRetryTimer = null
+let composerPreviewFailureCount = 0
 
 function getDeviceDefaultInstanceConfig(device = {}) {
     const config = parseInstanceConfig(device.instance_config)
@@ -3678,6 +3727,11 @@ function controlComposerCamera(action) {
 }
 
 function fitComposerPreview() {
+    if (!composerRuntime?.isRenderSurfaceHealthy?.()) {
+        composerPreviewFailureCount = 0
+        scheduleComposerPreview(0)
+        return
+    }
     resizeComposerPreviewAfterLayout()
     focusComposerPreview()
     sendNativePreviewCameraAction('fit')
@@ -3696,23 +3750,57 @@ function connectComposerResizeObserver(container) {
     composerResizeObserver.observe(container)
 }
 
+function stopComposerPreviewWatchdog() {
+    if (!composerPreviewWatchdogTimer) return
+    clearInterval(composerPreviewWatchdogTimer)
+    composerPreviewWatchdogTimer = null
+}
+
+function startComposerPreviewWatchdog() {
+    stopComposerPreviewWatchdog()
+    composerPreviewWatchdogTimer = setInterval(() => {
+        if (activeTab.value !== 'composer' || composerPreviewBuilding) return
+        if (composerRuntime?.isRenderSurfaceHealthy?.()) return
+        composerPreviewStatus.value = '预览画面已中断，正在自动恢复...'
+        scheduleComposerPreview(0)
+    }, 1500)
+}
+
+function disposeActiveComposerRuntime() {
+    disconnectComposerResizeObserver()
+    if (!composerRuntime) return
+    composerRuntime.dispose()
+    composerRuntime = null
+}
+
 function disposeComposerPreview() {
+    composerPreviewSeq += 1
+    composerPreviewQueued = false
+    stopComposerPreviewWatchdog()
     disconnectComposerResizeObserver()
     if (composerPreviewTimer) {
         clearTimeout(composerPreviewTimer)
         composerPreviewTimer = null
     }
-    if (composerRuntime) {
-        composerRuntime.dispose()
-        composerRuntime = null
+    if (composerPreviewRetryTimer) {
+        clearTimeout(composerPreviewRetryTimer)
+        composerPreviewRetryTimer = null
     }
+    disposeActiveComposerRuntime()
 }
 
-function scheduleComposerPreview() {
+function scheduleComposerPreview(delay = 220) {
     if (activeTab.value !== 'composer') return
     if (composerDragActive) return
+    if (composerPreviewBuilding) {
+        composerPreviewQueued = true
+        return
+    }
     if (composerPreviewTimer) clearTimeout(composerPreviewTimer)
-    composerPreviewTimer = setTimeout(() => renderComposerPreview(), 220)
+    composerPreviewTimer = setTimeout(() => {
+        composerPreviewTimer = null
+        renderComposerPreview()
+    }, Math.max(0, delay))
 }
 
 function focusComposerPreview() {
@@ -3737,12 +3825,23 @@ function focusComposerPreview() {
 
 async function renderComposerPreview() {
     if (activeTab.value !== 'composer' || !composerPreviewRef.value) return
+    if (composerPreviewBuilding) {
+        composerPreviewQueued = true
+        return
+    }
+    composerPreviewBuilding = true
+    composerPreviewQueued = false
     const token = ++composerPreviewSeq
     composerPreviewStatus.value = '正在刷新预览...'
-    disposeComposerPreview()
+    stopComposerPreviewWatchdog()
+    disconnectComposerResizeObserver()
+    disposeActiveComposerRuntime()
     await nextTick()
     const container = composerPreviewRef.value
-    if (!container || token !== composerPreviewSeq) return
+    if (!container || token !== composerPreviewSeq) {
+        composerPreviewBuilding = false
+        return
+    }
     let runtime = null
     try {
         runtime = new SceneRuntime(container, {
@@ -3778,14 +3877,49 @@ async function renderComposerPreview() {
         connectComposerResizeObserver(container)
         resizeComposerPreview()
         focusComposerPreview()
+        await new Promise(resolve => setTimeout(resolve, 80))
+        if (!runtime.isRenderSurfaceHealthy()) {
+            throw new Error('渲染画布未正确连接')
+        }
+        composerPreviewFailureCount = 0
         composerPreviewStatus.value = '预览已同步'
+        startComposerPreviewWatchdog()
     } catch (e) {
         if (composerRuntime === runtime) composerRuntime = null
         runtime?.dispose()
-        if (token === composerPreviewSeq) {
+        if (token === composerPreviewSeq && activeTab.value === 'composer') {
+            composerPreviewFailureCount += 1
             composerPreviewStatus.value = `预览加载失败：${e.message || e}`
+            if (composerPreviewFailureCount <= 3) {
+                if (composerPreviewRetryTimer) clearTimeout(composerPreviewRetryTimer)
+                const retryDelay = Math.min(3200, 500 * (2 ** (composerPreviewFailureCount - 1)))
+                composerPreviewRetryTimer = setTimeout(() => {
+                    composerPreviewRetryTimer = null
+                    scheduleComposerPreview(0)
+                }, retryDelay)
+            }
+        }
+    } finally {
+        composerPreviewBuilding = false
+        if (composerPreviewQueued && activeTab.value === 'composer') {
+            composerPreviewQueued = false
+            scheduleComposerPreview(80)
         }
     }
+}
+
+function updateComposerPreviewFromDraft() {
+    if (activeTab.value !== 'composer') return
+    const updated = composerRuntime?.updateDeviceLayout?.(
+        composerWorkshops.value,
+        composerDraft.id,
+        models.value || []
+    )
+    if (updated && composerRuntime?.isRenderSurfaceHealthy?.()) {
+        composerPreviewStatus.value = '预览已同步'
+        return
+    }
+    scheduleComposerPreview()
 }
 
 async function saveComposerDevice() {
@@ -3821,13 +3955,11 @@ async function saveComposerDevice() {
 
 watch(selectedComposerLineId, () => {
     ensureComposerSelection()
-    scheduleComposerPreview()
     scheduleNativeScenePreview({ source: 'composer' })
 })
 
 watch(selectedComposerDeviceId, () => {
     syncComposerDraftFromSelection()
-    scheduleComposerPreview()
     scheduleNativeScenePreview({ source: 'composer' })
 })
 
@@ -3837,7 +3969,7 @@ watch(composerPreviewMode, () => {
 })
 
 watch(composerDraft, () => {
-    scheduleComposerPreview()
+    updateComposerPreviewFromDraft()
     if (activeTab.value === 'composer') scheduleNativeScenePreview({ source: 'composer' })
 }, { deep: true })
 
@@ -3889,6 +4021,7 @@ watch(activeTab, async (tab) => {
             syncComposerDraftFromSelection()
         }
         await nextTick()
+        startComposerPreviewWatchdog()
         scheduleComposerPreview()
         scheduleNativeScenePreview({ source: 'composer' })
     } else {
@@ -3976,6 +4109,7 @@ onMounted(async () => {
     syncComposerDraftFromSelection()
     await nextTick()
     scheduleComposerPreview()
+    if (activeTab.value === 'composer') startComposerPreviewWatchdog()
     await refreshAdminConnectionStatus()
     nativeScenePreviewStatusTimer = setInterval(refreshAdminConnectionStatus, 3000)
     if (activeTab.value === 'composer') scheduleNativeScenePreview({ source: 'composer' })
@@ -3984,7 +4118,10 @@ onMounted(async () => {
 
 onActivated(async () => {
     await nextTick()
-    if (activeTab.value === 'composer') scheduleComposerPreview()
+    if (activeTab.value === 'composer') {
+        startComposerPreviewWatchdog()
+        scheduleComposerPreview()
+    }
     if (!nativeScenePreviewStatusTimer) {
         refreshAdminConnectionStatus()
         nativeScenePreviewStatusTimer = setInterval(refreshAdminConnectionStatus, 3000)
@@ -6361,7 +6498,9 @@ const mainTabs = [
                     <h2>画面组件配置</h2>
                     <p class="desc">管理当前项目、场景、组件布局和发布版本。工程师后续通过这里调整画面，不再改源码。</p>
 
-                    <div class="settings-section" v-if="platform.activeProject">
+                    <DashboardDesigner class="platform-designer-primary" @reload="loadPlatform" />
+
+                    <div class="settings-section" v-if="platform.activeProject" style="margin-top:24px;">
                         <h3 class="section-title">项目与当前场景</h3>
                         <div class="settings-grid" v-if="platform.activeScene">
                             <label>项目名称
@@ -6369,6 +6508,9 @@ const mainTabs = [
                             </label>
                             <label>场景名称
                                 <input v-model="platform.activeScene.name" class="input" />
+                            </label>
+                            <label>大屏显示标题
+                                <input v-model="activeSceneDisplayTitle" class="input" placeholder="智能热处理数字孪生控制中心" />
                             </label>
                             <label>场景类型
                                 <select v-model="platform.activeScene.scene_type" class="input">
@@ -6598,8 +6740,6 @@ const mainTabs = [
 
                         <p v-if="nativeDashboardMessage" class="native-dashboard-message">{{ nativeDashboardMessage }}</p>
                     </div>
-
-                    <DashboardDesigner style="margin-top:24px;" @reload="loadPlatform" />
 
                     <div v-if="false" class="settings-section" style="margin-top:24px;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
@@ -7256,7 +7396,7 @@ const mainTabs = [
 
                         <!-- ===== 数据库部署配置 ===== -->
                         <div class="settings-section">
-                            <h3 class="section-title">数据库连接</h3>
+                            <h3 class="section-title">主业务数据库</h3>
                             <div class="settings-grid">
                                 <label>数据库类型
                                     <select v-model="databaseConfig.type" class="input">
@@ -7306,17 +7446,89 @@ const mainTabs = [
                                 </span>
                             </div>
 
+                            <div class="external-data-source-manager">
+                                <div class="external-data-source-heading">
+                                    <div>
+                                        <strong>外部只读数据库连接</strong>
+                                        <p>用于大屏组件取数，不接管对方数据库，也不会执行新增、修改或删除。</p>
+                                    </div>
+                                    <button type="button" class="btn btn-small" @click="resetDataSourceEditor">＋ 新建连接</button>
+                                </div>
+
+                                <div class="external-data-source-list">
+                                    <button
+                                        v-for="connection in dataSourceConnections.filter(item => !item.primary)"
+                                        :key="connection.id"
+                                        type="button"
+                                        class="external-data-source-card"
+                                        :class="{ active: dataSourceEditor.id === connection.id }"
+                                        @click="editDataSource(connection)"
+                                    >
+                                        <span class="external-data-source-icon">DB</span>
+                                        <span><strong>{{ connection.name }}</strong><small>{{ connection.type }} · {{ connection.database || connection.filename }}</small></span>
+                                        <em>{{ connection.enabled ? '启用' : '停用' }}</em>
+                                    </button>
+                                    <p v-if="!dataSourceConnections.some(item => !item.primary)" class="empty-hint">尚未添加外部数据源。添加后，设计器里可直接选择“连接 → 表 → 字段”。</p>
+                                </div>
+
+                                <div class="external-data-source-editor">
+                                    <label>连接名称<input v-model="dataSourceEditor.name" class="input" placeholder="例如：MES 生产数据库" /></label>
+                                    <label>数据库类型
+                                        <select v-model="dataSourceEditor.type" class="input">
+                                            <option value="mysql">MySQL / MariaDB</option>
+                                            <option value="postgres">PostgreSQL</option>
+                                            <option value="sqlserver">SQL Server</option>
+                                            <option value="sqlite">SQLite 文件</option>
+                                        </select>
+                                    </label>
+                                    <label v-if="dataSourceEditor.type !== 'sqlite'">主机<input v-model="dataSourceEditor.host" class="input" placeholder="127.0.0.1" /></label>
+                                    <label v-if="dataSourceEditor.type !== 'sqlite'">端口<input v-model.number="dataSourceEditor.port" type="number" class="input" /></label>
+                                    <label v-if="dataSourceEditor.type !== 'sqlite'">数据库名<input v-model="dataSourceEditor.database" class="input" /></label>
+                                    <label v-if="dataSourceEditor.type !== 'sqlite'">默认 Schema<input v-model="dataSourceEditor.defaultSchema" class="input" placeholder="PostgreSQL: public / SQL Server: dbo" /></label>
+                                    <label v-if="dataSourceEditor.type !== 'sqlite'">只读账号<input v-model="dataSourceEditor.user" class="input" /></label>
+                                    <label v-if="dataSourceEditor.type !== 'sqlite'">密码<input v-model="dataSourceEditor.password" type="password" class="input" /></label>
+                                    <label v-else class="external-data-source-wide">SQLite 文件<input v-model="dataSourceEditor.filename" class="input" placeholder="完整 .db 文件路径" /></label>
+                                    <label>查询超时（毫秒）<input v-model.number="dataSourceEditor.queryTimeoutMs" type="number" min="1000" max="60000" class="input" /></label>
+                                    <label class="checkbox-line"><input v-model="dataSourceEditor.enabled" type="checkbox" /> 启用此连接</label>
+                                </div>
+                                <div class="external-data-source-actions">
+                                    <button type="button" class="btn" :disabled="dataSourceBusy" @click="testExternalDataSource">测试只读连接</button>
+                                    <button type="button" class="btn btn-primary" :disabled="dataSourceBusy" @click="saveExternalDataSource">保存连接</button>
+                                    <button v-if="dataSourceEditor.id" type="button" class="btn btn-danger" :disabled="dataSourceBusy" @click="removeExternalDataSource({ ...dataSourceEditor })">删除</button>
+                                    <span v-if="dataSourceMessage">{{ dataSourceMessage }}</span>
+                                </div>
+                            </div>
+
+                            <div class="database-backup-panel database-auto-backup-panel">
+                                <div class="database-backup-header">
+                                    <div>
+                                        <strong>数据库自动压缩备份（仅防断电或数据库损坏）</strong>
+                                        <p>可同时选择主业务库和保存的外部数据库连接；外部数据库始终以只读方式导出。</p>
+                                    </div>
+                                    <button type="button" class="btn" :disabled="dataSourceBackupBusy" @click="runSelectedDatabaseBackups()">立即备份已选</button>
+                                </div>
+                                <div class="database-auto-backup-controls">
+                                    <label class="checkbox-line"><input v-model="dataSourceBackupConfig.autoEnabled" type="checkbox" /> 启用自动备份</label>
+                                    <label>间隔（小时）<input v-model.number="dataSourceBackupConfig.intervalHours" type="number" min="1" max="168" class="input input-small" /></label>
+                                    <label>每个连接保留份数<input v-model.number="dataSourceBackupConfig.retention" type="number" min="1" max="100" class="input input-small" /></label>
+                                    <button type="button" class="btn btn-small" :disabled="dataSourceBackupBusy" @click="saveDataSourceBackupConfiguration">保存自动备份</button>
+                                </div>
+                                <div class="database-backup-source-grid">
+                                    <label v-for="connection in dataSourceConnections" :key="`backup-${connection.id}`" class="database-backup-source-option">
+                                        <input v-model="dataSourceBackupConfig.selectedConnectionIds" type="checkbox" :value="connection.id" />
+                                        <span><strong>{{ connection.name }}</strong><small>{{ connection.type }} · {{ connection.database || connection.filename }}</small></span>
+                                    </label>
+                                </div>
+                                <p v-if="dataSourceBackupStatus.lastError" class="database-recovery-notice">最近自动备份存在失败：{{ dataSourceBackupStatus.lastError.error }}</p>
+                            </div>
+
                             <div v-if="databaseBackupStatus.supported" class="database-backup-panel">
                                 <div class="database-backup-header">
                                     <div>
-                                        <strong>{{ databaseBackupStatus.type === 'mysql' ? 'MySQL 自动压缩备份' : 'SQLite 本机自动备份' }}（仅防断电或数据库损坏）</strong>
-                                        <p>
-                                            {{ databaseBackupStatus.type === 'mysql' ? '使用一致性 mysqldump 并 gzip 压缩；' : 'WAL 全同步写入；' }}
-                                            每 {{ formatBackupInterval(databaseBackupStatus.intervalMs) }} 自动备份，
-                                            保留最近 {{ databaseBackupStatus.retention }} 份，退出时再备份一次。
-                                        </p>
+                                        <strong>主业务数据库备份与恢复</strong>
+                                        <p>{{ databaseBackupStatus.type === 'mysql' ? '使用一致性 mysqldump 并 gzip 压缩。' : '使用 SQLite 一致性文件备份。' }}退出程序前仍会额外生成一份安全备份。</p>
                                     </div>
-                                    <button @click="createDatabaseBackup" class="btn" :disabled="databaseBackupBusy">立即备份</button>
+                                    <button @click="runSelectedDatabaseBackups('primary')" class="btn" :disabled="databaseBackupBusy || dataSourceBackupBusy">立即备份主库</button>
                                 </div>
                                 <p v-if="databaseBackupStatus.lastBackupError" class="database-recovery-notice">
                                     最近一次自动备份失败：{{ databaseBackupStatus.lastBackupError.error }}
@@ -7363,7 +7575,7 @@ const mainTabs = [
                                     </div>
                                 </div>
                                 <p class="site-backup-external-notice">
-                                    导出时请保存到 U 盘、移动硬盘或 NAS。只保存在现场电脑上，仍然不能防止整机丢失。
+                                    导出包含数据库数据及外部数据源连接凭据，属于敏感文件。请保存到受控的 U 盘、移动硬盘或 NAS；只留在现场电脑上仍无法防止整机丢失。
                                 </p>
                                 <div class="site-backup-auto-config">
                                     <label class="site-backup-auto-toggle">
@@ -7578,32 +7790,6 @@ const mainTabs = [
                             </details>
                         </div>
 
-                        <!-- ===== 基础设置 ===== -->
-                        <div class="settings-section">
-                            <h3 class="section-title">基础设置</h3>
-                            <div class="settings-grid">
-                                <label>大屏显示标题
-                                    <input v-model="settings.factory_name" class="input" placeholder="智能热处理数字孪生控制中心" />
-                                </label>
-                                <label>大屏视角模式
-                                    <select v-model="settings.camera_mode" class="input">
-                                        <option value="auto">自动 (单车间3级 / 多车间4级)</option>
-                                        <option value="4level">强制 4 级 (全局->车间->产线->设备)</option>
-                                        <option value="3level">强制 3 级 (直接进车间->产线->设备)</option>
-                                    </select>
-                                </label>
-                                <label>实时数据过期阈值 (ms)
-                                    <input v-model="settings.realtime_stale_ms" type="number" class="input" placeholder="6000" />
-                                </label>
-                                <label>显示模式
-                                    <select v-model="settings.display_mode" class="input">
-                                        <option value="industrial_twin">真实工业数字孪生</option>
-                                        <option value="classic_blue">经典科技蓝</option>
-                                    </select>
-                                </label>
-                            </div>
-                        </div>
-
                         <!-- ===== Unity 原生客户端画质 ===== -->
                         <div class="settings-section">
                             <h3 class="section-title">Unity 原生客户端画质</h3>
@@ -7638,42 +7824,60 @@ const mainTabs = [
                         </div>
 
                         <!-- ===== 渲染性能 ===== -->
-                        <div class="settings-section">
-                            <h3 class="section-title">旧 Web 大屏渲染性能（过渡保留）</h3>
-                            <div class="settings-grid">
-                                <label>性能档位
-                                    <select v-model="settings.render_profile" class="input">
-                                        <option v-for="profile in renderProfileOptions" :key="profile.value" :value="profile.value">
-                                            {{ profile.label }}
-                                        </option>
-                                    </select>
-                                </label>
-                                <label>当前生效参数
-                                    <div class="input render-setting-readonly">
-                                        {{ resolvedRenderSettings.targetFps }} FPS / {{ Math.round(resolvedRenderSettings.renderScale * 100) }}% 分辨率
+                        <div class="settings-section legacy-web-render-section" :class="{ open: isLegacyWebRenderSettingsOpen }">
+                            <div class="legacy-web-render-heading">
+                                <h3 class="section-title">旧 Web 大屏渲染性能（过渡保留）</h3>
+                                <button
+                                    type="button"
+                                    class="btn btn-small legacy-web-render-toggle"
+                                    :aria-expanded="isLegacyWebRenderSettingsOpen"
+                                    @click="isLegacyWebRenderSettingsOpen = !isLegacyWebRenderSettingsOpen"
+                                >
+                                    {{ isLegacyWebRenderSettingsOpen ? '收起' : '显示设置' }}
+                                    <svg viewBox="0 0 20 20" aria-hidden="true">
+                                        <path d="M5.75 7.75 10 12l4.25-4.25" />
+                                    </svg>
+                                </button>
+                            </div>
+
+                            <Transition name="legacy-render-collapse">
+                                <div v-if="isLegacyWebRenderSettingsOpen" class="legacy-web-render-body">
+                                    <div class="settings-grid">
+                                        <label>性能档位
+                                            <select v-model="settings.render_profile" class="input">
+                                                <option v-for="profile in renderProfileOptions" :key="profile.value" :value="profile.value">
+                                                    {{ profile.label }}
+                                                </option>
+                                            </select>
+                                        </label>
+                                        <label>当前生效参数
+                                            <div class="input render-setting-readonly">
+                                                {{ resolvedRenderSettings.targetFps }} FPS / {{ Math.round(resolvedRenderSettings.renderScale * 100) }}% 分辨率
+                                            </div>
+                                        </label>
                                     </div>
-                                </label>
-                            </div>
 
-                            <div class="mode-hint render-profile-hint">
-                                <p><strong>{{ selectedRenderProfile?.label }}：</strong>{{ selectedRenderProfile?.description }}</p>
-                                <p>浮标刷新 {{ resolvedRenderSettings.labelFps }} FPS；抗锯齿{{ resolvedRenderSettings.antialias ? '开启' : '关闭' }}。保存后刷新大屏页面生效。</p>
-                            </div>
+                                    <div class="mode-hint render-profile-hint">
+                                        <p><strong>{{ selectedRenderProfile?.label }}：</strong>{{ selectedRenderProfile?.description }}</p>
+                                        <p>浮标刷新 {{ resolvedRenderSettings.labelFps }} FPS；抗锯齿{{ resolvedRenderSettings.antialias ? '开启' : '关闭' }}。保存后刷新大屏页面生效。</p>
+                                    </div>
 
-                            <div v-if="settings.render_profile === 'custom'" class="settings-grid render-custom-grid">
-                                <label>目标帧率 (15-144 FPS)
-                                    <input v-model.number="settings.render_target_fps" type="number" min="15" max="144" step="1" class="input" />
-                                </label>
-                                <label>渲染分辨率倍率 (0.5-1.5)
-                                    <input v-model.number="settings.render_scale" type="number" min="0.5" max="1.5" step="0.05" class="input" />
-                                </label>
-                                <label>3D 浮标刷新率 (1-30 FPS)
-                                    <input v-model.number="settings.render_label_fps" type="number" min="1" max="30" step="1" class="input" />
-                                </label>
-                                <label>抗锯齿
-                                    <span class="checkbox-line"><input v-model="settings.render_antialias" type="checkbox" /> 启用 WebGL 抗锯齿</span>
-                                </label>
-                            </div>
+                                    <div v-if="settings.render_profile === 'custom'" class="settings-grid render-custom-grid">
+                                        <label>目标帧率 (15-144 FPS)
+                                            <input v-model.number="settings.render_target_fps" type="number" min="15" max="144" step="1" class="input" />
+                                        </label>
+                                        <label>渲染分辨率倍率 (0.5-1.5)
+                                            <input v-model.number="settings.render_scale" type="number" min="0.5" max="1.5" step="0.05" class="input" />
+                                        </label>
+                                        <label>3D 浮标刷新率 (1-30 FPS)
+                                            <input v-model.number="settings.render_label_fps" type="number" min="1" max="30" step="1" class="input" />
+                                        </label>
+                                        <label>抗锯齿
+                                            <span class="checkbox-line"><input v-model="settings.render_antialias" type="checkbox" /> 启用 WebGL 抗锯齿</span>
+                                        </label>
+                                    </div>
+                                </div>
+                            </Transition>
                         </div>
 
                         <!-- ===== 数据通路选择 ===== -->
@@ -11038,6 +11242,71 @@ button:enabled:active {
     margin: 0 0 20px 0; font-size: 16px; color: #1d1d1f; font-weight: 600;
     padding-bottom: 12px; border-bottom: 1px solid rgba(0, 0, 0, 0.06);
 }
+.legacy-web-render-section {
+    padding-top: 18px;
+    padding-bottom: 18px;
+    overflow: hidden;
+    transition: border-color 180ms ease, background-color 180ms ease, box-shadow 180ms ease;
+}
+.legacy-web-render-section.open {
+    border-color: rgba(0, 113, 227, 0.16);
+    background: #ffffff;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.035);
+}
+.legacy-web-render-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+}
+.legacy-web-render-heading .section-title {
+    margin: 0;
+    padding: 0;
+    border-bottom: 0;
+}
+.legacy-web-render-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-width: 96px;
+    color: #1d1d1f;
+    background: #ffffff;
+    border: 1px solid rgba(0, 0, 0, 0.1);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+.legacy-web-render-toggle:hover {
+    color: #0066cc;
+    background: #f5f9ff;
+    border-color: rgba(0, 102, 204, 0.22);
+}
+.legacy-web-render-toggle svg {
+    width: 15px;
+    height: 15px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    transition: transform 180ms ease;
+}
+.legacy-web-render-section.open .legacy-web-render-toggle svg {
+    transform: rotate(180deg);
+}
+.legacy-web-render-body {
+    margin-top: 18px;
+    padding-top: 20px;
+    border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+.legacy-render-collapse-enter-active,
+.legacy-render-collapse-leave-active {
+    transition: opacity 160ms ease, transform 160ms ease;
+}
+.legacy-render-collapse-enter-from,
+.legacy-render-collapse-leave-to {
+    opacity: 0;
+    transform: translateY(-6px);
+}
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 .settings-grid label { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: #515154; font-weight: 500; }
 .render-setting-readonly { display: flex; align-items: center; color: #1d1d1f; background: #f5f5f7; }
@@ -11082,6 +11351,33 @@ button:enabled:active {
 .native-dashboard-point-message { margin: 16px 0 0; color: #515154; font-size: 12px; }
 .native-dashboard-point-message.is-error { color: #b42318; }
 .native-dashboard-message { margin: 14px 0 0; color: #176b3a; font-size: 12px; line-height: 1.5; }
+.external-data-source-manager { margin-top: 24px; padding-top: 22px; border-top: 1px solid #e5e5e7; }
+.external-data-source-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.external-data-source-heading strong { color: #1d1d1f; font-size: 14px; }
+.external-data-source-heading p { margin: 5px 0 0; color: #6e6e73; font-size: 12px; line-height: 1.55; }
+.external-data-source-list { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; margin-top: 16px; }
+.external-data-source-card { display: grid; grid-template-columns: 34px minmax(0,1fr) auto; align-items: center; gap: 10px; min-width: 0; padding: 12px; color: #1d1d1f; background: #fff; border: 1px solid #e2e2e5; border-radius: 10px; text-align: left; cursor: pointer; transition: border-color 160ms ease,box-shadow 160ms ease,transform 160ms ease; }
+.external-data-source-card:hover,.external-data-source-card.active { border-color: #8e8e93; box-shadow: 0 8px 24px #0000000d; transform: translateY(-1px); }
+.external-data-source-icon { display: grid; place-items: center; width: 34px; height: 34px; color: #fff; background: #1d1d1f; border-radius: 9px; font-size: 10px; font-weight: 700; }
+.external-data-source-card > span:nth-child(2) { min-width: 0; }
+.external-data-source-card strong,.external-data-source-card small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.external-data-source-card strong { font-size: 12px; }.external-data-source-card small { margin-top: 3px; color: #6e6e73; font-size: 10px; }
+.external-data-source-card em { color: #24834f; font-size: 10px; font-style: normal; }
+.external-data-source-editor { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px 18px; margin-top: 16px; padding: 16px; background: #f7f7f8; border: 1px solid #e5e5e7; border-radius: 10px; }
+.external-data-source-editor label { display: flex; flex-direction: column; gap: 6px; color: #515154; font-size: 12px; font-weight: 500; }
+.external-data-source-editor .checkbox-line { flex-direction: row; align-items: center; align-self: end; }
+.external-data-source-wide { grid-column: 1/-1; }
+.external-data-source-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
+.external-data-source-actions span { color: #515154; font-size: 12px; }
+.database-auto-backup-panel { padding: 18px; background: #f7f7f8; border: 1px solid #e2e2e5; border-radius: 10px; }
+.database-auto-backup-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-top: 14px; }
+.database-auto-backup-controls > label:not(.checkbox-line) { display: flex; flex-direction: column; gap: 5px; color: #515154; font-size: 12px; }
+.database-auto-backup-controls .input-small { width: 100px; }
+.database-backup-source-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; margin-top: 14px; }
+.database-backup-source-option { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 10px 12px; background: #fff; border: 1px solid #e5e5e7; border-radius: 8px; cursor: pointer; }
+.database-backup-source-option input { accent-color: #1d1d1f; }
+.database-backup-source-option span { min-width: 0; }.database-backup-source-option strong,.database-backup-source-option small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.database-backup-source-option strong { color: #1d1d1f; font-size: 12px; }.database-backup-source-option small { margin-top: 2px; color: #8e8e93; font-size: 10px; }
 .database-backup-panel { margin-top: 22px; padding-top: 20px; border-top: 1px solid #e5e5e7; }
 .database-backup-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .database-backup-header p { margin: 6px 0 0; color: #6e6e73; font-size: 13px; line-height: 1.6; }

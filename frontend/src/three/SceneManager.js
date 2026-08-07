@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { CSS2DObject, CSS2DRenderer } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
-import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
+import { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
 import gsap from 'gsap';
 import { getBackendOrigin } from '../runtime/backendEndpoint.js';
 
@@ -196,6 +196,9 @@ export class SceneManager {
         this.dragOffset = new THREE.Vector3();
         this.deviceDragState = null;
         this.suppressNextClick = false;
+        this.webglContextLost = false;
+        this.environmentObjects = [];
+        this.concreteTexture = null;
 
         this.initScene();
         this.initCamera();
@@ -220,9 +223,10 @@ export class SceneManager {
         this.scene.fog = new THREE.FogExp2(envColor, 0.0025);
 
         const groundGeo = new THREE.PlaneGeometry(560, 560);
+        this.concreteTexture = createConcreteTexture();
         const groundMat = new THREE.MeshStandardMaterial({
             color: 0x858b88,
-            map: createConcreteTexture(),
+            map: this.concreteTexture,
             roughness: 0.86,
             metalness: 0.02,
             depthWrite: true
@@ -232,21 +236,25 @@ export class SceneManager {
         ground.position.y = -0.1;
         ground.receiveShadow = true;
         this.scene.add(ground);
+        this.environmentObjects.push(ground);
 
         const grid = new THREE.GridHelper(440, 44, 0x6f7774, 0x777f7c);
         grid.position.y = -0.085;
         grid.material.opacity = 0.08;
         grid.material.transparent = true;
         this.scene.add(grid);
+        this.environmentObjects.push(grid);
 
         const wallMat = new THREE.MeshStandardMaterial({ color: 0xb9bfbb, roughness: 0.9, metalness: 0.01 });
         const backWall = new THREE.Mesh(new THREE.PlaneGeometry(560, 72), wallMat);
         backWall.position.set(0, 35, -178);
         this.scene.add(backWall);
+        this.environmentObjects.push(backWall);
 
         const baseWall = new THREE.Mesh(new THREE.BoxGeometry(560, 0.28, 2.2), new THREE.MeshStandardMaterial({ color: 0x747c79, roughness: 0.72 }));
         baseWall.position.set(0, 0.2, -176.9);
         this.scene.add(baseWall);
+        this.environmentObjects.push(baseWall);
 
     }
 
@@ -272,7 +280,16 @@ export class SceneManager {
         
         // 多设备大屏优先保证帧率，默认关闭实时阴影，后续可做质量档位。
         this.renderer.shadowMap.enabled = false;
-        
+
+        this.boundOnWebglContextLost = (event) => {
+            event.preventDefault();
+            this.webglContextLost = true;
+        };
+        this.boundOnWebglContextRestored = () => {
+            this.webglContextLost = false;
+        };
+        this.renderer.domElement.addEventListener('webglcontextlost', this.boundOnWebglContextLost, false);
+        this.renderer.domElement.addEventListener('webglcontextrestored', this.boundOnWebglContextRestored, false);
         this.container.appendChild(this.renderer.domElement);
     }
 
@@ -321,7 +338,12 @@ export class SceneManager {
         const generator = new THREE.PMREMGenerator(this.renderer);
         generator.compileEquirectangularShader();
         const url = `${getBackendOrigin()}/assets/textures/industrial/blocky_photo_studio_1k.hdr`;
-        new RGBELoader().load(url, (texture) => {
+        new HDRLoader().load(url, (texture) => {
+            if (this.disposed) {
+                texture.dispose();
+                generator.dispose();
+                return;
+            }
             const renderTarget = generator.fromEquirectangular(texture);
             texture.dispose();
             generator.dispose();
@@ -1138,6 +1160,19 @@ export class SceneManager {
         this.requestLabelRefresh(300);
     }
 
+    isRenderSurfaceHealthy() {
+        const canvas = this.renderer?.domElement;
+        const context = this.renderer?.getContext?.();
+        return !this.disposed
+            && !this.webglContextLost
+            && !!canvas
+            && canvas.isConnected
+            && this.container?.contains?.(canvas)
+            && canvas.width > 1
+            && canvas.height > 1
+            && !(context?.isContextLost?.() === true);
+    }
+
     animate(now = performance.now()) {
         if (this.disposed) return;
         this.animationFrameId = requestAnimationFrame(this.boundAnimate);
@@ -1243,10 +1278,22 @@ export class SceneManager {
         this.scene.environment = null;
         this.environmentRenderTarget?.dispose?.();
         this.environmentRenderTarget = null;
+        this.environmentObjects.forEach((object) => {
+            this.scene.remove(object);
+            disposeObject3D(object);
+        });
+        this.environmentObjects = [];
+        this.concreteTexture?.dispose?.();
+        this.concreteTexture = null;
 
         // 销毁渲染器
         if (this.renderer) {
+            if (this.renderer.domElement && this.boundOnWebglContextLost) {
+                this.renderer.domElement.removeEventListener('webglcontextlost', this.boundOnWebglContextLost);
+                this.renderer.domElement.removeEventListener('webglcontextrestored', this.boundOnWebglContextRestored);
+            }
             this.renderer.dispose();
+            this.renderer.forceContextLoss?.();
             if (this.renderer.domElement && this.renderer.domElement.parentNode) {
                 this.renderer.domElement.parentNode.removeChild(this.renderer.domElement);
             }

@@ -18,7 +18,9 @@
     "test:native-preview": "node scripts/native-scene-preview-test.cjs",
     "test:spatial": "node scripts/spatial-hierarchy-test.cjs",
     "test:cast": "node scripts/cast-discovery-test.cjs",
-    "test:designer": "node scripts/dashboard-designer-test.cjs"
+    "test:designer": "node scripts/dashboard-designer-test.cjs",
+    "test:data-sources": "node scripts/data-source-test.cjs",
+    "test:datapoints-sync": "node scripts/data-point-sync-test.cjs"
   },
   "dependencies": {
     "archiver": "^7.0.1",

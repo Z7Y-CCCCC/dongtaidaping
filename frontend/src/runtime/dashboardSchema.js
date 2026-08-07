@@ -1,4 +1,4 @@
-export const DASHBOARD_SCHEMA_VERSION = 1
+export const DASHBOARD_SCHEMA_VERSION = 2
 
 export const DEFAULT_DASHBOARD_CANVAS = Object.freeze({
   width: 1920,
@@ -13,7 +13,7 @@ export const SYSTEM_WIDGET_TYPES = new Set(['navigation', 'device_label', 'diagn
 
 export const DASHBOARD_WIDGET_LIBRARY = [
   { type: 'text', label: '文本', icon: 'T', group: '基础', description: '标题、说明和动态文本' },
-  { type: 'value', label: '数值', icon: '12', group: '基础', description: 'PLC 数值、单位和格式' },
+  { type: 'value', label: '数值', icon: '12', group: '基础', description: '任意数据源的数值与格式' },
   { type: 'status', label: '状态灯', icon: '●', group: '基础', description: '布尔状态、在线和报警' },
   { type: 'image', label: '图片', icon: '▧', group: '基础', description: '现场图片、Logo 和图标' },
   { type: 'container', label: '容器', icon: '□', group: '布局', description: '透明卡片和区域分组' },
@@ -100,6 +100,21 @@ function objectValue(value, fallback = {}) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : fallback
 }
 
+function stringArray(value) {
+  return Array.isArray(value) ? value.map(item => String(item || '').trim()).filter(Boolean) : []
+}
+
+function normalizeVisibility(source = {}) {
+  const visibility = objectValue(source, {})
+  const allowedModes = new Set(['factory', 'workshop', 'line', 'device'])
+  return {
+    viewModes: stringArray(visibility.viewModes).filter(mode => allowedModes.has(mode)),
+    matchBoundDevice: !!visibility.matchBoundDevice,
+    ruleMode: visibility.ruleMode === 'any' ? 'any' : 'all',
+    rules: Array.isArray(visibility.rules) ? deepClone(visibility.rules).slice(0, 20) : []
+  }
+}
+
 export function normalizeDashboardWidget(source = {}, canvas = DEFAULT_DASHBOARD_CANVAS, index = 0) {
   const type = source.type || source.widget_type || 'text'
   const defaults = TYPE_DEFAULTS[type] || TYPE_DEFAULTS.text
@@ -109,6 +124,7 @@ export function normalizeDashboardWidget(source = {}, canvas = DEFAULT_DASHBOARD
   const legacyRows = canvas.legacyGrid?.rows || 12
   const hasCanonicalFrame = frame.width !== undefined || frame.height !== undefined
   const data = objectValue(source.data, objectValue(source.binding, {}))
+  const requestedMode = String(data.mode || '')
   return {
     id: String(source.id || `widget_${type}_${index + 1}`).replace(/[^a-zA-Z0-9_-]/g, '_'),
     type,
@@ -128,15 +144,26 @@ export function normalizeDashboardWidget(source = {}, canvas = DEFAULT_DASHBOARD
     content: { ...deepClone(defaults.content || {}), ...deepClone(config) },
     style: { ...deepClone(defaults.style || {}), ...deepClone(source.style || source.config?.style || {}) },
     data: {
-      mode: ['static', 'runtime', 'plc'].includes(data.mode) ? data.mode : (data.pointId || data.point_id ? 'plc' : (data.path || data.source ? 'runtime' : 'static')),
+      mode: ['static', 'runtime', 'plc', 'database'].includes(requestedMode) ? requestedMode : (data.connectionId || data.connection_id ? 'database' : (data.pointId || data.point_id ? 'plc' : (data.path || data.source ? 'runtime' : 'static'))),
       deviceId: String(data.deviceId || data.device_id || ''),
       pointId: String(data.pointId || data.point_id || ''),
       path: String(data.path || ''),
       source: String(data.source || ''),
+      connectionId: String(data.connectionId || data.connection_id || ''),
+      schema: String(data.schema || ''),
+      table: String(data.table || ''),
+      field: String(data.field || ''),
+      timeField: String(data.timeField || ''),
+      orderBy: String(data.orderBy || data.timeField || ''),
+      orderDirection: String(data.orderDirection || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc',
+      valueMode: ['latest', 'first', 'list', 'count', 'sum', 'avg', 'min', 'max'].includes(data.valueMode) ? data.valueMode : 'latest',
+      rowLimit: Math.round(numberValue(data.rowLimit, 50, 1, 500)),
+      refreshMs: Math.round(numberValue(data.refreshMs, 5000, 1000, 3600000)),
       unit: String(data.unit || ''),
       decimals: Math.round(numberValue(data.decimals, 1, 0, 8)),
       readOnly: true
     },
+    visibility: normalizeVisibility(source.visibility || source.config?.visibility),
     conditions: Array.isArray(source.conditions) ? deepClone(source.conditions) : deepClone(source.config?.conditions || []),
     animation: { type: 'none', duration: 1.2, delay: 0, iteration: 'infinite', ...deepClone(source.animation || source.config?.animation || {}) },
     events: Array.isArray(source.events) ? deepClone(source.events) : deepClone(source.config?.events || [])

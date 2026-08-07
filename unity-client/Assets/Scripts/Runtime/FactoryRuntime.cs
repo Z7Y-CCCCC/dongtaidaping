@@ -54,6 +54,14 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private FactoryConfigDto _config;
         private CancellationTokenSource _lifetime;
         private CancellationTokenSource _reload;
+        private JObject _lastDashboardContext = new JObject
+        {
+            ["viewMode"] = "factory",
+            ["sceneId"] = string.Empty,
+            ["workshopId"] = string.Empty,
+            ["lineId"] = string.Empty,
+            ["deviceId"] = string.Empty
+        };
         private Transform _factoryRoot;
         private Camera _camera;
         private OrbitCameraController _orbit;
@@ -100,6 +108,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 _camera.GetComponent<OrbitCameraController>(),
                 _diagnostics
             );
+            _dashboard.ViewContextChanged += OnDashboardViewContextChanged;
 
             _modelLibrary = GetOrAdd<RuntimeModelLibrary>();
             _webSocket = GetOrAdd<RealtimeWebSocketClient>();
@@ -558,6 +567,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             {
                 var deviceId = focus?.Value<string>("deviceId");
                 _dashboard.FocusPreviewDevice(deviceId);
+                PublishDashboardContext("device", deviceId: deviceId);
                 Debug.Log($"[FactoryRuntime] Native focus applied: mode=device, target={deviceId ?? string.Empty}");
                 return;
             }
@@ -595,7 +605,37 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _dashboard.FocusPreviewBounds(selectedRoots.Count > 0
                 ? CalculateRendererBounds(selectedRoots)
                 : factoryBounds);
+            PublishDashboardContext(mode, lineId: string.Equals(mode, "line", StringComparison.OrdinalIgnoreCase) ? targetId : string.Empty,
+                workshopId: string.Equals(mode, "workshop", StringComparison.OrdinalIgnoreCase) ? targetId : string.Empty);
             Debug.Log($"[FactoryRuntime] Native focus applied: mode={mode}, target={targetId}, roots={selectedRoots.Count}");
+        }
+
+        private void OnDashboardViewContextChanged(string mode, string deviceId)
+        {
+            PublishDashboardContext(mode, deviceId: deviceId);
+        }
+
+        private void PublishDashboardContext(string mode, string deviceId = "", string lineId = "", string workshopId = "")
+        {
+            var normalizedMode = string.IsNullOrWhiteSpace(mode) ? "factory" : mode.ToLowerInvariant();
+            if (!string.IsNullOrWhiteSpace(deviceId))
+            {
+                if (string.IsNullOrWhiteSpace(lineId)) _deviceLineIds.TryGetValue(deviceId, out lineId);
+                if (string.IsNullOrWhiteSpace(workshopId)) _deviceWorkshopIds.TryGetValue(deviceId, out workshopId);
+            }
+            _lastDashboardContext = new JObject
+            {
+                ["viewMode"] = normalizedMode,
+                ["sceneId"] = _config?.Platform?["activeScene"]?["id"]?.Value<string>() ?? string.Empty,
+                ["workshopId"] = workshopId ?? string.Empty,
+                ["lineId"] = lineId ?? string.Empty,
+                ["deviceId"] = deviceId ?? string.Empty
+            };
+            _webSocket?.SendMessage(new JObject
+            {
+                ["type"] = "dashboard_context",
+                ["payload"] = _lastDashboardContext.DeepClone()
+            });
         }
 
         private void ApplyPreviewCameraAction(JObject payload)
@@ -820,6 +860,14 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             _diagnostics.BackendState = state ?? "unknown";
             _dashboard.BackendState = _diagnostics.BackendState;
+            if (string.Equals(state, "connected", StringComparison.OrdinalIgnoreCase))
+            {
+                _webSocket?.SendMessage(new JObject
+                {
+                    ["type"] = "dashboard_context",
+                    ["payload"] = _lastDashboardContext.DeepClone()
+                });
+            }
         }
 
         private void DestroyCurrentFactory()
@@ -892,6 +940,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 _webSocket.ConnectionStateChanged -= OnConnectionStateChanged;
                 _webSocket.StopClient();
             }
+            if (_dashboard != null) _dashboard.ViewContextChanged -= OnDashboardViewContextChanged;
             if (_windowMenu != null) _windowMenu.SettingsRequested -= OpenAdminSettings;
             _reload?.Cancel();
             _reload?.Dispose();

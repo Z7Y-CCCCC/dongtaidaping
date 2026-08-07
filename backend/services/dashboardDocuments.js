@@ -10,6 +10,7 @@ const {
     documentToRuntimeWidgets,
     isCanonicalDocument
 } = require('../utils/dashboardDocument');
+const { resolveConnection } = require('./dataSources');
 
 function releasePayload(row) {
     if (!row) return null;
@@ -87,6 +88,11 @@ async function loadPublishedDocument(db, project, scene) {
 
 async function validatePlcBindings(db, document) {
     validateDocument(document);
+    const databaseConnectionIds = [...new Set(document.widgets
+        .filter(widget => widget.data?.mode === 'database')
+        .map(widget => String(widget.data.connectionId || ''))
+        .filter(Boolean))];
+    for (const connectionId of databaseConnectionIds) resolveConnection(connectionId);
     const bindings = document.widgets
         .filter(widget => widget.data?.mode === 'plc')
         .map(widget => ({

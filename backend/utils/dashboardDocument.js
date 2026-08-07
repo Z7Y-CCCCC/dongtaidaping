@@ -1,4 +1,5 @@
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
+const SUPPORTED_SCHEMA_VERSIONS = new Set([1, 2]);
 const DEFAULT_CANVAS = Object.freeze({
     width: 1920,
     height: 1080,
@@ -15,7 +16,7 @@ const ALLOWED_WIDGET_TYPES = new Set([
 const UNITY_WIDGET_TYPES = new Set(['navigation', 'device_label', 'diagnostics', 'line_overview_cards']);
 const ALLOWED_EVENT_ACTIONS = new Set([
     'enter_device', 'focus_factory', 'focus_line', 'focus_workshop',
-    'play_voice', 'open_link', 'switch_scene'
+    'play_voice', 'open_link', 'switch_scene', 'set_visibility', 'toggle_visibility'
 ]);
 const ALLOWED_EVENT_TRIGGERS = new Set(['click', 'doubleClick']);
 const FORBIDDEN_WRITE_KEYS = new Set([
@@ -127,8 +128,10 @@ function normalizeDataBinding(source, legacyBinding = {}) {
     const data = objectValue(source, {});
     const binding = objectValue(legacyBinding, {});
     let mode = shortText(data.mode, '', 32);
-    if (!['static', 'runtime', 'plc'].includes(mode)) {
-        mode = (data.pointId || binding.pointId || binding.point_id)
+    if (!['static', 'runtime', 'plc', 'database'].includes(mode)) {
+        mode = (data.connectionId || binding.connectionId || binding.connection_id)
+            ? 'database'
+            : (data.pointId || binding.pointId || binding.point_id)
             ? 'plc'
             : ((data.path || binding.path || binding.source) ? 'runtime' : 'static');
     }
@@ -140,6 +143,18 @@ function normalizeDataBinding(source, legacyBinding = {}) {
         pointId: shortText(data.pointId ?? binding.pointId ?? binding.point_id, '', 128),
         path: shortText(data.path ?? binding.path, '', 255),
         source: shortText(data.source ?? binding.source, '', 128),
+        connectionId: shortText(data.connectionId ?? binding.connectionId ?? binding.connection_id, '', 80),
+        schema: shortText(data.schema ?? binding.schema, '', 255),
+        table: shortText(data.table ?? binding.table, '', 255),
+        field: shortText(data.field ?? binding.field, '', 255),
+        timeField: shortText(data.timeField ?? binding.timeField, '', 255),
+        orderBy: shortText(data.orderBy ?? binding.orderBy ?? data.timeField ?? binding.timeField, '', 255),
+        orderDirection: String(data.orderDirection ?? binding.orderDirection ?? 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc',
+        valueMode: ['latest', 'first', 'list', 'count', 'sum', 'avg', 'min', 'max'].includes(data.valueMode ?? binding.valueMode)
+            ? (data.valueMode ?? binding.valueMode)
+            : 'latest',
+        rowLimit: integer(data.rowLimit ?? binding.rowLimit, 50, 1, 500),
+        refreshMs: integer(data.refreshMs ?? binding.refreshMs, 5000, 1000, 3600000),
         unit: shortText(data.unit ?? binding.unit, '', 32),
         decimals: integer(data.decimals ?? binding.decimals, 1, 0, 8),
         readOnly: true
@@ -153,12 +168,34 @@ function normalizeEvent(event) {
     const result = { trigger, action };
     for (const [key, max] of Object.entries({
         deviceId: 128, lineId: 128, workshopId: 128, sceneId: 128,
-        url: 2048, audioUrl: 2048, text: 500
+        url: 2048, audioUrl: 2048, text: 500,
+        targetId: 128, targetType: 32, visibility: 16
     })) {
         const value = shortText(source[key], '', max);
         if (value) result[key] = value;
     }
     return result;
+}
+
+function normalizeVisibility(value) {
+    const source = objectValue(value, {});
+    const allowedModes = new Set(['factory', 'workshop', 'line', 'device']);
+    return {
+        viewModes: arrayValue(source.viewModes, []).map(item => shortText(item, '', 32)).filter(item => allowedModes.has(item)),
+        matchBoundDevice: booleanValue(source.matchBoundDevice, false),
+        ruleMode: source.ruleMode === 'any' ? 'any' : 'all',
+        rules: arrayValue(source.rules, []).slice(0, 20).map(rule => {
+            const item = objectValue(rule, {});
+            return {
+                source: item.source === 'data' ? 'data' : 'context',
+                path: shortText(item.path, item.source === 'data' ? 'value' : 'viewMode', 128),
+                operator: ['==', '!=', '>', '>=', '<', '<=', 'truthy', 'falsy', 'contains'].includes(item.operator) ? item.operator : '==',
+                value: typeof item.value === 'number' || typeof item.value === 'boolean'
+                    ? item.value
+                    : shortText(item.value, '', 500)
+            };
+        })
+    };
 }
 
 function normalizeWidget(source, canvas, index = 0) {
@@ -173,6 +210,7 @@ function normalizeWidget(source, canvas, index = 0) {
     const conditions = arrayValue(widget.conditions, arrayValue(config.conditions, []));
     const animation = objectValue(widget.animation, objectValue(config.animation, { type: 'none' }));
     const events = arrayValue(widget.events, arrayValue(config.events, [])).slice(0, 12).map(normalizeEvent);
+    const visibility = normalizeVisibility(widget.visibility ?? config.visibility);
     const designer = objectValue(config.__designer, {});
     return {
         id: cleanId(widget.id, `widget_${type}_${index + 1}`),
@@ -189,6 +227,7 @@ function normalizeWidget(source, canvas, index = 0) {
         content,
         style,
         data: normalizeDataBinding(widget.data, binding),
+        visibility,
         conditions: conditions.slice(0, 20).map(item => objectValue(item, {})),
         animation: {
             type: shortText(animation.type, 'none', 32),
@@ -276,26 +315,50 @@ function buildDocumentFromLegacy({ project, scene, widgets }) {
 function validateDocument(document, options = {}) {
     const errors = [];
     const input = objectValue(document, {});
-    if (Number(input.schemaVersion) !== SCHEMA_VERSION) errors.push(`仅支持 Schema v${SCHEMA_VERSION}`);
+    if (!SUPPORTED_SCHEMA_VERSIONS.has(Number(input.schemaVersion))) errors.push(`仅支持 Schema v1-v${SCHEMA_VERSION}`);
     if (!shortText(input.projectId, '', 128)) errors.push('projectId 不能为空');
     if (!shortText(input.sceneId, '', 128)) errors.push('sceneId 不能为空');
     if (!Array.isArray(input.widgets)) errors.push('widgets 必须是数组');
     if (Array.isArray(input.widgets) && input.widgets.length > 500) errors.push('组件数量不能超过 500 个');
 
     const ids = new Set();
+    const groupIds = new Set((input.widgets || []).map(widget => shortText(widget?.groupId, '', 128)).filter(Boolean));
+    for (const widget of (input.widgets || [])) {
+        const widgetId = shortText(widget?.id, '', 128);
+        if (widgetId) ids.add(widgetId);
+    }
+    const duplicateIds = new Set();
+    const visitedIds = new Set();
     for (const [index, widget] of (input.widgets || []).entries()) {
         const label = `第 ${index + 1} 个组件`;
         if (!widget?.id || !/^[a-zA-Z0-9_-]+$/.test(widget.id)) errors.push(`${label} ID 不合法`);
-        if (ids.has(widget?.id)) errors.push(`组件 ID 重复：${widget.id}`);
-        ids.add(widget?.id);
+        if (visitedIds.has(widget?.id) && !duplicateIds.has(widget?.id)) {
+            errors.push(`组件 ID 重复：${widget.id}`);
+            duplicateIds.add(widget?.id);
+        }
+        visitedIds.add(widget?.id);
         if (!ALLOWED_WIDGET_TYPES.has(widget?.type)) errors.push(`${label} 类型不支持：${widget?.type}`);
         if (!widget?.frame || Number(widget.frame.width) < 20 || Number(widget.frame.height) < 20) errors.push(`${label} 尺寸不合法`);
         if (widget?.data?.readOnly === false) errors.push(`${label} 禁止启用 PLC 写入`);
         if (widget?.data?.mode === 'plc' && (!widget.data.deviceId || !widget.data.pointId)) {
             errors.push(`${label} 的 PLC 绑定必须同时选择设备和只读点位`);
         }
+        if (widget?.data?.mode === 'database'
+            && (!widget.data.connectionId || !widget.data.table || (widget.data.valueMode !== 'count' && !widget.data.field))) {
+            errors.push(`${label} 的数据库绑定必须选择连接、表和字段`);
+        }
         for (const event of widget?.events || []) {
             if (!ALLOWED_EVENT_ACTIONS.has(event?.action)) errors.push(`${label} 包含不允许的点击动作`);
+            if (['set_visibility', 'toggle_visibility'].includes(event?.action)
+                && (!event.targetId || !['group', 'widget'].includes(event.targetType))) {
+                errors.push(`${label} 的显隐事件必须选择组件或分组目标`);
+            } else if (['set_visibility', 'toggle_visibility'].includes(event?.action)
+                && event.targetType === 'widget' && !ids.has(event.targetId)) {
+                errors.push(`${label} 的显隐事件目标组件不存在：${event.targetId}`);
+            } else if (['set_visibility', 'toggle_visibility'].includes(event?.action)
+                && event.targetType === 'group' && !groupIds.has(event.targetId)) {
+                errors.push(`${label} 的显隐事件目标分组不存在：${event.targetId}`);
+            }
         }
         inspectForbiddenWriteIntent(widget, `${label}`, errors);
     }
@@ -339,6 +402,7 @@ function documentWidgetToLegacy(widget, document, index = 0) {
         conditions: arrayValue(widget.conditions, []),
         animation: objectValue(widget.animation, { type: 'none' }),
         events: arrayValue(widget.events, []),
+        visibility: normalizeVisibility(widget.visibility),
         __designer: {
             locked: !!widget.locked,
             zIndex: integer(widget.zIndex, index, -1000, 10000),
@@ -380,6 +444,7 @@ function documentToRuntimeWidgets(document) {
             content: clone(widget.content),
             style: clone(widget.style),
             data: clone(widget.data),
+            visibility: clone(widget.visibility),
             conditions: clone(widget.conditions),
             animation: clone(widget.animation),
             events: clone(widget.events),
@@ -393,7 +458,7 @@ function documentToRuntimeWidgets(document) {
 
 function isCanonicalDocument(value) {
     const parsed = objectValue(value, {});
-    return Number(parsed.schemaVersion) === SCHEMA_VERSION
+    return SUPPORTED_SCHEMA_VERSIONS.has(Number(parsed.schemaVersion))
         && Array.isArray(parsed.widgets)
         && parsed.canvas && typeof parsed.canvas === 'object';
 }

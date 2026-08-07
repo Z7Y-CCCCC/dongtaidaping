@@ -393,6 +393,7 @@ export function createDashboardDataStore(options = {}) {
         wsClient.onopen = () => {
             wsConnected.value = true;
             plcStatusText.value = '通信正常';
+            try { wsClient.send(JSON.stringify({ type: 'client_hello', role: 'web', client: 'dashboard-overlay' })); } catch (e) { /* ignore */ }
         };
 
         wsClient.onmessage = (event) => {

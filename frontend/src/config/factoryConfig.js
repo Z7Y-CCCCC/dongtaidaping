@@ -201,6 +201,9 @@ export const adminApi = {
     async saveDataPointsBatch(deviceId, points) { 
         return readApiJson(await fetch(`${API_BASE}/datapoints/batch`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ device_id: deviceId, points }) }), '保存点位失败')
     },
+    async syncDataPoints(deviceId, points) {
+        return readApiJson(await fetch(`${API_BASE}/datapoints/sync`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ device_id: deviceId, points }) }), '保存点位失败')
+    },
     async getRealtimePointValues(deviceId) {
         const suffix = deviceId && deviceId !== 'all' ? `?device_id=${encodeURIComponent(deviceId)}` : ''
         return readApiJson(await fetch(`${API_BASE}/plc/points/realtime${suffix}`), '读取实时点位失败')
@@ -239,6 +242,27 @@ export const adminApi = {
     async getDatabaseConfig() { return (await fetch(`${API_BASE}/database/config`)).json() },
     async testDatabaseConfig(data) { return readApiJson(await fetch(`${API_BASE}/database/test`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '测试数据库连接失败') },
     async saveDatabaseConfig(data) { return readApiJson(await fetch(`${API_BASE}/database/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存数据库配置失败') },
+    async getDataSources() { return readApiJson(await fetch(`${API_BASE}/data-sources`), '读取数据源连接失败') },
+    async testDataSource(data) { return readApiJson(await fetch(`${API_BASE}/data-sources/test`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '测试数据源连接失败') },
+    async saveDataSource(data) {
+        const id = data?.id
+        const url = id ? `${API_BASE}/data-sources/connections/${pathId(id)}` : `${API_BASE}/data-sources/connections`
+        return readApiJson(await fetch(url, { method: id ? 'PUT' : 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存数据源连接失败')
+    },
+    async deleteDataSource(id) { return readApiJson(await fetch(`${API_BASE}/data-sources/connections/${pathId(id)}`, { method: 'DELETE' }), '删除数据源连接失败') },
+    async getDataSourceTables(id) { return readApiJson(await fetch(`${API_BASE}/data-sources/connections/${pathId(id)}/tables`), '读取数据库表失败') },
+    async getDataSourceColumns(id, schema, table) {
+        const params = new URLSearchParams({ schema: schema || '', table: table || '' })
+        return readApiJson(await fetch(`${API_BASE}/data-sources/connections/${pathId(id)}/columns?${params}`), '读取数据库字段失败')
+    },
+    async previewDataSource(binding) { return readApiJson(await fetch(`${API_BASE}/data-sources/preview`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(binding) }), '预览数据失败') },
+    async getDataSourceBackupStatus() { return readApiJson(await fetch(`${API_BASE}/data-sources/backups/status`), '读取数据库自动备份配置失败') },
+    async saveDataSourceBackupConfig(config) { return readApiJson(await fetch(`${API_BASE}/data-sources/backups/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(config) }), '保存数据库自动备份配置失败') },
+    async runDataSourceBackups(connectionId = '') { return readApiJson(await fetch(`${API_BASE}/data-sources/backups/run`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ connectionId }) }), '创建数据库备份失败') },
+    async getRuntimeDataSourceValues(sceneId = '') {
+        const suffix = sceneId ? `?scene_id=${encodeURIComponent(sceneId)}` : ''
+        return readApiJson(await fetch(`${API_BASE}/data-sources/runtime-values${suffix}`), '读取外部数据库数据失败')
+    },
     async getDatabaseBackups() { return readApiJson(await fetch(`${API_BASE}/database/backups`), '读取数据库备份失败') },
     async createDatabaseBackup() { return readApiJson(await fetch(`${API_BASE}/database/backups`, { method: 'POST' }), '创建数据库备份失败') },
     async restoreDatabaseBackup(filename) { return readApiJson(await fetch(`${API_BASE}/database/backups/${pathId(filename)}/restore`, { method: 'POST' }), '恢复数据库备份失败') },

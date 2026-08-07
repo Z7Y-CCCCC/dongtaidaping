@@ -680,12 +680,149 @@ export function useSystemSettings({
         postgres: 5432,
         sqlserver: 1433
     }
+    const dataSourceConnections = ref([])
+    const dataSourceEditor = reactive({
+        id: '', name: '', type: 'mysql', host: '127.0.0.1', port: 3306,
+        user: '', password: '', database: '', filename: '', defaultSchema: '',
+        encrypt: false, trustServerCertificate: true, enabled: true, queryTimeoutMs: 8000
+    })
+    const dataSourceBusy = ref(false)
+    const dataSourceMessage = ref('')
+    const dataSourceBackupBusy = ref(false)
+    const dataSourceBackupConfig = reactive({
+        autoEnabled: true,
+        intervalHours: 6,
+        retention: 10,
+        selectedConnectionIds: ['primary']
+    })
+    const dataSourceBackupStatus = reactive({
+        running: false,
+        connections: [],
+        lastBackupRun: null,
+        lastError: null
+    })
+
+    function resetDataSourceEditor() {
+        Object.assign(dataSourceEditor, {
+            id: '', name: '', type: 'mysql', host: '127.0.0.1', port: 3306,
+            user: '', password: '', database: '', filename: '', defaultSchema: '',
+            encrypt: false, trustServerCertificate: true, enabled: true, queryTimeoutMs: 8000
+        })
+        dataSourceMessage.value = ''
+    }
+
+    function editDataSource(connection) {
+        if (!connection || connection.primary) return
+        Object.assign(dataSourceEditor, connection, { password: connection.password || '******' })
+        dataSourceMessage.value = `正在编辑：${connection.name}`
+    }
+
+    async function loadDataSources() {
+        try {
+            const result = await adminApi.getDataSources()
+            dataSourceConnections.value = result.connections || []
+            Object.assign(dataSourceBackupConfig, result.backup || {})
+            Object.assign(dataSourceBackupStatus, result.backupStatus || {}, {
+                connections: result.backupStatus?.connections || []
+            })
+        } catch (e) {
+            dataSourceMessage.value = `数据源读取失败：${e.message || e}`
+        }
+    }
+
+    async function testExternalDataSource() {
+        dataSourceBusy.value = true
+        dataSourceMessage.value = '正在以只读方式测试连接...'
+        try {
+            const result = await adminApi.testDataSource({ ...dataSourceEditor })
+            if (!result?.success) throw new Error(result?.error || '连接失败')
+            dataSourceMessage.value = '连接成功，可读取数据库结构。'
+        } catch (e) {
+            dataSourceMessage.value = `连接失败：${e.message || e}`
+        } finally {
+            dataSourceBusy.value = false
+        }
+    }
+
+    async function saveExternalDataSource() {
+        if (!String(dataSourceEditor.name || '').trim()) {
+            dataSourceMessage.value = '请填写连接名称'
+            return
+        }
+        dataSourceBusy.value = true
+        dataSourceMessage.value = '正在保存只读数据源...'
+        try {
+            const result = await adminApi.saveDataSource({ ...dataSourceEditor })
+            if (!result?.success) throw new Error(result?.error || '保存失败')
+            dataSourceConnections.value = result.connections || []
+            Object.assign(dataSourceBackupConfig, result.backup || {})
+            dataSourceMessage.value = `已保存：${result.connection?.name || dataSourceEditor.name}`
+            resetDataSourceEditor()
+            await loadDataSources()
+        } catch (e) {
+            dataSourceMessage.value = `保存失败：${e.message || e}`
+        } finally {
+            dataSourceBusy.value = false
+        }
+    }
+
+    async function removeExternalDataSource(connection) {
+        if (!connection?.id || connection.primary) return
+        if (!(await confirm(`删除只读数据源“${connection.name}”？已发布大屏中使用它的组件会显示离线。`))) return
+        dataSourceBusy.value = true
+        try {
+            const result = await adminApi.deleteDataSource(connection.id)
+            dataSourceConnections.value = result.connections || []
+            Object.assign(dataSourceBackupConfig, result.backup || {})
+            if (dataSourceEditor.id === connection.id) resetDataSourceEditor()
+            dataSourceMessage.value = `已删除：${connection.name}`
+            await loadDataSources()
+        } catch (e) {
+            dataSourceMessage.value = `删除失败：${e.message || e}`
+        } finally {
+            dataSourceBusy.value = false
+        }
+    }
+
+    async function saveDataSourceBackupConfiguration() {
+        dataSourceBackupBusy.value = true
+        dataSourceMessage.value = '正在保存数据库自动备份配置...'
+        try {
+            const result = await adminApi.saveDataSourceBackupConfig({ ...dataSourceBackupConfig })
+            if (!result?.success) throw new Error(result?.error || '保存失败')
+            Object.assign(dataSourceBackupConfig, result.config || {})
+            Object.assign(dataSourceBackupStatus, result.status || {}, { connections: result.status?.connections || [] })
+            dataSourceMessage.value = '数据库自动压缩备份配置已保存。'
+        } catch (e) {
+            dataSourceMessage.value = `自动备份配置保存失败：${e.message || e}`
+        } finally {
+            dataSourceBackupBusy.value = false
+        }
+    }
+
+    async function runSelectedDatabaseBackups(connectionId = '') {
+        dataSourceBackupBusy.value = true
+        dataSourceMessage.value = connectionId ? '正在备份所选数据库...' : '正在备份所有已勾选数据库...'
+        try {
+            const result = await adminApi.runDataSourceBackups(connectionId)
+            Object.assign(dataSourceBackupStatus, result.status || {}, { connections: result.status?.connections || [] })
+            const failed = (result.results || []).filter(item => !item.success)
+            dataSourceMessage.value = failed.length
+                ? `备份完成，但有 ${failed.length} 个连接失败：${failed.map(item => item.error).join('；')}`
+                : '已完成数据库压缩备份。'
+            await loadDatabaseBackups()
+        } catch (e) {
+            dataSourceMessage.value = `数据库备份失败：${e.message || e}`
+        } finally {
+            dataSourceBackupBusy.value = false
+        }
+    }
 
     async function loadDatabaseConfig() {
         try {
             const config = await adminApi.getDatabaseConfig()
             Object.assign(databaseConfig, config)
-            await Promise.all([loadDatabaseBackups(), loadSiteBackups()])
+            await Promise.all([loadDatabaseBackups(), loadSiteBackups(), loadDataSources()])
         } catch (e) {
             databaseTestStatus.value = '数据库配置读取失败'
         }
@@ -887,6 +1024,20 @@ export function useSystemSettings({
         databaseConfig.database ||= 'dongtai_daping'
     })
 
+    watch(() => dataSourceEditor.type, (type, oldType) => {
+        if (type === oldType) return
+        const ports = { mysql: 3306, postgres: 5432, sqlserver: 1433 }
+        const oldDefault = ports[oldType]
+        if (type === 'sqlite') {
+            dataSourceEditor.port = 0
+            dataSourceEditor.defaultSchema = ''
+            return
+        }
+        if (!dataSourceEditor.port || dataSourceEditor.port === oldDefault) dataSourceEditor.port = ports[type]
+        if (type === 'postgres' && !dataSourceEditor.defaultSchema) dataSourceEditor.defaultSchema = 'public'
+        if (type === 'sqlserver' && !dataSourceEditor.defaultSchema) dataSourceEditor.defaultSchema = 'dbo'
+    })
+
     async function loadEngineStatus() {
         try {
             const res = await fetch(`${API_BASE}/engine/status`)
@@ -908,11 +1059,7 @@ export function useSystemSettings({
 
     async function saveSettings() {
         const result = await adminApi.saveSettings({
-            factory_name: settings.factory_name,
             data_mode: settings.data_mode,
-            realtime_stale_ms: settings.realtime_stale_ms,
-            display_mode: settings.display_mode,
-            camera_mode: settings.camera_mode,
             native_quality_profile: settings.native_quality_profile,
             render_profile: settings.render_profile,
             render_target_fps: settings.render_target_fps,
@@ -1063,6 +1210,21 @@ export function useSystemSettings({
         databaseBackupBusy,
         databaseBackupMessage,
         databaseBackupStatus,
+        dataSourceConnections,
+        dataSourceEditor,
+        dataSourceBusy,
+        dataSourceMessage,
+        dataSourceBackupBusy,
+        dataSourceBackupConfig,
+        dataSourceBackupStatus,
+        resetDataSourceEditor,
+        editDataSource,
+        loadDataSources,
+        testExternalDataSource,
+        saveExternalDataSource,
+        removeExternalDataSource,
+        saveDataSourceBackupConfiguration,
+        runSelectedDatabaseBackups,
         siteBackupFileInput,
         siteBackupBusy,
         siteBackupMessage,

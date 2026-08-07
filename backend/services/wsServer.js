@@ -19,6 +19,7 @@ class WsServer {
         this.wssInstances = new Set();
         this.clients = new Set();
         this.sequence = 0;
+        this.dashboardContext = null;
     }
 
     /**
@@ -55,6 +56,21 @@ class WsServer {
                     } else if (data.type === 'client_hello') {
                         const role = String(data.role || data.payload?.role || '').trim().toLowerCase();
                         ws.clientRole = ['unity', 'web', 'admin'].includes(role) ? role : '';
+                        if (ws.clientRole === 'web' && this.dashboardContext && ws.readyState === 1) {
+                            ws.send(JSON.stringify({ type: 'dashboard_context_changed', payload: this.dashboardContext }));
+                        }
+                    } else if (data.type === 'dashboard_context' && ws.clientRole === 'unity') {
+                        const source = data.payload && typeof data.payload === 'object' ? data.payload : {};
+                        const mode = ['factory', 'workshop', 'line', 'device'].includes(source.viewMode) ? source.viewMode : 'factory';
+                        this.dashboardContext = {
+                            viewMode: mode,
+                            sceneId: String(source.sceneId || '').slice(0, 128),
+                            workshopId: String(source.workshopId || '').slice(0, 128),
+                            lineId: String(source.lineId || '').slice(0, 128),
+                            deviceId: String(source.deviceId || '').slice(0, 128),
+                            timestamp: Date.now()
+                        };
+                        this.broadcastToRole('dashboard_context_changed', this.dashboardContext, 'web');
                     }
                 } catch (e) { /* 忽略非 JSON 消息 */ }
             });

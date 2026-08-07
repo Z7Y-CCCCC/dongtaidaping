@@ -136,11 +136,13 @@ export function useDataPoints({
         const usage = normalizePointUsage(point)
         const displayName = pointDisplayName(point)
         const voiceConfig = parseVoiceConfig(point.voice_config)
+        const deviceId = point.device_id || (isAllPointsMode.value ? devices.value[0]?.id || '' : selectedDeviceForPoints.value)
         return {
             ...point,
             __usage: usage,
             __originalName: point.name || '',
-            device_id: point.device_id || (isAllPointsMode.value ? devices.value[0]?.id || '' : selectedDeviceForPoints.value),
+            __originalDeviceId: point.__originalDeviceId || deviceId,
+            device_id: deviceId,
             name: point.name || '',
             label: displayName,
             plc_tag: point.plc_tag || composePlcAddressFromParts(point),
@@ -796,15 +798,15 @@ export function useDataPoints({
         return errors
     }
 
-    function buildDataPointPayload(point) {
-        const { id, device_id, alarm_high, alarm_low, __usage, __originalName, __voiceRules, ...payload } = point
+    function buildDataPointPayload(point, { includeId = false } = {}) {
+        const { id, device_id, alarm_high, alarm_low, __usage, __originalName, __originalDeviceId, __voiceRules, ...payload } = point
         const usage = normalizePointUsage({ ...point, __usage })
         const displayName = pointDisplayName(point)
         const internalName = String(payload.name || '').trim() || toInternalPointName(displayName, id || displayName)
         const fieldName = roleFromUsage(usage, internalName)
         const plcTag = String(payload.plc_tag || '').trim()
         const dataType = String(payload.data_type || 'WORD').toUpperCase()
-        return {
+        const result = {
             ...payload,
             name: internalName,
             label: displayName,
@@ -827,11 +829,35 @@ export function useDataPoints({
             alarm_text: String(payload.alarm_text || '').trim(),
             alarm_level: payload.alarm_level || 'WARNING',
             alarm_condition: payload.alarm_condition || '=1',
+            alarm_high: optionalNumber(alarm_high),
+            alarm_low: optionalNumber(alarm_low),
             voice_config: JSON.stringify({
                 enabled: pointVoiceRules(point).some(rule => rule.enabled),
                 rules: pointVoiceRules(point).map((rule, index) => normalizeVoiceRule(rule, index))
             })
         }
+        const stayedOnOriginalDevice = String(device_id || '') === String(__originalDeviceId || device_id || '')
+        if (includeId && id !== undefined && id !== null && id !== '' && stayedOnOriginalDevice) result.id = id
+        return result
+    }
+
+    function mergePointSaveSummary(summary, result, fallbackTotal = 0) {
+        summary.inserted += Number(result?.inserted || 0)
+        summary.updated += Number(result?.updated || 0)
+        summary.deleted += Number(result?.deleted || 0)
+        summary.unchanged += Number(result?.unchanged || 0)
+        summary.total += Number(result?.total ?? fallbackTotal)
+    }
+
+    function pointSaveMessage(summary) {
+        const changed = summary.inserted + summary.updated + summary.deleted
+        if (changed === 0) return '没有检测到实际变化，数据库未重复写入。'
+        const parts = []
+        if (summary.updated > 0) parts.push(`修改 ${summary.updated} 条`)
+        if (summary.inserted > 0) parts.push(`新增 ${summary.inserted} 条`)
+        if (summary.deleted > 0) parts.push(`删除 ${summary.deleted} 条`)
+        const skipped = summary.unchanged > 0 ? `其余 ${summary.unchanged} 条未重复写入。` : ''
+        return `保存成功：${parts.join('，')}。${skipped}`
     }
 
     async function saveAllPoints() {
@@ -841,31 +867,35 @@ export function useDataPoints({
             return alert(errors.slice(0, 8).join('\n'), { title: '点位配置未保存', type: 'warning' })
         }
 
-        const points = dataPoints.value.map(buildDataPointPayload)
-        let savedCount = 0
+        const points = dataPoints.value.map(point => buildDataPointPayload(point, { includeId: true }))
+        const summary = { inserted: 0, updated: 0, deleted: 0, unchanged: 0, total: 0 }
         if (isAllPointsMode.value) {
             const deviceIds = new Set([...loadedPointDeviceIds.value, ...dataPoints.value.map(point => point.device_id).filter(Boolean)])
             for (const deviceId of deviceIds) {
                 const rows = dataPoints.value
                     .filter(point => point.device_id === deviceId)
-                    .map(buildDataPointPayload)
-                const result = await adminApi.saveDataPointsBatch(deviceId, rows)
+                    .map(point => buildDataPointPayload(point, { includeId: true }))
+                const result = await adminApi.syncDataPoints(deviceId, rows)
                 if (result?.error) return alert(result.error)
                 if (!result?.success) return alert('保存失败：后端没有返回成功状态', { title: '保存失败', type: 'danger' })
-                savedCount += result.count ?? rows.length
+                mergePointSaveSummary(summary, result, rows.length)
             }
         } else {
-            const result = await adminApi.saveDataPointsBatch(selectedDeviceForPoints.value, points)
+            const result = await adminApi.syncDataPoints(selectedDeviceForPoints.value, points)
             if (result?.error) return alert(result.error)
             if (!result?.success) return alert('保存失败：后端没有返回成功状态', { title: '保存失败', type: 'danger' })
-            savedCount = result.count ?? points.length
+            mergePointSaveSummary(summary, result, points.length)
         }
-        await alert(`保存成功，已写入 ${savedCount} 个点位。`, { title: '点位配置已保存', type: 'success' })
+        const changed = summary.inserted + summary.updated + summary.deleted
+        await alert(pointSaveMessage(summary), {
+            title: changed > 0 ? '点位配置已保存' : '点位配置无变化',
+            type: changed > 0 ? 'success' : 'info'
+        })
         isPointsDirty.value = false
         await loadDataPoints()
         selectedDeviceForMonitor.value = selectedDeviceForPoints.value
         await loadRealtimePointValues()
-        setTimeout(() => loadEngineStatus(), 800)
+        if (changed > 0) setTimeout(() => loadEngineStatus(), 800)
     }
 
     // 扩展功能：从其他设备复制

@@ -889,21 +889,10 @@ function getDatabaseBackupStatus() {
 
 async function startDatabaseMaintenance() {
     await getDb();
-    if (!['sqlite', 'mysql'].includes(dialectName())) return getDatabaseBackupStatus();
     if (backupTimer) clearInterval(backupTimer);
-
-    // MySQL 全量 dump 可能需要数分钟，不能阻塞 PLC 数据引擎启动。
-    // 后台发起并由 backupPromise 串行化；退出流程仍会等待它完成或超时。
-    createDatabaseBackup('startup').catch(error => {
-        console.error('[DB] 启动备份失败:', error.message);
-    });
-
-    backupTimer = setInterval(() => {
-        createDatabaseBackup('scheduled').catch(error => {
-            console.error('[DB] 定时备份失败:', error.message);
-        });
-    }, BACKUP_INTERVAL_MS);
-    backupTimer.unref?.();
+    backupTimer = null;
+    // 自动备份的连接选择、周期和外部只读库统一由 dataSources 服务调度。
+    // 这里仍保留手工备份、恢复以及退出前一致性备份能力。
     return getDatabaseBackupStatus();
 }
 

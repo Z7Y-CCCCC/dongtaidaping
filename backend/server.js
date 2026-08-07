@@ -39,6 +39,10 @@ const {
     resolveSiteBackupPath,
     SITE_IMPORT_DIR
 } = require('./services/siteBackup');
+const {
+    startDataSourceMaintenance,
+    stopDataSourceMaintenance
+} = require('./services/dataSources');
 
 const app = express();
 app.disable('x-powered-by');
@@ -80,6 +84,7 @@ app.use('/api/settings', require('./routes/settings')(settingsController));
 const nativePreviewController = { wsServer: null };
 app.use('/api/native-preview', require('./routes/nativePreview')(nativePreviewController));
 app.use('/api/platform', require('./routes/platform'));
+app.use('/api/data-sources', require('./routes/dataSources'));
 
 // 仅供 Electron 本机管理“登录后自启”和局域网投屏，路由内部会拒绝非回环请求。
 const runtimeController = { lanDisplay: null };
@@ -579,6 +584,7 @@ async function startServer() {
         try { await screenCast.close(); } catch (e) { /* ignore */ }
         try { await lanDisplay.stop(); } catch (e) { /* ignore */ }
         try { stopSiteBackupMaintenance(); } catch (e) { /* ignore */ }
+        try { await stopDataSourceMaintenance(); } catch (e) { /* ignore */ }
         try { wsServer.close(); } catch (e) { /* ignore */ }
         if (global.wsServer === wsServer) global.wsServer = null;
         httpServer.close();
@@ -647,6 +653,7 @@ async function startServer() {
         setTimeout(() => {
             getDb()
                 .then(() => startDatabaseMaintenance())
+                .then(() => startDataSourceMaintenance())
                 .then(() => lanDisplay.loadFromSettings())
                 .then(() => startSiteBackupMaintenance(uploadsRootDir))
                 .then(() => dataEngine.start())

@@ -15,6 +15,7 @@ const {
     verifySqliteFile,
     loadDatabaseConfig
 } = require('../db/database');
+const { reloadDataSourceConfiguration } = require('./dataSources');
 
 const DATA_DIR = process.env.APP_DATA_DIR
     ? path.resolve(process.env.APP_DATA_DIR)
@@ -26,8 +27,11 @@ const SITE_BACKUP_RETENTION = positiveInteger(process.env.SITE_BACKUP_RETENTION,
 const SITE_BACKUP_MAX_TOTAL_BYTES = positiveInteger(process.env.SITE_BACKUP_MAX_TOTAL_BYTES, 20 * 1024 * 1024 * 1024);
 const SITE_BACKUP_MIRROR_RETENTION = positiveInteger(process.env.SITE_BACKUP_MIRROR_RETENTION, 30);
 const SITE_BACKUP_FORMAT = 'heat-treatment-digital-twin-site-backup';
-const SITE_BACKUP_VERSION = 2;
+const SITE_BACKUP_VERSION = 3;
 const UPLOAD_GROUPS = ['models', 'audio'];
+const CONFIG_FILES = Object.freeze([
+    { filename: 'data-sources.json', archivePath: 'config/data-sources.json', sensitive: true }
+]);
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 10000;
 const MAX_ARCHIVE_FILE_BYTES = 512 * 1024 * 1024;
@@ -280,11 +284,22 @@ async function createSiteBackupUnlocked(uploadsRootDir) {
             fs.copyFileSync(source, filename);
             return { filename, relative };
         }));
+        const configFiles = CONFIG_FILES.flatMap(configFile => {
+            const source = path.join(DATA_DIR, configFile.filename);
+            if (!fs.existsSync(source) || !fs.statSync(source).isFile()) return [];
+            const filename = path.join(exportStaging, ...configFile.archivePath.split('/'));
+            ensureDirectory(path.dirname(filename));
+            fs.copyFileSync(source, filename);
+            return [{ ...configFile, filename }];
+        });
         const manifestFiles = [];
         await addArchiveFile(manifestFiles, databaseArchivePath, databaseFilename);
 
         for (const file of uploadedFiles) {
             await addArchiveFile(manifestFiles, `uploads/${file.relative}`, file.filename);
+        }
+        for (const file of configFiles) {
+            await addArchiveFile(manifestFiles, file.archivePath, file.filename);
         }
 
         const createdAt = new Date();
@@ -296,6 +311,8 @@ async function createSiteBackupUnlocked(uploadsRootDir) {
             databasePath: databaseArchivePath,
             uploadGroups: UPLOAD_GROUPS,
             uploadedFileCount: uploadedFiles.length,
+            configFiles: configFiles.map(file => file.archivePath),
+            containsSensitiveConfiguration: configFiles.some(file => file.sensitive),
             files: manifestFiles
         };
         const filename = `heat-treatment-site-backup-${timestampToken(createdAt)}.zip`;
@@ -316,6 +333,9 @@ async function createSiteBackupUnlocked(uploadsRootDir) {
             archive.file(databaseFilename, { name: databaseArchivePath });
             for (const file of uploadedFiles) {
                 archive.file(file.filename, { name: `uploads/${file.relative}` });
+            }
+            for (const file of configFiles) {
+                archive.file(file.filename, { name: file.archivePath });
             }
             archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
             archive.finalize().catch(reject);
@@ -359,7 +379,7 @@ function normalizeArchivePath(value) {
 }
 
 function validateManifest(manifest) {
-    if (!manifest || manifest.format !== SITE_BACKUP_FORMAT || ![1, SITE_BACKUP_VERSION].includes(Number(manifest.version))) {
+    if (!manifest || manifest.format !== SITE_BACKUP_FORMAT || ![1, 2, SITE_BACKUP_VERSION].includes(Number(manifest.version))) {
         throw new Error('不是受支持的整站备份包');
     }
     if (!['sqlite', 'mysql'].includes(String(manifest.databaseType || '').toLowerCase()) || !Array.isArray(manifest.files)) {
@@ -375,6 +395,13 @@ function validateManifest(manifest) {
             throw new Error('整站备份上传目录清单不合法');
         }
     }
+    const allowedConfigPaths = new Set(CONFIG_FILES.map(file => file.archivePath));
+    if (manifest.configFiles !== undefined) {
+        if (!Array.isArray(manifest.configFiles)
+            || manifest.configFiles.some(configPath => !allowedConfigPaths.has(String(configPath)))) {
+            throw new Error('整站备份配置文件清单不合法');
+        }
+    }
     const declared = new Map();
     let totalSize = 0;
     for (const file of manifest.files) {
@@ -385,7 +412,9 @@ function validateManifest(manifest) {
         if (!Number.isSafeInteger(size) || size < 0 || size > MAX_ARCHIVE_FILE_BYTES || !/^[a-f0-9]{64}$/.test(sha256)) {
             throw new Error(`整站备份文件校验信息无效: ${archivePath}`);
         }
-        if (archivePath !== databasePath && !UPLOAD_GROUPS.some(group => archivePath.startsWith(`uploads/${group}/`))) {
+        if (archivePath !== databasePath
+            && !UPLOAD_GROUPS.some(group => archivePath.startsWith(`uploads/${group}/`))
+            && !allowedConfigPaths.has(archivePath)) {
             throw new Error(`整站备份包含不允许恢复的文件: ${archivePath}`);
         }
         totalSize += size;
@@ -393,7 +422,8 @@ function validateManifest(manifest) {
         declared.set(archivePath, { path: archivePath, size, sha256 });
     }
     if (!declared.has(databasePath)) throw new Error('整站备份缺少数据库文件');
-    return { declared, databaseType, databasePath };
+    const configPaths = [...declared.keys()].filter(archivePath => allowedConfigPaths.has(archivePath));
+    return { declared, databaseType, databasePath, configPaths };
 }
 
 async function extractValidatedArchive(archiveFilename, stagingDirectory) {
@@ -412,7 +442,7 @@ async function extractValidatedArchive(archiveFilename, stagingDirectory) {
         throw new Error('整站备份缺少有效清单');
     }
     const manifest = JSON.parse((await readEntryBuffer(manifestEntry, MAX_MANIFEST_BYTES)).toString('utf8'));
-    const { declared, databaseType, databasePath } = validateManifest(manifest);
+    const { declared, databaseType, databasePath, configPaths } = validateManifest(manifest);
 
     for (const archivePath of entryMap.keys()) {
         if (archivePath !== 'manifest.json' && !declared.has(archivePath)) {
@@ -440,7 +470,7 @@ async function extractValidatedArchive(archiveFilename, stagingDirectory) {
         ? verifySqliteFile(databaseFilename)
         : await verifyDatabaseBackupFile(databaseFilename);
     if (!verification.valid) throw new Error(`整站备份数据库校验失败: ${verification.error}`);
-    return { manifest, databaseFilename };
+    return { manifest, databaseFilename, configPaths };
 }
 
 async function readEntryBuffer(entry, maxBytes) {
@@ -497,15 +527,19 @@ async function restoreSiteBackupUnlocked(archiveFilename, uploadsRootDir) {
     const stagingDirectory = path.join(SITE_IMPORT_DIR, `restore-${timestampToken()}-${process.pid}`);
     const uploadsRoot = path.resolve(uploadsRootDir);
     const rollbackUploads = path.join(stagingDirectory, 'rollback-uploads');
+    const rollbackConfig = path.join(stagingDirectory, 'rollback-config');
     let uploadsMutationStarted = false;
+    let configMutationStarted = false;
     let uploadGroupsToRestore = ['models'];
+    let configPathsToRestore = [];
     ensureDirectory(stagingDirectory);
 
     try {
-        const { manifest, databaseFilename } = await extractValidatedArchive(path.resolve(archiveFilename), stagingDirectory);
+        const { manifest, databaseFilename, configPaths } = await extractValidatedArchive(path.resolve(archiveFilename), stagingDirectory);
         uploadGroupsToRestore = Array.isArray(manifest.uploadGroups)
             ? [...new Set(manifest.uploadGroups.filter(group => UPLOAD_GROUPS.includes(group)))]
             : ['models'];
+        configPathsToRestore = configPaths || [];
         for (const group of uploadGroupsToRestore) {
             const currentDirectory = path.join(uploadsRoot, group);
             const rollbackDirectory = path.join(rollbackUploads, group);
@@ -521,6 +555,34 @@ async function restoreSiteBackupUnlocked(archiveFilename, uploadsRootDir) {
             ensureDirectory(currentDirectory);
         }
 
+        for (const archivePath of configPathsToRestore) {
+            const descriptor = CONFIG_FILES.find(item => item.archivePath === archivePath);
+            if (!descriptor) continue;
+            const currentFilename = path.join(DATA_DIR, descriptor.filename);
+            const rollbackFilename = path.join(rollbackConfig, descriptor.filename);
+            if (fs.existsSync(currentFilename)) {
+                ensureDirectory(path.dirname(rollbackFilename));
+                fs.copyFileSync(currentFilename, rollbackFilename);
+            }
+        }
+        configMutationStarted = configPathsToRestore.length > 0;
+        for (const archivePath of configPathsToRestore) {
+            const descriptor = CONFIG_FILES.find(item => item.archivePath === archivePath);
+            if (!descriptor) continue;
+            const restoredFilename = path.join(stagingDirectory, ...archivePath.split('/'));
+            const parsed = JSON.parse(fs.readFileSync(restoredFilename, 'utf8'));
+            if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.connections)) {
+                throw new Error(`整站备份中的配置文件无效：${descriptor.filename}`);
+            }
+            const currentFilename = path.join(DATA_DIR, descriptor.filename);
+            ensureDirectory(path.dirname(currentFilename));
+            const temporary = `${currentFilename}.${process.pid}.restore.tmp`;
+            fs.rmSync(temporary, { force: true });
+            fs.copyFileSync(restoredFilename, temporary);
+            fs.renameSync(temporary, currentFilename);
+        }
+        if (configMutationStarted) reloadDataSourceConfiguration();
+
         const imported = await importDatabaseBackupFile(databaseFilename, 'site-import');
         const databaseRestore = await restoreDatabaseBackup(imported.filename);
         return {
@@ -532,6 +594,17 @@ async function restoreSiteBackupUnlocked(archiveFilename, uploadsRootDir) {
             recovery: databaseRestore.recovery
         };
     } catch (error) {
+        if (configMutationStarted) {
+            for (const archivePath of configPathsToRestore) {
+                const descriptor = CONFIG_FILES.find(item => item.archivePath === archivePath);
+                if (!descriptor) continue;
+                const currentFilename = path.join(DATA_DIR, descriptor.filename);
+                const rollbackFilename = path.join(rollbackConfig, descriptor.filename);
+                fs.rmSync(currentFilename, { force: true });
+                if (fs.existsSync(rollbackFilename)) fs.copyFileSync(rollbackFilename, currentFilename);
+            }
+            reloadDataSourceConfiguration();
+        }
         if (uploadsMutationStarted) {
             for (const group of uploadGroupsToRestore) {
                 const currentDirectory = path.join(uploadsRoot, group);

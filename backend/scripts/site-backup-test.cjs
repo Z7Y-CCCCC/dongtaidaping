@@ -23,6 +23,7 @@ const MUTATED_SETTING = 'value-after-export';
 const MODEL_FILENAME = 'site-backup-test.glb';
 const ORIGINAL_MODEL = Buffer.from('site-backup-original-model-content');
 const MUTATED_MODEL = Buffer.from('site-backup-mutated-model-content');
+const DATA_SOURCE_ID = 'site_backup_external_source';
 
 let backend = null;
 let backendOrigin = null;
@@ -126,6 +127,27 @@ async function main() {
         }
 
         await putSetting(ORIGINAL_SETTING);
+        const savedDataSource = await requestJson(`${backendOrigin}/api/data-sources/connections`, {
+            method: 'POST',
+            body: JSON.stringify({
+                id: DATA_SOURCE_ID,
+                name: '整站灾备外部库',
+                type: 'sqlite',
+                filename: databaseFile,
+                enabled: true
+            })
+        });
+        if (!savedDataSource.success) throw new Error(`External data source setup failed: ${savedDataSource.error}`);
+        const savedBackupConfig = await requestJson(`${backendOrigin}/api/data-sources/backups/config`, {
+            method: 'PUT',
+            body: JSON.stringify({
+                autoEnabled: false,
+                intervalHours: 12,
+                retention: 7,
+                selectedConnectionIds: ['primary', DATA_SOURCE_ID]
+            })
+        });
+        if (!savedBackupConfig.success) throw new Error(`Data source backup config setup failed: ${savedBackupConfig.error}`);
         const exported = await requestJson(`${backendOrigin}/api/site-backups/export`, { method: 'POST' });
         if (!exported.success || !exported.backup?.filename) throw new Error('Export API did not return a backup filename');
         const mirroredArchive = path.join(mirrorDir, exported.backup.filename);
@@ -143,6 +165,11 @@ async function main() {
 
         await putSetting(MUTATED_SETTING);
         fs.writeFileSync(path.join(modelsDir, MODEL_FILENAME), MUTATED_MODEL);
+        await requestJson(`${backendOrigin}/api/data-sources/connections/${encodeURIComponent(DATA_SOURCE_ID)}`, { method: 'DELETE' });
+        await requestJson(`${backendOrigin}/api/data-sources/backups/config`, {
+            method: 'PUT',
+            body: JSON.stringify({ autoEnabled: false, intervalHours: 2, retention: 1, selectedConnectionIds: ['primary'] })
+        });
         const imported = await importArchive(downloadedArchive);
         if (!imported.ok || !imported.body?.success) {
             throw new Error(`Valid import failed: HTTP ${imported.status} ${JSON.stringify(imported.body)}`);
@@ -151,6 +178,7 @@ async function main() {
         const settingAfterRestore = await readSetting();
         const modelAfterRestore = fs.readFileSync(path.join(modelsDir, MODEL_FILENAME));
         const databaseAfterRestore = inspectDatabase(databaseFile);
+        const dataSourcesAfterRestore = await requestJson(`${backendOrigin}/api/data-sources`);
 
         const corruptedArchive = path.join(runDirectory, 'corrupted-site-backup.zip');
         const corrupted = fs.readFileSync(downloadedArchive);
@@ -160,11 +188,17 @@ async function main() {
         const corruptedImport = await importArchive(corruptedArchive);
 
         const checks = {
-            manifestFormatValid: manifest.format === 'heat-treatment-digital-twin-site-backup' && manifest.version === 2,
+            manifestFormatValid: manifest.format === 'heat-treatment-digital-twin-site-backup' && manifest.version === 3,
             databaseIncluded: archivePaths.has('database/factory.db'),
             uploadedModelIncluded: archivePaths.has(`uploads/models/${MODEL_FILENAME}`),
+            dataSourceConfigIncluded: archivePaths.has('config/data-sources.json')
+                && manifest.containsSensitiveConfiguration === true,
             databaseSettingRestored: settingAfterRestore === ORIGINAL_SETTING && databaseAfterRestore.setting === ORIGINAL_SETTING,
             uploadedModelRestored: modelAfterRestore.equals(ORIGINAL_MODEL),
+            dataSourceConnectionRestored: dataSourcesAfterRestore.connections?.some(item => item.id === DATA_SOURCE_ID) === true,
+            dataSourceBackupSelectionRestored: dataSourcesAfterRestore.backup?.intervalHours === 12
+                && dataSourcesAfterRestore.backup?.retention === 7
+                && dataSourcesAfterRestore.backup?.selectedConnectionIds?.includes(DATA_SOURCE_ID),
             databaseIntegrityValid: databaseAfterRestore.quickCheck === 'ok',
             corruptedArchiveRejected: !corruptedImport.ok && corruptedImport.status === 400,
             rollbackBackupCreated: imported.body?.rollback?.filename?.includes('-before-restore.db') === true,

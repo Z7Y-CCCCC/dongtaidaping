@@ -17,6 +17,7 @@ namespace HeatTreatment.DigitalTwin.Backend
         private ClientWebSocket _socket;
         private Uri _endpoint;
         private float _reconnectSeconds = 2f;
+        private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
 
         public bool IsConnected => _socket?.State == WebSocketState.Open;
         public event Action<JObject> MessageReceived;
@@ -96,6 +97,39 @@ namespace HeatTreatment.DigitalTwin.Backend
             );
         }
 
+        public void SendMessage(JObject message)
+        {
+            if (message == null) return;
+            _ = SendMessageAsync(message);
+        }
+
+        private async Task SendMessageAsync(JObject message)
+        {
+            var socket = _socket;
+            var cancellationToken = _lifetime?.Token ?? CancellationToken.None;
+            if (socket == null || socket.State != WebSocketState.Open || cancellationToken.IsCancellationRequested) return;
+            try
+            {
+                await _sendLock.WaitAsync(cancellationToken);
+                socket = _socket;
+                if (socket == null || socket.State != WebSocketState.Open) return;
+                var payload = Encoding.UTF8.GetBytes(message.ToString(Newtonsoft.Json.Formatting.None));
+                await socket.SendAsync(new ArraySegment<byte>(payload), WebSocketMessageType.Text, true, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                // Runtime is stopping or reconnecting.
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning($"[RealtimeWebSocket] Send failed: {exception.Message}");
+            }
+            finally
+            {
+                if (_sendLock.CurrentCount == 0) _sendLock.Release();
+            }
+        }
+
         private async Task ReceiveLoopAsync(ClientWebSocket socket, CancellationToken cancellationToken)
         {
             var buffer = new byte[64 * 1024];
@@ -144,6 +178,7 @@ namespace HeatTreatment.DigitalTwin.Backend
         private void OnDestroy()
         {
             StopClient();
+            _sendLock.Dispose();
         }
     }
 }

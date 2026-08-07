@@ -14,6 +14,9 @@ namespace HeatTreatment.DigitalTwin.Backend
 
         [JsonProperty("models")]
         public List<ModelAssetDto> Models { get; set; } = new List<ModelAssetDto>();
+
+        [JsonProperty("platform")]
+        public JObject Platform { get; set; } = new JObject();
     }
 
     public sealed class WorkshopDto

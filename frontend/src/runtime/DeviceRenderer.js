@@ -44,9 +44,19 @@ function makeMaterialsMirrorSafe(deviceModel) {
 }
 
 export async function createConfiguredDeviceModel(definition, models = [], options = {}) {
-    const { deviceCfg, devIdx, wsIdx, gLineIdx } = definition;
+    const { deviceCfg } = definition;
     const deviceModel = await createDeviceModel(deviceCfg, models, options);
+    applyConfiguredDeviceTransform(deviceModel, definition);
+    applyDeviceConnectionVisual(deviceModel, 'bad');
+    return deviceModel;
+}
+
+export function applyConfiguredDeviceTransform(deviceModel, definition) {
+    if (!deviceModel || !definition?.deviceCfg) return false;
+    const { deviceCfg, devIdx, wsIdx, gLineIdx } = definition;
     const instanceConfig = parseInstanceConfig(deviceCfg.instance_config);
+    deviceModel.deviceConfig = deviceCfg;
+    deviceModel.furnaceName = deviceCfg.name || deviceCfg.id || deviceModel.furnaceName;
     deviceModel.userData.instanceConfig = instanceConfig;
 
     deviceModel.position.set(
@@ -67,7 +77,7 @@ export async function createConfiguredDeviceModel(definition, models = [], optio
     if (mirrorX) {
         deviceModel.scale.set(-finalScale, finalScale, finalScale);
         makeMaterialsMirrorSafe(deviceModel);
-    } else if (finalScale !== 1) {
+    } else {
         deviceModel.scale.setScalar(finalScale);
     }
 
@@ -79,8 +89,9 @@ export async function createConfiguredDeviceModel(definition, models = [], optio
         deviceModel.statusLight.position.y = Number(instanceConfig.statusLightY);
     }
 
-    applyDeviceConnectionVisual(deviceModel, 'bad');
-    return deviceModel;
+    deviceModel.updateMatrixWorld?.(true);
+    deviceModel.batchRenderer?.markInstanceDirty?.(deviceModel.instanceIndex);
+    return true;
 }
 
 export function applyRealtimeToDeviceModel(deviceModel, data) {

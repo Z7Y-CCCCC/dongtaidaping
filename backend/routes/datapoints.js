@@ -211,6 +211,93 @@ function validatePointPayload(point, rowLabel = '点位') {
     return errors;
 }
 
+const POINT_PERSISTED_COLUMNS = [
+    'name',
+    'label',
+    'plc_tag',
+    'data_type',
+    'category',
+    'value_role',
+    'quality',
+    'scale',
+    'offset',
+    'expression',
+    'display_format',
+    'unit',
+    'sample_interval_ms',
+    'access_type',
+    'db_number',
+    'db_byte_offset',
+    'bit_offset',
+    'point_kind',
+    'alarm_record_role',
+    'alarm_text',
+    'alarm_level',
+    'alarm_condition',
+    'voice_config',
+    'alarm_high',
+    'alarm_low'
+];
+
+const POINT_NUMERIC_COLUMNS = new Set([
+    'scale',
+    'offset',
+    'sample_interval_ms',
+    'db_number',
+    'db_byte_offset',
+    'bit_offset',
+    'alarm_high',
+    'alarm_low'
+]);
+
+function comparablePointValue(column, value) {
+    if (POINT_NUMERIC_COLUMNS.has(column)) {
+        if (value === undefined || value === null || value === '') return null;
+        const number = Number(value);
+        return Number.isFinite(number) ? number : String(value);
+    }
+    return String(value ?? '');
+}
+
+function pointRowsEqual(existing, desired) {
+    const normalizedExisting = normalizePointPayload(existing, existing?.id || 'existing');
+    return POINT_PERSISTED_COLUMNS.every(column => (
+        comparablePointValue(column, normalizedExisting[column])
+        === comparablePointValue(column, desired[column])
+    ));
+}
+
+function pointColumnValues(point) {
+    return POINT_PERSISTED_COLUMNS.map(column => point[column]);
+}
+
+async function insertNormalizedPoint(client, deviceId, point) {
+    const columns = ['device_id', ...POINT_PERSISTED_COLUMNS];
+    return client.run(
+        `INSERT INTO data_points (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`,
+        [deviceId, ...pointColumnValues(point)]
+    );
+}
+
+async function updateNormalizedPoint(client, deviceId, id, point) {
+    const assignments = POINT_PERSISTED_COLUMNS.map(column => `${column}=?`).join(', ');
+    return client.run(
+        `UPDATE data_points SET ${assignments} WHERE id=? AND device_id=?`,
+        [...pointColumnValues(point), id, deviceId]
+    );
+}
+
+function normalizedPointId(value, rowLabel) {
+    if (value === undefined || value === null || value === '') return null;
+    const id = Number(value);
+    if (!Number.isSafeInteger(id) || id <= 0) {
+        const error = new Error(`${rowLabel}: 点位 ID 不正确，请刷新页面后重试`);
+        error.statusCode = 409;
+        throw error;
+    }
+    return id;
+}
+
 function restartDataEngineSoon(reason) {
     if (!global.dataEngine?.restart) return;
     setTimeout(() => {
@@ -349,6 +436,96 @@ router.delete('/:id', async (req, res) => {
         res.json({ success: true });
     } catch (e) {
         res.status(400).json({ error: e.message });
+    }
+});
+
+// 保存后台编辑器中的目标状态，但只对实际发生变化的行执行 INSERT / UPDATE / DELETE。
+// 与 /batch 的“整台设备覆盖”语义分开，避免普通编辑时重建全部点位和改变已有 ID。
+router.post('/sync', async (req, res) => {
+    const { device_id, points } = req.body;
+    if (!device_id || !Array.isArray(points)) {
+        return res.status(400).json({ error: '需要 device_id 和 points 数组' });
+    }
+
+    const validationErrors = [];
+    points.forEach((point, index) => {
+        validationErrors.push(...validatePointPayload(point, `第 ${index + 1} 行`));
+    });
+    if (validationErrors.length) {
+        return res.status(400).json({ error: validationErrors.join('\n') });
+    }
+
+    try {
+        const db = await getDb();
+        const result = await db.transaction(async (tx) => {
+            const device = await tx.get('SELECT id FROM devices WHERE id = ?', [device_id]);
+            if (!device) {
+                const error = new Error('设备不存在，无法保存点位配置');
+                error.statusCode = 404;
+                throw error;
+            }
+
+            const existingRows = await tx.all('SELECT * FROM data_points WHERE device_id = ?', [device_id]);
+            const existingById = new Map(existingRows.map(row => [String(row.id), row]));
+            const retainedIds = new Set();
+            const inserts = [];
+            const updates = [];
+            let unchanged = 0;
+
+            points.forEach((sourcePoint, index) => {
+                const rowLabel = `第 ${index + 1} 行`;
+                const id = normalizedPointId(sourcePoint.id, rowLabel);
+                const point = normalizePointPayload(sourcePoint, `${device_id}_${index + 1}`);
+                if (id === null) {
+                    inserts.push(point);
+                    return;
+                }
+
+                const key = String(id);
+                if (retainedIds.has(key)) {
+                    const error = new Error(`${rowLabel}: 点位 ID 重复，请刷新页面后重试`);
+                    error.statusCode = 409;
+                    throw error;
+                }
+                const existing = existingById.get(key);
+                if (!existing) {
+                    const error = new Error(`${rowLabel}: 点位已被删除或不属于当前设备，请刷新页面后重试`);
+                    error.statusCode = 409;
+                    throw error;
+                }
+                retainedIds.add(key);
+                if (pointRowsEqual(existing, point)) unchanged += 1;
+                else updates.push({ id, point });
+            });
+
+            const deletes = existingRows.filter(row => !retainedIds.has(String(row.id)));
+            for (const row of deletes) {
+                await tx.run('DELETE FROM data_points WHERE id = ? AND device_id = ?', [row.id, device_id]);
+            }
+            for (const entry of updates) {
+                await updateNormalizedPoint(tx, device_id, entry.id, entry.point);
+            }
+            for (const point of inserts) {
+                await insertNormalizedPoint(tx, device_id, point);
+            }
+
+            const changed = inserts.length + updates.length + deletes.length;
+            return {
+                success: true,
+                count: changed,
+                changed,
+                inserted: inserts.length,
+                updated: updates.length,
+                deleted: deletes.length,
+                unchanged,
+                total: points.length
+            };
+        });
+
+        if (result.changed > 0) restartDataEngineSoon('sync changed data points');
+        res.json(result);
+    } catch (e) {
+        res.status(e.statusCode || 400).json({ error: e.message });
     }
 });
 

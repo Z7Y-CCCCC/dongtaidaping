@@ -1,5 +1,5 @@
 import { SceneManager } from '../three/SceneManager.js';
-import { applyRealtimeToDeviceModel, createConfiguredDeviceModel } from './DeviceRenderer.js';
+import { applyConfiguredDeviceTransform, applyRealtimeToDeviceModel, createConfiguredDeviceModel } from './DeviceRenderer.js';
 import { createBatchedDeviceRenderer, getBatchableModelInfo } from './BatchDeviceRenderer.js';
 import { shouldOptimizeModelGroup } from './modelOptimization.js';
 import { deviceLocalToWorld, normalizeSpatialTransform } from '../utils/spatialLayout.js';
@@ -239,6 +239,17 @@ function flattenDeviceDefinitions(workshops) {
     return definitions;
 }
 
+function runtimeModelKey(deviceCfg, models = []) {
+    const modelInfo = models.find(item => item.id === deviceCfg?.model_type);
+    return JSON.stringify([
+        deviceCfg?.model_type || '',
+        deviceCfg?.model_file || '',
+        deviceCfg?.template_id || '',
+        modelInfo?.file_path || '',
+        deviceCfg?.name || ''
+    ]);
+}
+
 export class SceneRuntime {
     constructor(containerElement, options) {
         this.containerElement = containerElement;
@@ -316,7 +327,8 @@ export class SceneRuntime {
                 workshopIdx: wsIdx,
                 globalLineIndex: gLineIdx,
                 lineId,
-                isLineMember
+                isLineMember,
+                runtimeModelKey: runtimeModelKey(deviceCfg, models || [])
             });
             this.sceneManager.addFurnace(deviceModel);
             this.furnaces.set(deviceCfg.id, deviceModel);
@@ -326,6 +338,28 @@ export class SceneRuntime {
         this.sceneManager.setTopologyConfig(workshops || [], cameraMode || 'auto');
         this.sceneManager.animate();
         return this;
+    }
+
+    updateDeviceLayout(workshops, deviceId, models = this.options.models || []) {
+        const definition = flattenDeviceDefinitions(workshops || [])
+            .find(item => String(item.deviceCfg?.id || '') === String(deviceId || ''));
+        const deviceModel = this.furnaces.get(deviceId);
+        if (!definition || !deviceModel) return false;
+        if (deviceModel.userData.runtimeModelKey !== runtimeModelKey(definition.deviceCfg, models)) return false;
+
+        applyConfiguredDeviceTransform(deviceModel, definition);
+        Object.assign(deviceModel.userData, {
+            workshopIdx: definition.wsIdx,
+            globalLineIndex: definition.gLineIdx,
+            lineId: definition.lineId,
+            isLineMember: definition.isLineMember
+        });
+        this.sceneManager?.requestLabelRefresh?.(300);
+        return true;
+    }
+
+    isRenderSurfaceHealthy() {
+        return this.sceneManager?.isRenderSurfaceHealthy?.() === true;
     }
 
     applyDeviceData(data) {

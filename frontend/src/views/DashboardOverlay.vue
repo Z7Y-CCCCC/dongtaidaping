@@ -1,14 +1,19 @@
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useFactoryConfig } from '../config/factoryConfig.js'
 import { createDashboardDataStore } from '../runtime/DataStore.js'
 import { API_BASE } from '../runtime/backendEndpoint.js'
 import WidgetRenderer from '../runtime/WidgetRenderer.vue'
+import { applyVisibilityAction, widgetRuntimeVisible } from '../runtime/dashboardRules.js'
 
 const rootRef = ref(null)
 const selectedWidgetId = ref('')
 const hostConnected = ref(false)
 const lineReturnBusy = ref(false)
+const databaseValues = reactive({})
+const runtimeContext = reactive({ viewMode: 'factory', sceneId: '', workshopId: '', lineId: '', deviceId: '' })
+const groupVisibility = reactive({})
+const widgetVisibility = reactive({})
 
 const dataStore = createDashboardDataStore({
     metricsRefreshIntervalMs: 5000,
@@ -39,7 +44,7 @@ const grid = computed(() => ({
     columns: Math.max(1, Number(platform.value.activeScene?.layout?.grid?.columns) || 24),
     rows: Math.max(1, Number(platform.value.activeScene?.layout?.grid?.rows) || 12)
 }))
-const widgets = computed(() => {
+const configuredWidgets = computed(() => {
     const configured = Array.isArray(platform.value.document?.widgets)
         ? platform.value.document.widgets
         : (Array.isArray(platform.value.widgets) ? platform.value.widgets : [])
@@ -49,6 +54,13 @@ const widgets = computed(() => {
         .filter(widget => widget.runtimeTarget !== 'unity')
         .sort((left, right) => Number(left.zIndex ?? left.sort_order ?? 0) - Number(right.zIndex ?? right.sort_order ?? 0))
 })
+const widgets = computed(() => configuredWidgets.value.filter(widget => widgetRuntimeVisible(widget, {
+    context: runtimeContext,
+    dataValue: runtimeValueForWidget(widget),
+    dataRecord: widget.data?.mode === 'database' ? databaseValues[widget.id] : null,
+    groupVisibility,
+    widgetVisibility
+})))
 
 function getByPath(source, path) {
     if (!path) return undefined
@@ -75,6 +87,27 @@ const pointValues = computed(() => {
     }
     return result
 })
+
+function runtimeValueForWidget(widget) {
+    const binding = widget?.data || widget?.binding || {}
+    if (binding.mode === 'database') return databaseValues[widget.id]?.value
+    if (binding.mode === 'plc' || binding.pointId || binding.point_id) {
+        const pointId = String(binding.pointId || binding.point_id || '')
+        const deviceId = String(binding.deviceId || binding.device_id || '')
+        return pointValues.value[`${deviceId}:${pointId}`]?.value ?? pointValues.value[pointId]?.value
+    }
+    if (binding.mode === 'runtime') {
+        const context = {
+            metrics: dataStore.metrics,
+            events: dataStore.events.value,
+            trendPoints: dataStore.trendPoints.value,
+            deviceStatusMap: dataStore.deviceStatusMap,
+            deviceDataMap: dataStore.deviceDataMap
+        }
+        return getByPath(context, binding.path || binding.source)
+    }
+    return widget?.content?.value
+}
 
 const projectName = computed(() => platform.value.activeProject?.name || '热处理数字孪生')
 const sceneName = computed(() => platform.value.activeScene?.name || '工厂总览')
@@ -196,6 +229,12 @@ function eventQueryConfig() {
 }
 
 async function focusNativeScene(mode, event = {}) {
+    Object.assign(runtimeContext, {
+        viewMode: mode,
+        deviceId: mode === 'device' ? (event.deviceId || '') : '',
+        lineId: mode === 'line' ? (event.lineId || runtimeContext.lineId || '') : (mode === 'device' ? runtimeContext.lineId : ''),
+        workshopId: mode === 'workshop' ? (event.workshopId || '') : (['line', 'device'].includes(mode) ? runtimeContext.workshopId : '')
+    })
     try {
         const response = await fetch(`${API_BASE}/native-preview`, {
             method: 'POST',
@@ -243,6 +282,11 @@ function playVoice(event) {
 
 function handleWidgetAction({ event }) {
     if (!event) return
+    if (['set_visibility', 'toggle_visibility'].includes(event.action)) {
+        applyVisibilityAction(event, { groupVisibility, widgetVisibility })
+        scheduleRegionReport()
+        return
+    }
     if (event.action === 'enter_device') return focusNativeScene('device', event)
     if (event.action === 'focus_factory') return focusNativeScene('factory', event)
     if (event.action === 'focus_line') return focusNativeScene('line', event)
@@ -258,17 +302,40 @@ function handleWidgetAction({ event }) {
 }
 
 async function handleRuntimeMessage(message) {
-    if (message?.type !== 'dashboard_release_changed') return
-    await loadConfig()
-    dataStore.setEventQueryOptions(eventQueryConfig())
-    await nextTick()
-    scheduleRegionReport()
+    if (message?.type === 'dashboard_context_changed') {
+        Object.assign(runtimeContext, message.payload || {})
+        scheduleRegionReport()
+        return
+    }
+    if (message?.type === 'dashboard_release_changed') {
+        await loadConfig()
+        runtimeContext.sceneId = platform.value.activeScene?.id || runtimeContext.sceneId
+        dataStore.setEventQueryOptions(eventQueryConfig())
+        await refreshDatabaseValues(true)
+        await nextTick()
+        scheduleRegionReport()
+    }
 }
 
 function handleHostMessage(event) {
     if (event.data?.type !== 'overlay_host_state') return
     hostConnected.value = event.data.visible !== false
+    if (event.data.context) Object.assign(runtimeContext, event.data.context)
     scheduleRegionReport()
+}
+
+async function refreshDatabaseValues(force = false) {
+    if (!force && !configuredWidgets.value.some(widget => widget.data?.mode === 'database')) return
+    try {
+        const response = await fetch(`${API_BASE}/data-sources/runtime-values`)
+        if (!response.ok) return
+        const payload = await response.json()
+        const next = payload.values || {}
+        Object.keys(databaseValues).forEach(key => { if (!(key in next)) delete databaseValues[key] })
+        Object.assign(databaseValues, next)
+    } catch {
+        // 外部数据库短暂离线时保留上一次画面，质量状态由后端结果更新。
+    }
 }
 
 onMounted(async () => {
@@ -277,13 +344,15 @@ onMounted(async () => {
     window.chrome?.webview?.addEventListener('message', handleHostMessage)
 
     await loadConfig()
+    runtimeContext.sceneId = platform.value.activeScene?.id || ''
     registerConfiguredDevices()
     dataStore.setEventQueryOptions(eventQueryConfig())
     dataStore.setMessageHandler(handleRuntimeMessage)
     dataStore.connect()
     await Promise.all([
         dataStore.refreshEvents(true),
-        dataStore.refreshMetrics(true)
+        dataStore.refreshMetrics(true),
+        refreshDatabaseValues(true)
     ])
 
     await nextTick()
@@ -298,6 +367,7 @@ onMounted(async () => {
     refreshTimer = window.setInterval(() => {
         dataStore.refreshEvents()
         dataStore.refreshMetrics()
+        refreshDatabaseValues()
     }, 5000)
 
     hostConnected.value = true
@@ -332,9 +402,7 @@ onUnmounted(() => {
                 @click.stop="returnToLineView"
             >
                 <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M10 6 4 12l6 6" />
-                    <path d="M5 12h8.5a5.5 5.5 0 0 1 5.5 5.5V19" />
-                    <path class="line-mark" d="M15.5 5.5h3v3h-3zM15.5 10.5h3v3h-3z" />
+                    <path d="M15.25 4.75 8 12l7.25 7.25" />
                 </svg>
             </button>
 
@@ -371,6 +439,7 @@ onUnmounted(() => {
                     :device-status-map="dataStore.deviceStatusMap"
                     :device-data-map="dataStore.deviceDataMap"
                     :point-values="pointValues"
+                    :database-values="databaseValues"
                     @action="handleWidgetAction"
                 />
             </div>
@@ -420,12 +489,12 @@ body,
     display: grid;
     place-items: center;
     padding: 0;
-    border: 1px solid rgba(128, 185, 232, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.14);
     border-radius: 12px;
-    color: #d9efff;
-    background: linear-gradient(145deg, rgba(25, 55, 78, 0.9), rgba(7, 24, 39, 0.84));
-    box-shadow: 0 12px 30px rgba(0, 8, 18, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.08);
-    backdrop-filter: blur(12px) saturate(118%);
+    color: rgba(255, 255, 255, 0.94);
+    background: rgba(29, 29, 31, 0.72);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    backdrop-filter: blur(18px) saturate(140%);
     pointer-events: auto;
     cursor: pointer;
     transition: transform 160ms ease, border-color 160ms ease, background 160ms ease, opacity 160ms ease;
@@ -433,26 +502,25 @@ body,
 
 .overlay-line-return:hover:not(:disabled) {
     transform: translateY(-1px);
-    border-color: rgba(103, 198, 255, 0.68);
-    background: linear-gradient(145deg, rgba(31, 76, 108, 0.94), rgba(8, 31, 50, 0.9));
+    border-color: rgba(255, 255, 255, 0.24);
+    background: rgba(58, 58, 60, 0.82);
 }
 
 .overlay-line-return:active:not(:disabled) { transform: translateY(0) scale(0.97); }
 .overlay-line-return:focus-visible { outline: 2px solid rgba(99, 196, 255, 0.92); outline-offset: 2px; }
 .overlay-line-return:disabled { opacity: 0.62; cursor: wait; }
 .overlay-line-return svg {
-    width: 23px;
-    height: 23px;
+    width: 20px;
+    height: 20px;
     overflow: visible;
     fill: none;
     stroke: currentColor;
-    stroke-width: 1.8;
+    stroke-width: 2.15;
     stroke-linecap: round;
     stroke-linejoin: round;
     transition: transform 160ms ease;
 }
 .overlay-line-return:hover:not(:disabled) svg { transform: translateX(-1px); }
-.overlay-line-return .line-mark { fill: rgba(94, 193, 247, 0.18); stroke-width: 1.35; }
 .overlay-line-return.is-busy svg { animation: overlayReturnPulse 700ms ease-in-out infinite alternate; }
 
 .overlay-status {

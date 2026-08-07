@@ -163,6 +163,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
         }
 
         public string SelectedDeviceId => _selected?.Device?.Id ?? string.Empty;
+        public event Action<string, string> ViewContextChanged;
 
         public void Initialize(
             Camera runtimeCamera,
@@ -752,6 +753,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             // opening on its rear side in the detail view.
             var detailYaw = Mathf.DeltaAngle(0f, device.Root.transform.eulerAngles.y + 238f);
             _orbit?.FocusBounds(device.WorldBounds, detailYaw, 19f, 1.12f, false);
+            ViewContextChanged?.Invoke("device", device.Device?.Id ?? string.Empty);
         }
 
         private void ShowOverview(bool immediate)
@@ -764,6 +766,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 if (entry.Root != null) entry.Root.SetActive(true);
             }
             _orbit?.FocusBounds(_factoryBounds, -39f, 33f, 1.08f, immediate);
+            ViewContextChanged?.Invoke("factory", string.Empty);
         }
 
         private void SelectFromWorld(Vector3 screenPosition)

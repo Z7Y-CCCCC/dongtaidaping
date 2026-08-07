@@ -10,6 +10,7 @@ const props = defineProps({
   deviceStatusMap: { type: Object, default: () => ({}) },
   deviceDataMap: { type: Object, default: () => ({}) },
   pointValues: { type: Object, default: () => ({}) },
+  databaseValues: { type: Object, default: () => ({}) },
   preview: { type: Boolean, default: false }
 })
 
@@ -61,9 +62,11 @@ const pointRecord = computed(() => {
   const deviceId = String(dataBinding.value.deviceId || dataBinding.value.device_id || '')
   return props.pointValues[`${deviceId}:${pointId}`] || props.pointValues[pointId] || null
 })
+const databaseRecord = computed(() => props.databaseValues[String(props.widget.id || '')] || null)
 
 const boundValue = computed(() => {
   const binding = dataBinding.value
+  if (binding.mode === 'database') return databaseRecord.value?.value ?? content.value.value
   if (binding.mode === 'plc' || binding.pointId || binding.point_id) {
     if (pointRecord.value && pointRecord.value.value !== undefined) return pointRecord.value.value
     const deviceId = binding.deviceId || binding.device_id
@@ -79,7 +82,10 @@ const boundValue = computed(() => {
   return content.value.value
 })
 
-const boundQuality = computed(() => pointRecord.value?.quality || props.deviceStatusMap[dataBinding.value.deviceId]?.quality || 'good')
+const boundQuality = computed(() => {
+  if (dataBinding.value.mode === 'database') return databaseRecord.value?.quality || (databaseRecord.value?.error ? 'bad' : 'stale')
+  return pointRecord.value?.quality || props.deviceStatusMap[dataBinding.value.deviceId]?.quality || 'good'
+})
 
 function numericValue(value) {
   if (typeof value === 'boolean') return value ? 1 : 0
@@ -174,12 +180,14 @@ const metricItems = computed(() => {
 })
 
 const eventRows = computed(() => {
+  if (dataBinding.value.mode === 'database' && Array.isArray(databaseRecord.value?.rows)) return databaseRecord.value.rows
   const source = dataBinding.value.source || dataBinding.value.path
   const bound = source ? getWidgetValue(source) : null
   return Array.isArray(bound) ? bound : props.events
 })
 
 const trendRows = computed(() => {
+  if (dataBinding.value.mode === 'database' && Array.isArray(databaseRecord.value?.rows)) return databaseRecord.value.rows
   const source = dataBinding.value.source
   const bound = source ? getWidgetValue(source) : null
   if (Array.isArray(bound)) return bound
