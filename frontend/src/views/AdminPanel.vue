@@ -164,12 +164,50 @@ function loadAdminUiState() {
 
 const storedAdminUiState = loadAdminUiState()
 
+const PLATFORM_SUBPAGES = [
+    { key: 'designer', label: '大屏设计器', description: '拖拽组件、绑定数据并发布画面' },
+    { key: 'scene', label: '项目与场景', description: '标题、主题、视角与数据时效' },
+    { key: 'environment', label: '场景与光效', description: 'Unity 灯光、后处理、围墙与空间' },
+    { key: 'native-dashboard', label: 'Unity 原生组件', description: '总览、详情栏与设备点位展示' }
+]
+const SETTINGS_SUBPAGES = [
+    { key: 'runtime', label: '运行与投屏', description: '自启动、电视投屏与本地运行服务' },
+    { key: 'database', label: '数据库与备份', description: '连接、外部数据源、备份与恢复' },
+    { key: 'performance', label: '客户端性能', description: 'Unity 画质与旧 Web 兼容参数' },
+    { key: 'data', label: '数据通路', description: 'PLC 实时采集或离线模拟模式' }
+]
+
+function restoreSubpage(value, options, fallback) {
+    return options.some(option => option.key === value) ? value : fallback
+}
+
 // 当前选中的 Tab
 const activeTab = ref(storedAdminUiState.activeTab || 'composer')
+const platformSubpage = ref(restoreSubpage(storedAdminUiState.platformSubpage, PLATFORM_SUBPAGES, 'designer'))
+const settingsSubpage = ref(restoreSubpage(storedAdminUiState.settingsSubpage, SETTINGS_SUBPAGES, 'runtime'))
+const adminContentRef = ref(null)
 const isAdminNavCollapsed = ref(!!storedAdminUiState.isAdminNavCollapsed)
 const isFactoryMenuOpen = ref(true)
 const isDataMenuOpen = ref(true)
 const isLegacyWebRenderSettingsOpen = ref(false)
+
+async function selectPlatformSubpage(key) {
+    if (!PLATFORM_SUBPAGES.some(option => option.key === key)) return
+    platformSubpage.value = key
+    await nextTick()
+    adminContentRef.value?.scrollTo({ top: 0, behavior: 'smooth' })
+    if (key === 'designer') {
+        requestAnimationFrame(() => window.dispatchEvent(new Event('resize')))
+    }
+}
+
+async function selectSettingsSubpage(key) {
+    if (!SETTINGS_SUBPAGES.some(option => option.key === key)) return
+    settingsSubpage.value = key
+    await nextTick()
+    adminContentRef.value?.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
 const navIconPaths = {
     composer: ['M4 5h16v14H4z', 'M8 9h8', 'M8 13h5', 'M16 13h1', 'M8 17h8'],
     factory: ['M4 20V9l4-3 4 3 4-3 4 3v11', 'M8 20v-6h3v6', 'M16 20v-6h3v6', 'M12 20V9'],
@@ -4057,6 +4095,8 @@ watch(pointMonitorAutoRefresh, () => {
 
 watch([
     activeTab,
+    platformSubpage,
+    settingsSubpage,
     isAdminNavCollapsed,
     selectedDeviceForPoints,
     showPointAdvancedFields,
@@ -4071,6 +4111,8 @@ watch([
 ], () => {
     localStorage.setItem(ADMIN_UI_STATE_KEY, JSON.stringify({
         activeTab: activeTab.value,
+        platformSubpage: platformSubpage.value,
+        settingsSubpage: settingsSubpage.value,
         isAdminNavCollapsed: isAdminNavCollapsed.value,
         selectedDeviceForPoints: selectedDeviceForPoints.value,
         showPointAdvancedFields: showPointAdvancedFields.value,
@@ -5414,7 +5456,7 @@ const mainTabs = [
             </button>
 
             <!-- 右侧内容区 -->
-            <main class="admin-content">
+            <main ref="adminContentRef" class="admin-content">
                 <Transition name="tab-switch" mode="out-in">
                     <div :key="activeTab" class="tab-transition-host">
 
@@ -6498,9 +6540,32 @@ const mainTabs = [
                     <h2>画面组件配置</h2>
                     <p class="desc">管理当前项目、场景、组件布局和发布版本。工程师后续通过这里调整画面，不再改源码。</p>
 
-                    <DashboardDesigner class="platform-designer-primary" @reload="loadPlatform" />
+                    <div class="secondary-page-nav-shell">
+                        <nav class="secondary-page-nav" aria-label="画面组件设置分类">
+                            <button
+                                v-for="(item, index) in PLATFORM_SUBPAGES"
+                                :key="item.key"
+                                type="button"
+                                class="secondary-page-nav-item"
+                                :class="{ active: platformSubpage === item.key }"
+                                :aria-current="platformSubpage === item.key ? 'page' : undefined"
+                                @click="selectPlatformSubpage(item.key)"
+                            >
+                                <span class="secondary-page-number">{{ String(index + 1).padStart(2, '0') }}</span>
+                                <span class="secondary-page-copy">
+                                    <strong>{{ item.label }}</strong>
+                                    <small>{{ item.description }}</small>
+                                </span>
+                                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7.5 4.75 5.25 5.25-5.25 5.25" /></svg>
+                            </button>
+                        </nav>
+                    </div>
 
-                    <div class="settings-section" v-if="platform.activeProject" style="margin-top:24px;">
+                    <div v-show="platformSubpage === 'designer'" class="secondary-page-panel secondary-page-panel-designer">
+                        <DashboardDesigner class="platform-designer-primary" @reload="loadPlatform" />
+                    </div>
+
+                    <div v-show="platformSubpage === 'scene'" v-if="platform.activeProject" class="settings-section secondary-page-panel">
                         <h3 class="section-title">项目与当前场景</h3>
                         <div class="settings-grid" v-if="platform.activeScene">
                             <label>项目名称
@@ -6540,21 +6605,23 @@ const mainTabs = [
                         <button @click="saveActiveScene" class="btn btn-primary" style="margin-top:16px;">保存当前场景</button>
                     </div>
 
-                    <NativeEnvironmentSettings
-                        :config="nativeEnvironmentConfig"
-                        :saving="nativeEnvironmentSaving"
-                        :message="nativeEnvironmentMessage"
-                        :preset-options="nativeEnvironmentPresetOptions"
-                        :workshops="workshops"
-                        :lines="lines"
-                        :devices="devices"
-                        @save="saveNativeEnvironmentSettings($event || {})"
-                        @apply-preset="applyNativeEnvironmentPreset"
-                        @reset="resetNativeEnvironmentConfig"
-                    />
+                    <div v-show="platformSubpage === 'environment'" class="secondary-page-panel">
+                        <NativeEnvironmentSettings
+                            :config="nativeEnvironmentConfig"
+                            :saving="nativeEnvironmentSaving"
+                            :message="nativeEnvironmentMessage"
+                            :preset-options="nativeEnvironmentPresetOptions"
+                            :workshops="workshops"
+                            :lines="lines"
+                            :devices="devices"
+                            @save="saveNativeEnvironmentSettings($event || {})"
+                            @apply-preset="applyNativeEnvironmentPreset"
+                            @reset="resetNativeEnvironmentConfig"
+                        />
+                    </div>
 
                     <!-- ===== Unity 原生大屏组件 ===== -->
-                    <div class="settings-section native-dashboard-settings">
+                    <div v-show="platformSubpage === 'native-dashboard'" class="settings-section native-dashboard-settings secondary-page-panel">
                         <div class="native-dashboard-heading">
                             <div>
                                 <h3 class="section-title">Unity 原生大屏组件</h3>
@@ -7379,6 +7446,27 @@ const mainTabs = [
                     <h2>系统设置</h2>
                     <p class="desc">配置大屏渲染性能、数据通路、PLC 连接参数和通信方式。</p>
 
+                    <div class="secondary-page-nav-shell">
+                        <nav class="secondary-page-nav" aria-label="系统设置分类">
+                            <button
+                                v-for="(item, index) in SETTINGS_SUBPAGES"
+                                :key="item.key"
+                                type="button"
+                                class="secondary-page-nav-item"
+                                :class="{ active: settingsSubpage === item.key }"
+                                :aria-current="settingsSubpage === item.key ? 'page' : undefined"
+                                @click="selectSettingsSubpage(item.key)"
+                            >
+                                <span class="secondary-page-number">{{ String(index + 1).padStart(2, '0') }}</span>
+                                <span class="secondary-page-copy">
+                                    <strong>{{ item.label }}</strong>
+                                    <small>{{ item.description }}</small>
+                                </span>
+                                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7.5 4.75 5.25 5.25-5.25 5.25" /></svg>
+                            </button>
+                        </nav>
+                    </div>
+
                     <!-- 引擎运行状态 -->
                     <div class="engine-status-card" :class="'status-' + engineStatus.plcStatus?.status">
                         <div class="engine-status-header">
@@ -7395,7 +7483,7 @@ const mainTabs = [
                     <div class="settings-form settings-form-wide">
 
                         <!-- ===== 数据库部署配置 ===== -->
-                        <div class="settings-section">
+                        <div v-show="settingsSubpage === 'database'" class="settings-section secondary-page-panel">
                             <h3 class="section-title">主业务数据库</h3>
                             <div class="settings-grid">
                                 <label>数据库类型
@@ -7616,7 +7704,7 @@ const mainTabs = [
                         </div>
 
                         <!-- ===== 运行与投屏 ===== -->
-                        <div class="settings-section runtime-settings-section">
+                        <div v-show="settingsSubpage === 'runtime'" class="settings-section runtime-settings-section secondary-page-panel">
                             <h3 class="section-title">运行与投屏</h3>
 
                             <!-- 主路径：像手机投屏一样，直接选局域网里的电视 -->
@@ -7791,7 +7879,7 @@ const mainTabs = [
                         </div>
 
                         <!-- ===== Unity 原生客户端画质 ===== -->
-                        <div class="settings-section">
+                        <div v-show="settingsSubpage === 'performance'" class="settings-section secondary-page-panel">
                             <h3 class="section-title">Unity 原生客户端画质</h3>
                             <div class="settings-grid">
                                 <label>现场电脑画质档位
@@ -7824,7 +7912,7 @@ const mainTabs = [
                         </div>
 
                         <!-- ===== 渲染性能 ===== -->
-                        <div class="settings-section legacy-web-render-section" :class="{ open: isLegacyWebRenderSettingsOpen }">
+                        <div v-show="settingsSubpage === 'performance'" class="settings-section legacy-web-render-section secondary-page-panel" :class="{ open: isLegacyWebRenderSettingsOpen }">
                             <div class="legacy-web-render-heading">
                                 <h3 class="section-title">旧 Web 大屏渲染性能（过渡保留）</h3>
                                 <button
@@ -7881,7 +7969,7 @@ const mainTabs = [
                         </div>
 
                         <!-- ===== 数据通路选择 ===== -->
-                        <div class="settings-section">
+                        <div v-show="settingsSubpage === 'data'" class="settings-section secondary-page-panel">
                             <h3 class="section-title">数据通路模式</h3>
                             <label>选择数据采集方式
                                 <select v-model="settings.data_mode" class="input">
@@ -7901,7 +7989,11 @@ const mainTabs = [
                             </div>
                         </div>
 
-                        <button @click="saveSettings" class="btn btn-primary" style="margin-top:24px; padding: 10px 30px; font-size: 15px;">保存所有系统设置</button>
+                        <button
+                            v-if="settingsSubpage === 'performance' || settingsSubpage === 'data'"
+                            @click="saveSettings"
+                            class="btn btn-primary secondary-page-save"
+                        >保存当前参数</button>
                     </div>
                 </div>
 
@@ -8353,6 +8445,117 @@ const mainTabs = [
 }
 .tab-content h2 { margin: 0 0 6px 0; font-size: 24px; color: #1d1d1f; font-weight: 600; letter-spacing: -0.5px; }
 .desc { color: #86868b; font-size: 14px; margin-bottom: 28px; }
+.secondary-page-nav-shell {
+    position: sticky;
+    top: -32px;
+    z-index: 24;
+    margin: 0 0 24px;
+    padding: 8px;
+    background: rgba(245, 245, 247, 0.9);
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    border-radius: 15px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.045);
+    backdrop-filter: blur(18px) saturate(1.15);
+}
+.secondary-page-nav {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 7px;
+}
+.secondary-page-nav-item {
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) 16px;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    min-height: 64px;
+    padding: 10px 12px;
+    color: #3a3a3c;
+    background: rgba(255, 255, 255, 0.82);
+    border: 1px solid rgba(0, 0, 0, 0.055);
+    border-radius: 10px;
+    text-align: left;
+    cursor: pointer;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.018);
+    transition: color 160ms ease, background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+.secondary-page-nav-item:hover {
+    color: #1d1d1f;
+    background: #ffffff;
+    border-color: rgba(0, 0, 0, 0.11);
+    box-shadow: 0 5px 16px rgba(0, 0, 0, 0.055);
+    transform: translateY(-1px);
+}
+.secondary-page-nav-item.active {
+    color: #ffffff;
+    background: #1d1d1f;
+    border-color: #1d1d1f;
+    box-shadow: 0 8px 18px rgba(29, 29, 31, 0.17);
+}
+.secondary-page-number {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    color: #6e6e73;
+    background: #f2f2f4;
+    border-radius: 8px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}
+.secondary-page-nav-item.active .secondary-page-number {
+    color: #1d1d1f;
+    background: #ffffff;
+}
+.secondary-page-copy {
+    min-width: 0;
+}
+.secondary-page-copy strong,
+.secondary-page-copy small {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.secondary-page-copy strong {
+    font-size: 13px;
+    font-weight: 650;
+}
+.secondary-page-copy small {
+    margin-top: 3px;
+    color: #86868b;
+    font-size: 10px;
+    font-weight: 500;
+}
+.secondary-page-nav-item.active .secondary-page-copy small {
+    color: rgba(255, 255, 255, 0.68);
+}
+.secondary-page-nav-item svg {
+    width: 16px;
+    height: 16px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    opacity: 0.58;
+}
+.secondary-page-panel {
+    animation: secondary-page-in 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.secondary-page-panel-designer {
+    min-width: 0;
+}
+.secondary-page-save {
+    margin-top: 0;
+    padding: 10px 30px;
+    font-size: 15px;
+}
+@keyframes secondary-page-in {
+    from { opacity: 0; transform: translateY(5px); }
+    to { opacity: 1; transform: translateY(0); }
+}
 
 .line-planner-tab {
     min-height: calc(100vh - 86px);
@@ -11494,6 +11697,7 @@ button:enabled:active {
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 @media (max-width: 1180px) {
+    .secondary-page-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .native-dashboard-heading { flex-direction: column; }
     .native-dashboard-panel-grid,
     .native-dashboard-point-grid { grid-template-columns: 1fr; }
@@ -11540,6 +11744,7 @@ button:enabled:active {
 }
 
 @media (max-width: 900px) {
+    .secondary-page-nav-item { min-height: 58px; }
     .admin-header { padding: 0 16px; }
     .admin-header h1 { font-size: 16px; }
     .admin-connection-strip { gap: 6px; margin-left: 10px; }
@@ -11592,6 +11797,10 @@ button:enabled:active {
 }
 
 @media (max-width: 520px) {
+    .secondary-page-nav-shell { margin-right: -12px; margin-left: -12px; border-radius: 0; }
+    .secondary-page-nav { display: flex; overflow-x: auto; padding-bottom: 2px; scrollbar-width: thin; }
+    .secondary-page-nav-item { flex: 0 0 min(250px, 78vw); }
+    .secondary-page-copy small { display: none; }
     .admin-container.line-planner-active .admin-nav {
         width: 68px;
         flex: 0 0 68px;
@@ -11645,6 +11854,8 @@ button:enabled:active {
     .dialog-fade-leave-active,
     .dialog-fade-enter-active .app-dialog,
     .dialog-fade-leave-active .app-dialog,
+    .secondary-page-nav-item,
+    .secondary-page-panel,
     .btn,
     .input {
         transition-duration: 1ms !important;
