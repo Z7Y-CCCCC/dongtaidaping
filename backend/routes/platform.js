@@ -1,6 +1,17 @@
 const express = require('express');
 const router = express.Router();
 const { getDb } = require('../db/database');
+const {
+    releasePayload,
+    loadDraftDocument,
+    loadDesignerState,
+    saveDraft,
+    publishDraft,
+    activateRelease,
+    activateLatestSceneRelease,
+    deleteRelease,
+    buildLegacyDocument
+} = require('../services/dashboardDocuments');
 
 function safeJsonParse(value, fallback) {
     if (!value) return fallback;
@@ -64,6 +75,9 @@ async function loadPlatformSnapshot() {
         ? await db.all('SELECT * FROM releases WHERE project_id = ? ORDER BY created_at DESC', [activeProject.id])
         : [];
     const currentRelease = releases.find(r => r.is_current) || releases[0] || null;
+    const draftDocument = activeScene
+        ? await loadDraftDocument(db, activeProject, activeScene)
+        : null;
     const assets = await db.all('SELECT * FROM models ORDER BY created_at DESC');
     const deviceTemplates = await db.all('SELECT * FROM device_templates ORDER BY created_at ASC');
     const datapointTemplates = await db.all('SELECT * FROM datapoint_templates ORDER BY device_template_id, sort_order ASC');
@@ -109,6 +123,8 @@ async function loadPlatformSnapshot() {
             ...currentRelease,
             snapshot: safeJsonParse(currentRelease.snapshot_json, {})
         } : null,
+        document: draftDocument,
+        draftRevision: Number(activeScene?.draft_revision || 0),
         recentEvents,
         latestMetrics: latestMetrics || null
     };
@@ -119,6 +135,84 @@ router.get('/', async (req, res) => {
         res.json(await loadPlatformSnapshot());
     } catch (e) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+router.get('/designer', async (req, res) => {
+    try {
+        res.json(await loadDesignerState(await getDb(), String(req.query.scene_id || '')));
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.put('/designer/draft', async (req, res) => {
+    try {
+        const result = await saveDraft(await getDb(), {
+            sceneId: req.body?.sceneId || req.body?.scene_id,
+            document: req.body?.document,
+            expectedRevision: req.body?.expectedRevision ?? req.body?.expected_revision
+        });
+        res.json({ success: true, document: result.document, revision: result.revision });
+    } catch (e) {
+        res.status(e.status || 400).json({ error: e.message, code: e.code, errors: e.validationErrors || [] });
+    }
+});
+
+router.post('/releases', async (req, res) => {
+    try {
+        const result = await publishDraft(await getDb(), {
+            sceneId: req.body?.sceneId || req.body?.scene_id,
+            version: req.body?.version,
+            notes: req.body?.notes
+        });
+        global.wsServer?.broadcast?.('dashboard_release_changed', {
+            releaseId: result.release.id,
+            version: result.release.version,
+            sceneId: result.document.sceneId,
+            action: 'publish'
+        });
+        res.json({ success: true, ...result });
+    } catch (e) {
+        res.status(e.status || 400).json({ error: e.message, errors: e.validationErrors || [] });
+    }
+});
+
+router.post('/releases/:id/activate', async (req, res) => {
+    try {
+        const result = await activateRelease(await getDb(), req.params.id);
+        global.wsServer?.broadcast?.('dashboard_release_changed', {
+            releaseId: result.release.id,
+            version: result.release.version,
+            sceneId: result.document.sceneId,
+            action: 'activate'
+        });
+        res.json({ success: true, ...result });
+    } catch (e) {
+        res.status(e.status || 400).json({ error: e.message, errors: e.validationErrors || [] });
+    }
+});
+
+router.post('/scenes/:id/activate-latest-release', async (req, res) => {
+    try {
+        const result = await activateLatestSceneRelease(await getDb(), req.params.id);
+        global.wsServer?.broadcast?.('dashboard_release_changed', {
+            releaseId: result.release.id,
+            version: result.release.version,
+            sceneId: result.document.sceneId,
+            action: 'switch_scene'
+        });
+        res.json({ success: true, ...result });
+    } catch (e) {
+        res.status(400).json({ error: e.message, errors: e.validationErrors || [] });
+    }
+});
+
+router.delete('/releases/:id', async (req, res) => {
+    try {
+        res.json(await deleteRelease(await getDb(), req.params.id));
+    } catch (e) {
+        res.status(400).json({ error: e.message });
     }
 });
 
@@ -147,6 +241,25 @@ router.put('/scenes/:id', async (req, res) => {
                 numberOrDefault(sort_order, scene.sort_order),
                 req.params.id
             ]);
+        });
+        const updatedScene = await db.get('SELECT * FROM scenes WHERE id = ?', [req.params.id]);
+        const project = await db.get('SELECT * FROM projects WHERE id = ?', [updatedScene.project_id]);
+        const draft = await loadDraftDocument(db, project, updatedScene);
+        draft.name = updatedScene.name;
+        draft.scene = {
+            ...draft.scene,
+            id: updatedScene.id,
+            name: updatedScene.name,
+            type: updatedScene.scene_type,
+            layout: safeJsonParse(updatedScene.layout_json, {}),
+            camera: safeJsonParse(updatedScene.camera_json, {}),
+            theme: safeJsonParse(updatedScene.theme_json, {})
+        };
+        draft.theme = { ...draft.theme, ...safeJsonParse(updatedScene.theme_json, {}) };
+        await saveDraft(db, {
+            sceneId: updatedScene.id,
+            document: draft,
+            expectedRevision: Number(updatedScene.draft_revision || 0)
         });
         res.json({ success: true });
     } catch (e) {
@@ -179,6 +292,8 @@ router.put('/widgets/:id', async (req, res) => {
             visible === undefined ? widget.visible : (visible === false || visible === 0 ? 0 : 1),
             req.params.id
         ]);
+
+        await rebuildLegacySceneDraft(db, widget.scene_id);
 
         res.json({ success: true });
     } catch (e) {
@@ -216,6 +331,7 @@ router.post('/widgets', async (req, res) => {
             numberOrDefault(sort_order, 0),
             visible === false || visible === 0 ? 0 : 1
         ]);
+        await rebuildLegacySceneDraft(db, scene_id);
         res.json({ success: true, id });
     } catch (e) {
         res.status(400).json({ error: e.message });
@@ -225,15 +341,27 @@ router.post('/widgets', async (req, res) => {
 router.delete('/widgets/:id', async (req, res) => {
     try {
         const db = await getDb();
-        const widget = await db.get('SELECT id FROM widgets WHERE id = ?', [req.params.id]);
+        const widget = await db.get('SELECT id, scene_id FROM widgets WHERE id = ?', [req.params.id]);
         if (!widget) return res.status(404).json({ error: '组件不存在，可能已经被删除或 ID 未正确编码' });
 
         await db.run('DELETE FROM widgets WHERE id = ?', [req.params.id]);
+        await rebuildLegacySceneDraft(db, widget.scene_id);
         res.json({ success: true });
     } catch (e) {
         res.status(400).json({ error: e.message });
     }
 });
+
+async function rebuildLegacySceneDraft(db, sceneId) {
+    const scene = await db.get('SELECT * FROM scenes WHERE id = ?', [sceneId]);
+    if (!scene) return;
+    const project = await db.get('SELECT * FROM projects WHERE id = ?', [scene.project_id]);
+    const document = await buildLegacyDocument(db, project, scene);
+    const revision = Number(scene.draft_revision || 0) + 1;
+    document.metadata = { ...document.metadata, revision, source: 'legacy_editor' };
+    await db.run(`UPDATE scenes SET draft_json = ?, draft_revision = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?`, [JSON.stringify(document), revision, scene.id]);
+}
 
 router.post('/events', async (req, res) => {
     const { event_type, level, source_id, title, message, value, quality } = req.body;

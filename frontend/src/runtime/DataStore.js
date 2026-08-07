@@ -46,6 +46,7 @@ export function createDashboardDataStore(options = {}) {
     const selectedDeviceId = ref(null);
     const selectedDeviceData = reactive({});
     const deviceStatusMap = reactive({});
+    const deviceDataMap = reactive({});
     const metrics = reactive({
         current_output: 0,
         daily_target: 1,
@@ -71,6 +72,7 @@ export function createDashboardDataStore(options = {}) {
     let staleTimer = null;
     let disposed = false;
     let onDeviceData = null;
+    let onMessage = null;
     let lastMetricsRefreshAt = 0;
     let lastEventsRefreshAt = 0;
     let lastTrendUpdateAt = 0;
@@ -107,6 +109,10 @@ export function createDashboardDataStore(options = {}) {
         recomputeMetricsFromRuntime();
     }
 
+    function setMessageHandler(handler) {
+        onMessage = typeof handler === 'function' ? handler : null;
+    }
+
     function registerDevice(deviceCfg) {
         if (!deviceCfg?.id) return;
         deviceStatusMap[deviceCfg.id] = {
@@ -135,6 +141,7 @@ export function createDashboardDataStore(options = {}) {
 
         lastRealtimeFrameAt = Date.now();
         latestDeviceDataMap.set(data.furnace_id, data);
+        deviceDataMap[data.furnace_id] = data;
         lastSeenMap.set(data.furnace_id, Date.now());
 
         const quality = getDeviceQuality(data);
@@ -231,6 +238,7 @@ export function createDashboardDataStore(options = {}) {
                     }
                     : createDeviceConnectionData(deviceId, quality, deviceStatus);
                 latestDeviceDataMap.set(deviceId, connectionData);
+                deviceDataMap[deviceId] = connectionData;
                 if (selectedDeviceId.value === deviceId) {
                     Object.keys(selectedDeviceData).forEach(key => delete selectedDeviceData[key]);
                     Object.assign(selectedDeviceData, connectionData);
@@ -310,6 +318,7 @@ export function createDashboardDataStore(options = {}) {
                     if (cachedData) {
                         const staleData = cloneDataWithQuality(cachedData, nextQuality);
                         latestDeviceDataMap.set(deviceId, staleData);
+                        deviceDataMap[deviceId] = staleData;
                         if (selectedDeviceId.value === deviceId) {
                             Object.keys(selectedDeviceData).forEach(key => delete selectedDeviceData[key]);
                             Object.assign(selectedDeviceData, staleData);
@@ -396,6 +405,7 @@ export function createDashboardDataStore(options = {}) {
                 } else if (msg.type === 'plc_status') {
                     applyPlcStatus(msg.payload);
                 }
+                onMessage?.(msg);
             } catch (e) {
                 // 忽略非 JSON 消息。
             }
@@ -437,6 +447,7 @@ export function createDashboardDataStore(options = {}) {
         selectedDeviceId,
         selectedDeviceData,
         deviceStatusMap,
+        deviceDataMap,
         metrics,
         events,
         trendPoints,
@@ -444,6 +455,7 @@ export function createDashboardDataStore(options = {}) {
         setStaleMs,
         setEventQueryOptions,
         setDeviceDataHandler,
+        setMessageHandler,
         registerDevice,
         selectDevice,
         connect,

@@ -3,13 +3,19 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 
 const props = defineProps({
-  widget: { type: Object, default: () => ({ widget_type: 'metrics', title: '' }) },
+  widget: { type: Object, default: () => ({ type: 'metrics', title: '' }) },
   metrics: { type: Object, default: () => ({}) },
   events: { type: Array, default: () => [] },
-  trendPoints: { type: Array, default: () => [] }
+  trendPoints: { type: Array, default: () => [] },
+  deviceStatusMap: { type: Object, default: () => ({}) },
+  deviceDataMap: { type: Object, default: () => ({}) },
+  pointValues: { type: Object, default: () => ({}) },
+  preview: { type: Boolean, default: false }
 })
 
+const emit = defineEmits(['action'])
 const chartRef = ref(null)
+const localTrend = ref([])
 let chart = null
 
 function getByPath(source, path) {
@@ -17,185 +23,330 @@ function getByPath(source, path) {
   return String(path).split('.').reduce((current, key) => current?.[key], source)
 }
 
-const dataContext = computed(() => ({
-  metrics: props.metrics,
-  events: props.events,
-  trendPoints: props.trendPoints
-}))
+function objectValue(value, fallback = {}) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : fallback
+}
+
+const type = computed(() => props.widget.type || props.widget.widget_type || 'text')
+const content = computed(() => objectValue(props.widget.content, objectValue(props.widget.config, {})))
+const widgetStyle = computed(() => objectValue(props.widget.style, objectValue(props.widget.config?.style, {})))
+const dataBinding = computed(() => objectValue(props.widget.data, objectValue(props.widget.binding, {})))
+const conditions = computed(() => Array.isArray(props.widget.conditions) ? props.widget.conditions : (props.widget.config?.conditions || []))
+const animation = computed(() => objectValue(props.widget.animation, objectValue(props.widget.config?.animation, { type: 'none' })))
+const widgetEvents = computed(() => Array.isArray(props.widget.events) ? props.widget.events : (props.widget.config?.events || []))
+const widgetTitle = computed(() => props.widget.title || content.value.title || '')
 
 const progressPercent = computed(() => {
   const target = Number(props.metrics.daily_target || props.metrics.dailyTarget || 1)
   const output = Number(props.metrics.current_output || props.metrics.currentOutput || 0)
-  return Math.max(0, Math.min(100, (output / target) * 100)).toFixed(1)
+  return Math.max(0, Math.min(100, target ? (output / target) * 100 : 0)).toFixed(1)
 })
 
-const oeeValue = computed(() => Number(props.metrics.overall_oee || props.metrics.overallOEE || 0).toFixed(1))
+const dataContext = computed(() => ({
+  metrics: props.metrics,
+  events: props.events,
+  trendPoints: props.trendPoints,
+  deviceStatusMap: props.deviceStatusMap,
+  deviceDataMap: props.deviceDataMap,
+  points: props.pointValues
+}))
 
 function getWidgetValue(path) {
   if (path === 'metrics.progress_percent') return progressPercent.value
   return getByPath(dataContext.value, path)
 }
 
-function getBoundArray(defaultSource) {
-  const source = props.widget.binding?.source || defaultSource
-  const value = getByPath(dataContext.value, source)
-  return Array.isArray(value) ? value : []
+const pointRecord = computed(() => {
+  const pointId = String(dataBinding.value.pointId || dataBinding.value.point_id || '')
+  const deviceId = String(dataBinding.value.deviceId || dataBinding.value.device_id || '')
+  return props.pointValues[`${deviceId}:${pointId}`] || props.pointValues[pointId] || null
+})
+
+const boundValue = computed(() => {
+  const binding = dataBinding.value
+  if (binding.mode === 'plc' || binding.pointId || binding.point_id) {
+    if (pointRecord.value && pointRecord.value.value !== undefined) return pointRecord.value.value
+    const deviceId = binding.deviceId || binding.device_id
+    const deviceData = props.deviceDataMap[deviceId]
+    const fromDevice = getByPath(deviceData, binding.path)
+    if (fromDevice !== undefined) return fromDevice
+    const fromStatus = getByPath(props.deviceStatusMap[deviceId], binding.path)
+    if (fromStatus !== undefined) return fromStatus
+    return content.value.value
+  }
+  const path = binding.path || binding.source
+  if (path) return getWidgetValue(path)
+  return content.value.value
+})
+
+const boundQuality = computed(() => pointRecord.value?.quality || props.deviceStatusMap[dataBinding.value.deviceId]?.quality || 'good')
+
+function numericValue(value) {
+  if (typeof value === 'boolean') return value ? 1 : 0
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
 }
 
-function formatMetricValue(item) {
-  const value = getWidgetValue(item.path)
-  if (item.suffixPath) {
-    const suffix = getWidgetValue(item.suffixPath)
-    return `${value ?? '--'}${item.separator || ''}${suffix ?? '--'}${item.unit || ''}`
+function formatValue(value = boundValue.value) {
+  if (value === undefined || value === null || value === '') return content.value.fallback ?? '--'
+  if (typeof value === 'boolean') return value ? (content.value.onText || '正常') : (content.value.offText || '停止')
+  const number = Number(value)
+  if (Number.isFinite(number)) {
+    const decimals = Math.max(0, Math.min(8, Number(dataBinding.value.decimals ?? 1)))
+    return number.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
   }
-  return `${value ?? '--'}${item.unit || ''}`
+  return String(value)
 }
+
+function conditionMatches(condition, value) {
+  const operator = condition?.operator || '=='
+  const target = condition?.value
+  const number = numericValue(value)
+  const targetNumber = numericValue(target)
+  if (operator === 'truthy') return !!value
+  if (operator === 'falsy') return !value
+  if (operator === '==') return String(value) === String(target) || (number !== null && targetNumber !== null && number === targetNumber)
+  if (operator === '!=') return !conditionMatches({ ...condition, operator: '==' }, value)
+  if (number === null || targetNumber === null) return false
+  if (operator === '>') return number > targetNumber
+  if (operator === '>=') return number >= targetNumber
+  if (operator === '<') return number < targetNumber
+  if (operator === '<=') return number <= targetNumber
+  return false
+}
+
+const activeCondition = computed(() => conditions.value.find(condition => conditionMatches(condition, boundValue.value)) || null)
+const conditionAnimation = computed(() => activeCondition.value?.animation || 'none')
+const animationType = computed(() => conditionAnimation.value !== 'none' ? conditionAnimation.value : (animation.value.type || 'none'))
+const animationClass = computed(() => animationType.value === 'none' ? '' : `widget-animation-${animationType.value}`)
+
+function cssSize(value, fallback = undefined) {
+  if (value === undefined || value === null || value === '') return fallback
+  return typeof value === 'number' ? `${value}px` : String(value)
+}
+
+const shellStyle = computed(() => {
+  const style = widgetStyle.value
+  const condition = activeCondition.value || {}
+  const shadows = {
+    none: 'none',
+    soft: '0 14px 34px rgba(0,8,18,.24)',
+    glow: '0 0 28px rgba(67,184,255,.24)',
+    strong: '0 18px 48px rgba(0,6,14,.42)'
+  }
+  return {
+    background: condition.background || style.background,
+    color: condition.color || style.color,
+    borderColor: condition.borderColor || style.borderColor,
+    borderRadius: cssSize(style.borderRadius, undefined),
+    opacity: style.opacity ?? 1,
+    padding: cssSize(style.padding, undefined),
+    fontSize: cssSize(style.fontSize, undefined),
+    boxShadow: shadows[style.shadow] || style.boxShadow,
+    '--widget-value-color': condition.color || style.valueColor || '#67d2ff',
+    '--widget-on-color': style.onColor || '#49df9d',
+    '--widget-off-color': style.offColor || '#7c8d9d',
+    '--widget-alarm-color': style.alarmColor || '#ff625f',
+    '--widget-line-color': content.value.lineColor || '#55c7ff',
+    animationDuration: `${Number(animation.value.duration || 1.2)}s`,
+    animationDelay: `${Number(animation.value.delay || 0)}s`,
+    animationIterationCount: animation.value.iteration || 'infinite'
+  }
+})
 
 const metricItems = computed(() => {
-  const items = Array.isArray(props.widget.config?.items) ? props.widget.config.items : [
+  const items = Array.isArray(content.value.items) ? content.value.items : [
     { label: '今日产出', path: 'metrics.current_output' },
     { label: '完成进度', path: 'metrics.progress_percent', unit: '%' },
     { label: '能耗估算', path: 'metrics.energy_consumption' },
     { label: '在线设备', path: 'metrics.online_devices', suffixPath: 'metrics.total_devices', separator: '/' }
   ]
-  return items.map(item => ({
-    label: item.label || item.path || '指标',
-    value: formatMetricValue(item)
-  }))
+  return items.map(item => {
+    const value = getWidgetValue(item.path)
+    const suffix = item.suffixPath ? getWidgetValue(item.suffixPath) : undefined
+    return {
+      label: item.label || item.path || '指标',
+      value: item.suffixPath
+        ? `${value ?? '--'}${item.separator || ''}${suffix ?? '--'}${item.unit || ''}`
+        : `${value ?? '--'}${item.unit || ''}`
+    }
+  })
 })
 
-const trendRows = computed(() => getBoundArray('trendPoints'))
-const eventRows = computed(() => getBoundArray('events'))
-const boundValue = computed(() => getWidgetValue(props.widget.binding?.path))
+const eventRows = computed(() => {
+  const source = dataBinding.value.source || dataBinding.value.path
+  const bound = source ? getWidgetValue(source) : null
+  return Array.isArray(bound) ? bound : props.events
+})
+
+const trendRows = computed(() => {
+  const source = dataBinding.value.source
+  const bound = source ? getWidgetValue(source) : null
+  if (Array.isArray(bound)) return bound
+  if (dataBinding.value.mode === 'plc' || dataBinding.value.pointId) return localTrend.value
+  return props.trendPoints
+})
+
 const textLines = computed(() => {
-  const config = props.widget.config || {}
-  const rawText = Array.isArray(config.lines) ? config.lines.join('\n') : (config.text || config.label || '')
-  const fallback = rawText || props.widget.title || '文本组件'
-  const value = boundValue.value ?? config.value ?? ''
-  return String(fallback).replaceAll('{value}', value).split('\n').filter(Boolean)
+  const rawText = Array.isArray(content.value.lines) ? content.value.lines.join('\n') : (content.value.text || content.value.label || '')
+  const fallback = rawText || widgetTitle.value || '文本组件'
+  return String(fallback).replaceAll('{value}', formatValue()).split('\n').filter(Boolean)
 })
-const textTone = computed(() => props.widget.config?.tone || 'normal')
 
-function resizeChart() {
-  if (chart) chart.resize()
-}
-
-function disposeChart() {
-  if (chart) {
-    chart.dispose()
-    chart = null
+const statusState = computed(() => {
+  if (boundQuality.value === 'bad') return 'unknown'
+  const value = boundValue.value
+  if (typeof value === 'string') {
+    const normalized = value.toLowerCase()
+    if (['true', '1', 'on', 'running', 'online', 'normal', '正常', '运行'].includes(normalized)) return 'on'
+    if (['false', '0', 'off', 'stopped', 'offline', '停止', '离线'].includes(normalized)) return 'off'
   }
-}
+  if (value === undefined || value === null || value === '') return 'unknown'
+  return Number(value) !== 0 || value === true ? 'on' : 'off'
+})
+
+const statusText = computed(() => {
+  if (statusState.value === 'unknown') return content.value.unknownText || '离线'
+  return statusState.value === 'on' ? (content.value.onText || '正常') : (content.value.offText || '停止')
+})
+
+const deviceRows = computed(() => Object.entries(props.deviceStatusMap)
+  .map(([id, value]) => ({ id, ...value }))
+  .slice(0, Number(content.value.limit || 12)))
+
+function resizeChart() { chart?.resize() }
+function disposeChart() { if (chart) { chart.dispose(); chart = null } }
 
 function renderChart() {
-  if (!['trend', 'metrics'].includes(props.widget.widget_type)) {
-    disposeChart()
-    return
-  }
+  if (!['trend', 'metrics'].includes(type.value)) { disposeChart(); return }
   if (!chartRef.value) return
   if (!chart) chart = echarts.init(chartRef.value)
-
-  if (props.widget.widget_type === 'trend') {
-    const config = props.widget.config || {}
-    const timeField = config.timeField || 'time'
-    const valueField = config.valueField || 'value'
-    const lineColor = config.lineColor || '#f0b35a'
+  if (type.value === 'trend') {
+    const timeField = content.value.timeField || 'time'
+    const valueField = content.value.valueField || 'value'
+    const lineColor = content.value.lineColor || '#55c7ff'
     chart.setOption({
-      tooltip: { trigger: 'axis', backgroundColor: 'rgba(18,24,30,0.92)', textStyle: { color: '#fff' } },
-      grid: { left: 42, right: 18, bottom: 28, top: 24 },
-      xAxis: { type: 'category', boundaryGap: false, data: trendRows.value.map(p => p[timeField]), axisLabel: { color: '#aeb7bf' } },
-      yAxis: { type: 'value', axisLabel: { color: '#aeb7bf' }, splitLine: { lineStyle: { color: 'rgba(255,255,255,0.08)' } } },
+      animation: !props.preview,
+      tooltip: { trigger: 'axis', backgroundColor: 'rgba(8,20,32,.94)', borderColor: 'rgba(86,181,238,.3)', textStyle: { color: '#fff' } },
+      grid: { left: 45, right: 18, bottom: 28, top: 24 },
+      xAxis: { type: 'category', boundaryGap: false, data: trendRows.value.map(point => point[timeField]), axisLine: { lineStyle: { color: 'rgba(180,215,238,.18)' } }, axisLabel: { color: '#8fa6b8' } },
+      yAxis: { type: 'value', axisLabel: { color: '#8fa6b8' }, splitLine: { lineStyle: { color: 'rgba(180,215,238,.08)' } } },
       series: [{
-        name: config.seriesName || props.widget.title || '趋势',
-        type: 'line',
-        smooth: true,
-        symbol: 'circle',
-        symbolSize: 5,
+        name: content.value.seriesName || widgetTitle.value || '趋势', type: 'line', smooth: true, showSymbol: false,
         lineStyle: { color: lineColor, width: 2 },
-        areaStyle: { color: config.areaColor || 'rgba(240,179,90,0.14)' },
-        data: trendRows.value.map(p => p[valueField])
+        areaStyle: { color: content.value.areaColor || 'rgba(85,199,255,.16)' },
+        data: trendRows.value.map(point => point[valueField])
       }]
-    })
-  } else if (props.widget.widget_type === 'metrics') {
-    const chartPath = props.widget.config?.chartPath || 'metrics.overall_oee'
-    const chartValue = Number(getWidgetValue(chartPath) ?? oeeValue.value)
-    const chartLabel = props.widget.config?.chartLabel || 'OEE'
-    chart.setOption({
-      tooltip: { trigger: 'item' },
-      series: [{
-        type: 'pie',
-        radius: ['64%', '82%'],
-        avoidLabelOverlap: false,
-        label: { show: true, position: 'center', formatter: `${chartValue.toFixed(1)}%\n${chartLabel}`, color: '#e8ecef', fontSize: 15, fontWeight: 600 },
-        itemStyle: { borderColor: '#171d22', borderWidth: 2 },
-        data: [
-          { value: chartValue, name: '有效', itemStyle: { color: props.widget.config?.chartColor || '#4fc08d' } },
-          { value: Math.max(0, 100 - chartValue), name: '损耗', itemStyle: { color: '#3b4249' } }
-        ]
-      }]
-    })
+    }, true)
+    return
   }
+  const chartPath = content.value.chartPath || 'metrics.overall_oee'
+  const chartValue = Number(getWidgetValue(chartPath) || 0)
+  chart.setOption({
+    animation: !props.preview,
+    series: [{
+      type: 'pie', radius: ['64%', '82%'], silent: true,
+      label: { show: true, position: 'center', formatter: `${chartValue.toFixed(1)}%\n${content.value.chartLabel || 'OEE'}`, color: '#eaf6ff', fontSize: 15, fontWeight: 700 },
+      itemStyle: { borderColor: '#12202d', borderWidth: 2 },
+      data: [
+        { value: chartValue, itemStyle: { color: content.value.chartColor || '#4fd09a' } },
+        { value: Math.max(0, 100 - chartValue), itemStyle: { color: 'rgba(122,151,171,.2)' } }
+      ]
+    }]
+  }, true)
 }
 
-onMounted(() => {
-  nextTick(renderChart)
-  window.addEventListener('resize', resizeChart)
+function triggerEvents(trigger, domEvent) {
+  widgetEvents.value.filter(event => (event.trigger || 'click') === trigger).forEach(event => emit('action', { event, widget: props.widget, domEvent }))
+}
+
+watch(boundValue, value => {
+  if (!(dataBinding.value.mode === 'plc' || dataBinding.value.pointId)) return
+  const number = Number(value)
+  if (!Number.isFinite(number)) return
+  const now = new Date().toLocaleTimeString().slice(0, 8)
+  localTrend.value = [...localTrend.value, { time: now, value: number }].slice(-Math.max(8, Number(content.value.historyLength || 60)))
 })
 
-watch(() => [props.widget, props.metrics, props.trendPoints, props.events], () => nextTick(renderChart), { deep: true })
+watch(() => [props.widget, props.metrics, props.trendPoints, props.events, localTrend.value], () => nextTick(renderChart), { deep: true })
 
-onUnmounted(() => {
-  window.removeEventListener('resize', resizeChart)
-  disposeChart()
-})
+onMounted(() => { nextTick(renderChart); window.addEventListener('resize', resizeChart) })
+onUnmounted(() => { window.removeEventListener('resize', resizeChart); disposeChart() })
 </script>
 
 <template>
-  <div class="widget-shell industrial-panel">
-    <div class="widget-title"><i></i>{{ widget.title }}</div>
+  <div
+    class="widget-shell industrial-panel"
+    :class="[
+      `widget-kind-${type}`,
+      animationClass,
+      `quality-${boundQuality}`,
+      { interactive: widgetEvents.length > 0 }
+    ]"
+    :style="shellStyle"
+    @click="triggerEvents('click', $event)"
+    @dblclick="triggerEvents('doubleClick', $event)"
+  >
+    <div v-if="widgetTitle && content.showTitle !== false && type !== 'image'" class="widget-title"><i></i><span>{{ widgetTitle }}</span></div>
 
-    <template v-if="widget.widget_type === 'metrics'">
-      <div class="metrics-layout">
-        <div ref="chartRef" class="widget-chart"></div>
-        <div class="metric-list">
-          <div class="metric-row" v-for="item in metricItems" :key="item.label">
-            <span>{{ item.label }}</span><strong>{{ item.value }}</strong>
-          </div>
-        </div>
-      </div>
+    <template v-if="type === 'metrics'">
+      <div class="metrics-layout"><div ref="chartRef" class="widget-chart"></div><div class="metric-list"><div v-for="item in metricItems" :key="item.label" class="metric-row"><span>{{ item.label }}</span><strong>{{ item.value }}</strong></div></div></div>
     </template>
 
-    <template v-else-if="widget.widget_type === 'trend'">
+    <template v-else-if="type === 'trend'">
       <div ref="chartRef" class="widget-chart trend-chart"></div>
     </template>
 
-    <template v-else-if="widget.widget_type === 'alarm_list'">
-      <ul class="alarm-list">
-        <li v-for="(event, idx) in eventRows.slice(0, widget.config?.limit || 5)" :key="event.id || idx">
-          <span class="rank" :class="event.level">{{ idx + 1 }}</span>
-          <span class="alarm-txt">[{{ event.time || event.occurred_at || '--' }}] {{ event.msg || event.title || event.message }}</span>
-          <span class="tag" :class="event.level">{{ event.level }}</span>
-        </li>
-      </ul>
+    <template v-else-if="type === 'alarm_list'">
+      <ul class="alarm-list"><li v-for="(event, index) in eventRows.slice(0, content.limit || 5)" :key="event.id || index"><span class="rank" :class="event.level">{{ index + 1 }}</span><span class="alarm-txt"><small v-if="content.showTime !== false">{{ event.time || event.occurred_at || '--' }}</small>{{ event.msg || event.title || event.message }}</span><span v-if="content.showLevel !== false" class="tag" :class="event.level">{{ event.level || 'info' }}</span></li></ul>
     </template>
 
-    <template v-else-if="widget.widget_type === 'marquee'">
-      <div class="marquee-content-wrap">
-        <div class="marquee-content" :style="{ animationDuration: (widget.config?.speed || 30) + 's' }">
-          <span v-for="(event, idx) in eventRows" :key="event.id || idx" class="marquee-item" :class="event.level">
-            [{{ event.time || event.occurred_at || '--' }}] {{ event.msg || event.title || event.message }}
-          </span>
-          <span v-for="(event, idx) in eventRows" :key="'copy' + (event.id || idx)" class="marquee-item" :class="event.level">
-            [{{ event.time || event.occurred_at || '--' }}] {{ event.msg || event.title || event.message }}
-          </span>
-        </div>
-      </div>
+    <template v-else-if="type === 'marquee'">
+      <div class="marquee-content-wrap"><div class="marquee-content" :style="{ animationDuration: (content.speed || 30) + 's' }"><template v-for="copy in 2" :key="copy"><span v-for="(event,index) in eventRows" :key="`${copy}-${event.id || index}`" class="marquee-item" :class="event.level">[{{ event.time || event.occurred_at || '--' }}] {{ event.msg || event.title || event.message }}</span></template></div></div>
     </template>
 
-    <template v-else-if="widget.widget_type === 'text'">
-      <div class="text-widget-body" :class="'tone-' + textTone">
-        <p v-for="(line, idx) in textLines" :key="idx">{{ line }}</p>
-      </div>
+    <template v-else-if="type === 'text'">
+      <div class="text-widget-body" :style="{ textAlign: content.align || 'left' }"><p v-for="(line,index) in textLines" :key="index">{{ line }}</p></div>
+    </template>
+
+    <template v-else-if="type === 'value'">
+      <div class="value-widget-body" :class="`shape-${content.shape || 'card'}`"><span>{{ content.label || widgetTitle }}</span><strong>{{ formatValue() }}<small v-if="dataBinding.unit">{{ dataBinding.unit }}</small></strong><em v-if="boundQuality !== 'good'">{{ boundQuality === 'bad' ? '离线' : '数据延迟' }}</em></div>
+    </template>
+
+    <template v-else-if="type === 'status'">
+      <div class="status-widget-body" :class="[`state-${statusState}`, `shape-${content.shape || 'lamp'}`]"><span class="status-lamp"><i></i></span><div><small>{{ content.label || widgetTitle }}</small><strong>{{ statusText }}</strong></div></div>
+    </template>
+
+    <template v-else-if="type === 'device_list'">
+      <div class="device-list"><div v-for="device in deviceRows" :key="device.id" class="device-list-row" :class="[`quality-${device.quality || 'bad'}`, { alarm: device.alarm }]"><i></i><span><strong>{{ device.name || device.id }}</strong><small>{{ device.online ? (device.running ? '运行中' : '在线待机') : '通讯离线' }}</small></span><b v-if="content.showTemperature !== false">{{ device.temp ?? '--' }}<small> °C</small></b></div><p v-if="!deviceRows.length">等待设备实时数据</p></div>
+    </template>
+
+    <template v-else-if="type === 'image'">
+      <img v-if="content.url" class="image-widget" :src="content.url" :alt="content.alt || widgetTitle" :style="{ objectFit: content.fit || 'contain' }" />
+      <div v-else class="image-placeholder"><span>▧</span><strong>选择图片</strong><small>在右侧内容属性填写地址</small></div>
+    </template>
+
+    <template v-else-if="type === 'container'">
+      <div class="container-placeholder"><span></span><small>容器区域</small></div>
+    </template>
+
+    <template v-else>
+      <div class="unknown-widget"><strong>{{ widgetTitle || type }}</strong><small>该组件由 {{ widget.runtimeTarget || 'Unity' }} 运行时处理</small></div>
     </template>
   </div>
 </template>
+
+<style scoped>
+.widget-shell{box-sizing:border-box;position:relative;width:100%;height:100%;min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden;padding:14px;border:1px solid rgba(91,169,219,.24);border-radius:14px;color:#edf7ff;background:rgba(10,24,38,.82);box-shadow:0 14px 34px rgba(0,8,18,.22);font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;transition:border-color .18s,filter .18s,transform .18s}.widget-shell.interactive{cursor:pointer}.widget-shell.quality-bad{filter:saturate(.72)}
+.widget-title{flex:0 0 auto;display:flex;align-items:center;gap:8px;min-height:22px;margin-bottom:8px;color:inherit;font-size:13px;font-weight:700;letter-spacing:.02em}.widget-title i{width:3px;height:14px;border-radius:99px;background:var(--widget-line-color,#55c7ff);box-shadow:0 0 12px color-mix(in srgb,var(--widget-line-color,#55c7ff) 55%,transparent)}.widget-title span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.metrics-layout{flex:1;min-height:0;display:grid;grid-template-columns:minmax(110px,38%) minmax(0,1fr);gap:12px}.widget-chart{width:100%;height:100%;min-height:80px}.trend-chart{flex:1}.metric-list{min-height:0;display:grid;align-content:center;gap:3px;overflow:hidden}.metric-row{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:26px;padding:3px 0;border-bottom:1px solid rgba(175,214,239,.07);color:#91a7b9;font-size:11px}.metric-row strong{color:#f1f8fd;font-size:13px}
+.alarm-list{flex:1;min-height:0;margin:0;padding:0;overflow:hidden;list-style:none}.alarm-list li{display:grid;grid-template-columns:25px minmax(0,1fr) auto;gap:8px;align-items:center;min-height:31px;border-bottom:1px solid rgba(174,214,240,.07);font-size:10px}.rank,.tag{display:grid;place-items:center;min-height:20px;padding:0 5px;border-radius:6px;color:#91bdd8;background:rgba(74,141,185,.12)}.rank.warning,.tag.warning{color:#ffd080;background:rgba(255,176,52,.12)}.rank.critical,.tag.critical{color:#ff8c88;background:rgba(255,94,89,.12)}.alarm-txt{min-width:0;overflow:hidden;color:#d0dfeb;text-overflow:ellipsis;white-space:nowrap}.alarm-txt small{margin-right:7px;color:#6f899d}.tag{font-size:8px;text-transform:uppercase}
+.marquee-content-wrap{flex:1;min-height:0;overflow:hidden}.marquee-content{display:flex;align-items:center;width:max-content;height:100%;white-space:nowrap;animation:widgetMarquee linear infinite}.marquee-item{margin-right:42px;color:inherit;font-size:12px}.marquee-item.warning{color:#ffd080}.marquee-item.critical{color:#ff8c88}
+.text-widget-body{flex:1;min-height:0;display:grid;align-content:center;gap:5px;overflow:hidden;color:inherit;line-height:1.5}.text-widget-body p{margin:0;white-space:pre-wrap}
+.value-widget-body{flex:1;min-height:0;display:grid;align-content:center;gap:6px}.value-widget-body>span{color:#8ea7ba;font-size:12px}.value-widget-body strong{color:var(--widget-value-color);font-size:clamp(24px,3vw,48px);font-weight:800;line-height:1.05;text-shadow:0 0 20px color-mix(in srgb,var(--widget-value-color) 24%,transparent)}.value-widget-body strong small{margin-left:7px;color:#9fb3c3;font-size:.34em;font-weight:500}.value-widget-body em{color:#ffb05c;font-size:9px;font-style:normal}.value-widget-body.shape-tile strong{letter-spacing:.08em;font-family:Consolas,monospace}.value-widget-body.shape-plain{align-content:center;text-align:center}.value-widget-body.shape-gauge::before{content:"";position:absolute;right:14px;bottom:14px;width:56px;height:56px;border:7px solid rgba(91,184,237,.12);border-top-color:var(--widget-value-color);border-radius:50%}
+.status-widget-body{flex:1;min-height:0;display:flex;align-items:center;gap:13px}.status-lamp{display:grid;place-items:center;width:44px;height:44px;border-radius:50%;background:rgba(116,142,162,.1)}.status-lamp i{width:18px;height:18px;border-radius:50%;background:var(--widget-off-color);box-shadow:0 0 0 6px color-mix(in srgb,var(--widget-off-color) 12%,transparent),0 0 15px color-mix(in srgb,var(--widget-off-color) 30%,transparent)}.state-on .status-lamp i{background:var(--widget-on-color);box-shadow:0 0 0 6px color-mix(in srgb,var(--widget-on-color) 12%,transparent),0 0 18px color-mix(in srgb,var(--widget-on-color) 50%,transparent)}.state-unknown .status-lamp i{background:var(--widget-alarm-color)}.status-widget-body div{display:grid;gap:3px}.status-widget-body small{color:#829bae;font-size:10px}.status-widget-body strong{font-size:20px}.status-widget-body.shape-badge .status-lamp{width:24px;height:24px}.status-widget-body.shape-badge .status-lamp i{width:10px;height:10px}.status-widget-body.shape-switch .status-lamp{width:52px;height:26px;border-radius:99px;justify-content:start;padding:4px}.status-widget-body.shape-switch .status-lamp i{width:18px;height:18px;box-shadow:none;transition:.2s}.status-widget-body.shape-switch.state-on .status-lamp{justify-content:end;background:color-mix(in srgb,var(--widget-on-color) 22%,transparent)}
+.device-list{flex:1;min-height:0;overflow:hidden}.device-list-row{display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:9px;align-items:center;min-height:37px;border-bottom:1px solid rgba(174,214,240,.07)}.device-list-row>i{width:7px;height:7px;border-radius:50%;background:#45d797;box-shadow:0 0 9px rgba(69,215,151,.45)}.device-list-row.quality-bad>i{background:#75899a;box-shadow:none}.device-list-row.alarm>i{background:#ff625f;box-shadow:0 0 10px rgba(255,98,95,.55)}.device-list-row span{min-width:0}.device-list-row span strong,.device-list-row span small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.device-list-row span strong{font-size:10px}.device-list-row span small{margin-top:2px;color:#728ca1;font-size:8px}.device-list-row>b{color:#dcebf6;font-size:11px}.device-list-row>b small{color:#728ca1;font-size:8px}.device-list>p{display:grid;place-items:center;height:100%;margin:0;color:#71899d;font-size:10px}
+.image-widget{width:100%;height:100%;display:block}.image-placeholder,.unknown-widget,.container-placeholder{flex:1;display:grid;place-content:center;gap:5px;text-align:center;color:#71899d}.image-placeholder>span{font-size:30px;color:#61bce9}.image-placeholder strong,.unknown-widget strong{color:#b8d2e4}.image-placeholder small,.unknown-widget small,.container-placeholder small{font-size:9px}.container-placeholder span{width:58px;height:32px;border:1px dashed rgba(91,184,237,.35);border-radius:7px;justify-self:center}.unknown-widget{border:1px dashed rgba(100,164,207,.24);border-radius:8px}
+.widget-animation-fadeIn{animation-name:widgetFadeIn;animation-fill-mode:both}.widget-animation-slideUp{animation-name:widgetSlideUp;animation-fill-mode:both}.widget-animation-pulse{animation-name:widgetPulse;animation-timing-function:ease-in-out}.widget-animation-breathe{animation-name:widgetBreathe;animation-timing-function:ease-in-out}.widget-animation-float{animation-name:widgetFloat;animation-timing-function:ease-in-out}.widget-animation-blink{animation-name:widgetBlink;animation-timing-function:steps(2,end)}
+@keyframes widgetMarquee{to{transform:translateX(-50%)}}@keyframes widgetFadeIn{from{opacity:0}to{opacity:1}}@keyframes widgetSlideUp{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}@keyframes widgetPulse{50%{transform:scale(1.018)}}@keyframes widgetBreathe{50%{filter:brightness(1.14);box-shadow:0 0 30px rgba(63,182,255,.22)}}@keyframes widgetFloat{50%{transform:translateY(-5px)}}@keyframes widgetBlink{50%{opacity:.45}}
+</style>

@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useFactoryConfig } from '../config/factoryConfig.js'
 import { createDashboardDataStore } from '../runtime/DataStore.js'
+import { API_BASE } from '../runtime/backendEndpoint.js'
 import WidgetRenderer from '../runtime/WidgetRenderer.vue'
 
 const rootRef = ref(null)
@@ -27,70 +28,51 @@ const CONFIG_ONLY_WIDGET_TYPES = new Set([
     'navigation'
 ])
 
-const fallbackWidgets = [
-    {
-        id: 'overlay_metrics',
-        widget_type: 'metrics',
-        title: '生产指标',
-        x: 0,
-        y: 0,
-        w: 5,
-        h: 5,
-        visible: 1,
-        config: { compact: true },
-        binding: {}
-    },
-    {
-        id: 'overlay_trend',
-        widget_type: 'trend',
-        title: '温度趋势',
-        x: 19,
-        y: 0,
-        w: 5,
-        h: 5,
-        visible: 1,
-        config: { seriesName: '平均温度', lineColor: '#58b8ff', areaColor: 'rgba(88,184,255,0.16)' },
-        binding: {}
-    },
-    {
-        id: 'overlay_alarms',
-        widget_type: 'alarm_list',
-        title: '报警履历',
-        x: 19,
-        y: 5,
-        w: 5,
-        h: 5,
-        visible: 1,
-        config: { limit: 5 },
-        binding: {}
-    },
-    {
-        id: 'overlay_marquee',
-        widget_type: 'marquee',
-        title: '实时日志',
-        x: 3,
-        y: 11,
-        w: 18,
-        h: 1,
-        visible: 1,
-        config: { speed: 30, limit: 20, eventWindowHours: 24 },
-        binding: {}
-    }
-]
-
 const platform = computed(() => getPlatform() || {})
+const dashboardCanvas = computed(() => platform.value.document?.canvas || platform.value.canvas || {
+    width: 1920,
+    height: 1080,
+    legacyGrid: { columns: 24, rows: 12 }
+})
 const grid = computed(() => ({
     columns: Math.max(1, Number(platform.value.activeScene?.layout?.grid?.columns) || 24),
     rows: Math.max(1, Number(platform.value.activeScene?.layout?.grid?.rows) || 12)
 }))
 const widgets = computed(() => {
-    const configured = Array.isArray(platform.value.widgets) && platform.value.widgets.length
-        ? platform.value.widgets
-        : fallbackWidgets
+    const configured = Array.isArray(platform.value.document?.widgets)
+        ? platform.value.document.widgets
+        : (Array.isArray(platform.value.widgets) ? platform.value.widgets : [])
     return configured
         .filter(widget => widget.visible !== 0 && widget.visible !== false)
-        .filter(widget => !CONFIG_ONLY_WIDGET_TYPES.has(widget.widget_type))
-        .sort((left, right) => Number(left.sort_order || 0) - Number(right.sort_order || 0))
+        .filter(widget => !CONFIG_ONLY_WIDGET_TYPES.has(widget.type || widget.widget_type))
+        .filter(widget => widget.runtimeTarget !== 'unity')
+        .sort((left, right) => Number(left.zIndex ?? left.sort_order ?? 0) - Number(right.zIndex ?? right.sort_order ?? 0))
+})
+
+function getByPath(source, path) {
+    if (!path) return undefined
+    return String(path).split('.').reduce((current, key) => current?.[key], source)
+}
+
+const pointValues = computed(() => {
+    const result = {}
+    for (const workshop of getWorkshops() || []) {
+        for (const line of workshop.lines || []) {
+            for (const device of line.devices || []) {
+                const frame = dataStore.deviceDataMap[device.id] || {}
+                for (const point of device.dataPoints || []) {
+                    const category = point.category || 'analog'
+                    const field = point.value_role || point.name
+                    const value = getByPath(frame, `${category}.${field}`)
+                    const quality = getByPath(frame, `quality.${category}.${field}`) || dataStore.deviceStatusMap[device.id]?.quality || 'bad'
+                    const record = { ...point, value, quality, device_id: device.id }
+                    result[String(point.id)] = record
+                    result[`${device.id}:${point.id}`] = record
+                }
+            }
+        }
+    }
+    return result
 })
 
 const projectName = computed(() => platform.value.activeProject?.name || '热处理数字孪生')
@@ -108,6 +90,18 @@ function postHostMessage(message) {
 }
 
 function widgetStyle(widget) {
+    if (widget.frame) {
+        const canvasWidth = Math.max(1, Number(dashboardCanvas.value.width) || 1920)
+        const canvasHeight = Math.max(1, Number(dashboardCanvas.value.height) || 1080)
+        return {
+            left: `${Number(widget.frame.x || 0) / canvasWidth * 100}%`,
+            top: `${Number(widget.frame.y || 0) / canvasHeight * 100}%`,
+            width: `${Number(widget.frame.width || 320) / canvasWidth * 100}%`,
+            height: `${Number(widget.frame.height || 180) / canvasHeight * 100}%`,
+            zIndex: Number(widget.zIndex || 0),
+            transform: `rotate(${Number(widget.frame.rotation || 0)}deg)`
+        }
+    }
     const columns = grid.value.columns
     const rows = grid.value.rows
     const x = Math.max(0, Math.min(columns, Number(widget.x) || 0))
@@ -189,13 +183,72 @@ function registerConfiguredDevices() {
 }
 
 function eventQueryConfig() {
-    const marquee = widgets.value.find(widget => widget.widget_type === 'marquee')?.config || {}
-    const alarms = widgets.value.find(widget => widget.widget_type === 'alarm_list')?.config || {}
+    const marqueeWidget = widgets.value.find(widget => (widget.type || widget.widget_type) === 'marquee')
+    const alarmWidget = widgets.value.find(widget => (widget.type || widget.widget_type) === 'alarm_list')
+    const marquee = marqueeWidget?.content || marqueeWidget?.config || {}
+    const alarms = alarmWidget?.content || alarmWidget?.config || {}
     return {
         limit: marquee.limit || alarms.limit || 20,
         eventWindowHours: marquee.eventWindowHours ?? marquee.windowHours ?? 24,
         eventType: marquee.eventType || marquee.event_type || ''
     }
+}
+
+async function focusNativeScene(mode, event = {}) {
+    try {
+        await fetch(`${API_BASE}/native-preview`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                action: 'focus',
+                source: 'dashboard_overlay',
+                focus: {
+                    mode,
+                    deviceId: event.deviceId || '',
+                    lineId: event.lineId || '',
+                    workshopId: event.workshopId || ''
+                }
+            })
+        })
+    } catch {
+        // Unity 不在线时不影响数据组件本身。
+    }
+}
+
+function playVoice(event) {
+    if (event.audioUrl) {
+        const audio = new Audio(event.audioUrl)
+        audio.play().catch(() => {})
+        return
+    }
+    if (event.text && window.speechSynthesis) {
+        window.speechSynthesis.cancel()
+        window.speechSynthesis.speak(new SpeechSynthesisUtterance(event.text))
+    }
+}
+
+function handleWidgetAction({ event }) {
+    if (!event) return
+    if (event.action === 'enter_device') return focusNativeScene('device', event)
+    if (event.action === 'focus_factory') return focusNativeScene('factory', event)
+    if (event.action === 'focus_line') return focusNativeScene('line', event)
+    if (event.action === 'focus_workshop') return focusNativeScene('workshop', event)
+    if (event.action === 'play_voice') return playVoice(event)
+    if (event.action === 'open_link' && /^https?:\/\//i.test(event.url || '')) {
+        if (window.chrome?.webview) postHostMessage({ type: 'dashboard_action', action: 'open_link', url: event.url })
+        else window.open(event.url, '_blank', 'noopener,noreferrer')
+    }
+    if (event.action === 'switch_scene' && event.sceneId) {
+        fetch(`${API_BASE}/platform/scenes/${encodeURIComponent(event.sceneId)}/activate-latest-release`, { method: 'POST' }).catch(() => {})
+    }
+}
+
+async function handleRuntimeMessage(message) {
+    if (message?.type !== 'dashboard_release_changed') return
+    await loadConfig()
+    dataStore.setEventQueryOptions(eventQueryConfig())
+    await nextTick()
+    scheduleRegionReport()
 }
 
 function handleHostMessage(event) {
@@ -212,6 +265,7 @@ onMounted(async () => {
     await loadConfig()
     registerConfiguredDevices()
     dataStore.setEventQueryOptions(eventQueryConfig())
+    dataStore.setMessageHandler(handleRuntimeMessage)
     dataStore.connect()
     await Promise.all([
         dataStore.refreshEvents(true),
@@ -269,7 +323,7 @@ onUnmounted(() => {
                 :key="widget.id"
                 class="overlay-widget"
                 :class="[
-                    `widget-type-${widget.widget_type}`,
+                    `widget-type-${widget.type || widget.widget_type}`,
                     { 'is-selected': selectedWidgetId === widget.id }
                 ]"
                 :style="widgetStyle(widget)"
@@ -282,6 +336,10 @@ onUnmounted(() => {
                     :metrics="dataStore.metrics"
                     :events="dataStore.events.value"
                     :trend-points="dataStore.trendPoints.value"
+                    :device-status-map="dataStore.deviceStatusMap"
+                    :device-data-map="dataStore.deviceDataMap"
+                    :point-values="pointValues"
+                    @action="handleWidgetAction"
                 />
             </div>
         </div>
@@ -317,7 +375,7 @@ body,
 
 .overlay-canvas {
     position: absolute;
-    inset: 18px 24px 24px;
+    inset: 0;
 }
 
 .overlay-status {
@@ -367,9 +425,9 @@ body,
 
 .overlay-widget {
     position: absolute;
-    min-width: 150px;
-    min-height: 60px;
-    padding: 0 9px 9px 0;
+    min-width: 0;
+    min-height: 0;
+    padding: 0;
     overflow: visible;
     pointer-events: auto;
     cursor: default;

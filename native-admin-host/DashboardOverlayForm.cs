@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Drawing.Drawing2D;
+using System.Diagnostics;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -197,11 +198,24 @@ internal sealed class DashboardOverlayForm : Form
                 return;
             }
             if (type == "overlay_regions") ReadInteractionRegions(root);
+            if (type == "dashboard_action") HandleDashboardAction(root);
         }
         catch (Exception exception)
         {
             WriteOverlayError("透明数据层消息解析失败", exception);
         }
+    }
+
+    private static void HandleDashboardAction(JsonElement root)
+    {
+        if (!root.TryGetProperty("action", out var actionElement)) return;
+        var action = actionElement.GetString();
+        if (action != "open_link" || !root.TryGetProperty("url", out var urlElement)) return;
+        var url = urlElement.GetString();
+        if (string.IsNullOrWhiteSpace(url)
+            || !Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)) return;
+        Process.Start(new ProcessStartInfo(uri.AbsoluteUri) { UseShellExecute = true });
     }
 
     private void ReadInteractionRegions(JsonElement root)

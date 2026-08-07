@@ -3,6 +3,11 @@ const router = express.Router();
 const { getDb } = require('../db/database');
 const { mergeBuiltinModels } = require('../services/builtinModels');
 const { normalizeWorkshopLayout, normalizeLineLayout } = require('../utils/spatialLayout');
+const {
+    getProjectAndScene,
+    loadPublishedDocument,
+    runtimePlatformPayload
+} = require('../services/dashboardDocuments');
 
 function safeJsonParse(value, fallback) {
     if (!value) return fallback;
@@ -72,34 +77,22 @@ router.get('/', async (req, res) => {
         });
 
         const models = mergeBuiltinModels(await db.all('SELECT * FROM models'));
-        const activeProject = await db.get('SELECT * FROM projects WHERE is_active = 1 LIMIT 1')
-            || await db.get('SELECT * FROM projects ORDER BY created_at ASC LIMIT 1');
-        const activeScene = activeProject
-            ? (await db.get('SELECT * FROM scenes WHERE project_id = ? AND is_active = 1 LIMIT 1', [activeProject.id])
-                || await db.get('SELECT * FROM scenes WHERE project_id = ? ORDER BY sort_order ASC LIMIT 1', [activeProject.id]))
-            : null;
-        const widgets = activeScene
-            ? await db.all('SELECT * FROM widgets WHERE scene_id = ? ORDER BY sort_order ASC', [activeScene.id])
-            : [];
+        const { project: activeProject, scene: activeScene } = await getProjectAndScene(db);
+        const published = await loadPublishedDocument(db, activeProject, activeScene);
+        const runtimeScene = published.document?.sceneId && published.document.sceneId !== activeScene?.id
+            ? (await db.get('SELECT * FROM scenes WHERE id = ? AND project_id = ?', [published.document.sceneId, activeProject?.id]) || activeScene)
+            : activeScene;
 
         res.json({
             settings,
             workshops: workshopsWithLines,
             models,
-            platform: {
-                activeProject,
-                activeScene: activeScene ? {
-                    ...activeScene,
-                    layout: safeJsonParse(activeScene.layout_json, {}),
-                    camera: safeJsonParse(activeScene.camera_json, {}),
-                    theme: safeJsonParse(activeScene.theme_json, {})
-                } : null,
-                widgets: widgets.map(widget => ({
-                    ...widget,
-                    config: safeJsonParse(widget.config_json, {}),
-                    binding: safeJsonParse(widget.binding_json, {})
-                }))
-            }
+            platform: runtimePlatformPayload({
+                project: activeProject,
+                scene: runtimeScene,
+                document: published.document,
+                release: published.release
+            })
         });
     } catch (e) {
         res.status(500).json({ error: e.message });

@@ -483,6 +483,7 @@ async function startServer() {
     const WsServer = require('./services/wsServer');
     const wsServer = new WsServer();
     wsServer.attach(httpServer);
+    global.wsServer = wsServer;
     settingsController.wsServer = wsServer;
     nativePreviewController.wsServer = wsServer;
 
@@ -511,6 +512,7 @@ async function startServer() {
         try { await screenCast.close(); } catch (e) { /* ignore */ }
         try { await lanDisplay.stop(); } catch (e) { /* ignore */ }
         try { wsServer.close(); } catch (e) { /* ignore */ }
+        if (global.wsServer === wsServer) global.wsServer = null;
         httpServer.close();
         try {
             await stopDatabaseMaintenance({ backup: true, reason: 'shutdown' });

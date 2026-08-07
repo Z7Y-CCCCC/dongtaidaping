@@ -264,6 +264,30 @@ export const adminApi = {
 
     // 平台编排
     async getPlatform() { return (await fetch(`${API_BASE}/platform`)).json() },
+    async getDashboardDesigner(sceneId = '') {
+        const suffix = sceneId ? `?scene_id=${encodeURIComponent(sceneId)}` : ''
+        return readApiJson(await fetch(`${API_BASE}/platform/designer${suffix}`), '读取大屏设计器失败')
+    },
+    async saveDashboardDraft(sceneId, document, expectedRevision) {
+        return readApiJson(await fetch(`${API_BASE}/platform/designer/draft`, {
+            method: 'PUT',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ sceneId, document, expectedRevision })
+        }), '保存大屏草稿失败')
+    },
+    async publishDashboard(sceneId, version = '', notes = '') {
+        return readApiJson(await fetch(`${API_BASE}/platform/releases`, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ sceneId, version, notes })
+        }), '发布大屏版本失败')
+    },
+    async activateDashboardRelease(id) {
+        return readApiJson(await fetch(`${API_BASE}/platform/releases/${pathId(id)}/activate`, { method: 'POST' }), '恢复发布版本失败')
+    },
+    async deleteDashboardRelease(id) {
+        return readApiJson(await fetch(`${API_BASE}/platform/releases/${pathId(id)}`, { method: 'DELETE' }), '删除发布版本失败')
+    },
     async updateScene(id, data) { return readApiJson(await fetch(`${API_BASE}/platform/scenes/${pathId(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存场景失败') },
     async createWidget(data) { return readApiJson(await fetch(`${API_BASE}/platform/widgets`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '创建组件失败') },
     async updateWidget(id, data) { return readApiJson(await fetch(`${API_BASE}/platform/widgets/${pathId(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存组件失败') },

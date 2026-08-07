@@ -1,6 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 const {
+    buildDocumentFromLegacy,
+    isCanonicalDocument,
+    safeJsonParse: parseDashboardJson
+} = require('../utils/dashboardDocument');
+const {
     safeObject,
     finiteNumber,
     normalizeAngleDegrees,
@@ -1198,6 +1203,15 @@ async function ensureSchemaColumns() {
     await ensureColumn('data_points', 'alarm_level', `${t.string(32)} DEFAULT 'WARNING'`);
     await ensureColumn('data_points', 'alarm_condition', `${t.string(64)} DEFAULT '=1'`);
     await ensureColumn('data_points', 'voice_config', `${t.text}`);
+
+    await ensureColumn('scenes', 'draft_json', `${t.json}`);
+    await ensureColumn('scenes', 'draft_revision', `${t.int} DEFAULT 0`);
+    await ensureColumn('scenes', 'published_release_id', `${t.string(128)} NULL`);
+
+    await ensureColumn('releases', 'scene_id', `${t.string(128)} NULL`);
+    await ensureColumn('releases', 'notes', `${t.text}`);
+    await ensureColumn('releases', 'schema_version', `${t.int} DEFAULT 1`);
+    await ensureColumn('releases', 'draft_revision', `${t.int} DEFAULT 0`);
 }
 
 async function rawQuery(sql) {
@@ -1400,6 +1414,7 @@ async function initTables() {
     await createIndex('idx_devices_line', 'devices', `${quoteIdentifier('line_id')}, ${quoteIdentifier('sort_order')}`);
     await createIndex('idx_data_points_device', 'data_points', quoteIdentifier('device_id'));
     await createIndex('idx_widgets_scene', 'widgets', `${quoteIdentifier('scene_id')}, ${quoteIdentifier('sort_order')}`);
+    await createIndex('idx_releases_project_current', 'releases', `${quoteIdentifier('project_id')}, ${quoteIdentifier('is_current')}`);
     await createIndex('idx_event_logs_time', 'event_logs', `${quoteIdentifier('occurred_at')} DESC, ${quoteIdentifier('id')} DESC`);
     await createIndex('idx_metric_snapshots_time', 'metric_snapshots', `${quoteIdentifier('snapshot_time')} DESC, ${quoteIdentifier('id')} DESC`);
 }
@@ -1655,15 +1670,127 @@ async function seedPlatformDefaults(db) {
 
     await mergeWidgetDefaultConfig(db, 'widget_marquee', { speed: 30, limit: 20, eventWindowHours: 24 });
 
+    const platformProject = await db.get('SELECT * FROM projects WHERE id = ?', ['project_default']);
+    const platformScene = await db.get('SELECT * FROM scenes WHERE id = ?', ['scene_factory_overview']);
+    const platformWidgets = await db.all('SELECT * FROM widgets WHERE scene_id = ? ORDER BY sort_order ASC', ['scene_factory_overview']);
+    const platformDocument = buildDocumentFromLegacy({
+        project: platformProject,
+        scene: platformScene,
+        widgets: platformWidgets
+    });
+
+    if (!isCanonicalDocument(platformScene?.draft_json)) {
+        await db.run('UPDATE scenes SET draft_json = ?, draft_revision = ? WHERE id = ?', [
+            JSON.stringify(platformDocument),
+            Math.max(1, Number(platformScene?.draft_revision || 0)),
+            'scene_factory_overview'
+        ]);
+    }
+
     const releaseCount = await db.get('SELECT COUNT(*) AS cnt FROM releases');
     if (releaseCount.cnt === 0) {
         await db.insertIgnore('releases', {
             id: 'release_default_v1',
             project_id: 'project_default',
+            scene_id: 'scene_factory_overview',
             version: '1.0.0',
-            snapshot_json: JSON.stringify({ scene_id: 'scene_factory_overview' }),
-            is_current: 1
+            snapshot_json: JSON.stringify(platformDocument),
+            is_current: 1,
+            notes: '系统初始化发布版本',
+            schema_version: 1,
+            draft_revision: Math.max(1, Number(platformScene?.draft_revision || 0))
         }, 'id');
+    }
+
+    const currentRelease = await db.get(
+        'SELECT * FROM releases WHERE project_id = ? AND is_current = 1 ORDER BY created_at DESC LIMIT 1',
+        ['project_default']
+    ) || await db.get(
+        'SELECT * FROM releases WHERE project_id = ? ORDER BY created_at DESC LIMIT 1',
+        ['project_default']
+    );
+    if (currentRelease) {
+        const releaseDocument = parseDashboardJson(currentRelease.snapshot_json, {});
+        if (!isCanonicalDocument(releaseDocument)) {
+            await db.run(`UPDATE releases SET scene_id = ?, snapshot_json = ?, schema_version = ?,
+                draft_revision = ?, is_current = 1 WHERE id = ?`, [
+                'scene_factory_overview',
+                JSON.stringify(platformDocument),
+                1,
+                Math.max(1, Number(platformScene?.draft_revision || 0)),
+                currentRelease.id
+            ]);
+        }
+        await db.run('UPDATE scenes SET published_release_id = ? WHERE id = ?', [
+            currentRelease.id,
+            'scene_factory_overview'
+        ]);
+    }
+
+    await ensureAllDashboardDocuments(db);
+}
+
+async function ensureAllDashboardDocuments(db) {
+    const projects = await db.all('SELECT * FROM projects ORDER BY created_at ASC');
+    for (const project of projects) {
+        const scenes = await db.all('SELECT * FROM scenes WHERE project_id = ? ORDER BY is_active DESC, sort_order ASC', [project.id]);
+        for (const scene of scenes) {
+            const widgets = await db.all('SELECT * FROM widgets WHERE scene_id = ? ORDER BY sort_order ASC', [scene.id]);
+            const legacyDocument = buildDocumentFromLegacy({ project, scene, widgets });
+            const storedDraft = parseDashboardJson(scene.draft_json, null);
+            if (!isCanonicalDocument(storedDraft)) {
+                const revision = Math.max(1, Number(scene.draft_revision || 0));
+                legacyDocument.metadata = { ...legacyDocument.metadata, revision };
+                await db.run('UPDATE scenes SET draft_json = ?, draft_revision = ? WHERE id = ?', [
+                    JSON.stringify(legacyDocument), revision, scene.id
+                ]);
+                scene.draft_json = JSON.stringify(legacyDocument);
+                scene.draft_revision = revision;
+            }
+        }
+
+        const activeScene = scenes.find(scene => !!scene.is_active) || scenes[0];
+        if (!activeScene) continue;
+        const activeWidgets = await db.all('SELECT * FROM widgets WHERE scene_id = ? ORDER BY sort_order ASC', [activeScene.id]);
+        const activeDocument = isCanonicalDocument(activeScene.draft_json)
+            ? parseDashboardJson(activeScene.draft_json, {})
+            : buildDocumentFromLegacy({ project, scene: activeScene, widgets: activeWidgets });
+        const releases = await db.all('SELECT * FROM releases WHERE project_id = ? ORDER BY created_at DESC', [project.id]);
+        let current = releases.find(release => !!release.is_current) || null;
+        if (!current) {
+            let patch = releases.length;
+            let version = `1.0.${patch}`;
+            const versions = new Set(releases.map(release => String(release.version)));
+            while (versions.has(version)) version = `1.0.${++patch}`;
+            const id = `release_seed_${String(project.id).replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            await db.insertIgnore('releases', {
+                id,
+                project_id: project.id,
+                scene_id: activeScene.id,
+                version,
+                snapshot_json: JSON.stringify(activeDocument),
+                is_current: 1,
+                notes: '自动迁移的初始发布版本',
+                schema_version: 1,
+                draft_revision: Number(activeScene.draft_revision || 0)
+            }, 'id');
+            current = await db.get('SELECT * FROM releases WHERE id = ?', [id]);
+        } else if (!isCanonicalDocument(parseDashboardJson(current.snapshot_json, null))) {
+            await db.run(`UPDATE releases SET scene_id = ?, snapshot_json = ?, schema_version = ?,
+                draft_revision = ? WHERE id = ?`, [
+                activeScene.id,
+                JSON.stringify(activeDocument),
+                1,
+                Number(activeScene.draft_revision || 0),
+                current.id
+            ]);
+        }
+        if (current) {
+            const releaseSceneId = current.scene_id
+                || parseDashboardJson(current.snapshot_json, {})?.sceneId
+                || activeScene.id;
+            await db.run('UPDATE scenes SET published_release_id = ? WHERE id = ?', [current.id, releaseSceneId]);
+        }
     }
 }
 

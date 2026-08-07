@@ -44,6 +44,7 @@ import { usePointMonitor } from './admin/composables/usePointMonitor.js'
 import { useDataPoints } from './admin/composables/useDataPoints.js'
 import { formatPointValue, formatQualityLabel, formatPointTime } from './admin/utils/points.js'
 import NativeEnvironmentSettings from './admin/components/NativeEnvironmentSettings.vue'
+import DashboardDesigner from './admin/components/DashboardDesigner.vue'
 import { normalizeWorkshopLayout } from '../utils/spatialLayout.js'
 
 defineOptions({ name: 'AdminPanel' })
@@ -6542,7 +6543,9 @@ const mainTabs = [
                         <p v-if="nativeDashboardMessage" class="native-dashboard-message">{{ nativeDashboardMessage }}</p>
                     </div>
 
-                    <div class="settings-section" style="margin-top:24px;">
+                    <DashboardDesigner style="margin-top:24px;" @reload="loadPlatform" />
+
+                    <div v-if="false" class="settings-section" style="margin-top:24px;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
                             <h3 class="section-title" style="margin: 0;">组件布局</h3>
                             <button @click="openCreateWidgetModal" class="btn btn-primary">+ 添加新组件</button>
@@ -6732,7 +6735,7 @@ const mainTabs = [
                         </div>
                     </Transition>
 
-                    <div class="settings-section" style="margin-top:24px;">
+                    <div v-if="false" class="settings-section" style="margin-top:24px;">
                         <h3 class="section-title">发布版本</h3>
                         <table class="data-table">
                             <thead><tr><th>版本</th><th>当前</th><th>发布时间</th></tr></thead>

@@ -370,6 +370,8 @@ onUnmounted(() => {
             :metrics="dataStore.metrics"
             :events="dataStore.events.value"
             :trend-points="dataStore.trendPoints.value"
+            :device-status-map="dataStore.deviceStatusMap"
+            :device-data-map="dataStore.deviceDataMap"
           />
         </div>
       </div>

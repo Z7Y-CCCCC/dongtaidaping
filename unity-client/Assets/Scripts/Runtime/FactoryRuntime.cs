@@ -344,6 +344,11 @@ namespace HeatTreatment.DigitalTwin.Runtime
             {
                 ApplyNativeScenePreview(message["payload"] as JObject);
             }
+            else if (type == "dashboard_release_changed")
+            {
+                _diagnostics.Activity = "Published dashboard version changed; reloading";
+                BeginReload();
+            }
         }
 
         private void ApplyNativeScenePreview(JObject payload)
@@ -368,6 +373,14 @@ namespace HeatTreatment.DigitalTwin.Runtime
             if (string.Equals(action, "camera", StringComparison.OrdinalIgnoreCase))
             {
                 ApplyPreviewCameraAction(payload);
+                return;
+            }
+
+            if (string.Equals(action, "focus", StringComparison.OrdinalIgnoreCase))
+            {
+                var focusBounds = CalculateRendererBounds(_factoryRoot);
+                ApplyPreviewFocus(payload["focus"] as JObject, focusBounds);
+                _diagnostics.Activity = "Dashboard focus action applied";
                 return;
             }
 

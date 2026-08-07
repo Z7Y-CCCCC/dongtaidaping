@@ -68,7 +68,7 @@ module.exports = function createNativePreviewRouter(controller) {
     });
 
     router.post('/', (req, res) => {
-        const action = ['apply', 'reset', 'reload', 'camera'].includes(req.body?.action)
+        const action = ['apply', 'reset', 'reload', 'camera', 'focus'].includes(req.body?.action)
             ? req.body.action
             : 'apply';
         const devices = (Array.isArray(req.body?.devices) ? req.body.devices : [])

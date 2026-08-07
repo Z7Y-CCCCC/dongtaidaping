@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://heat-treatment.local/schemas/dashboard-document.schema.json",
+  "title": "Heat Treatment Dashboard Document",
+  "type": "object",
+  "required": ["schemaVersion", "projectId", "sceneId", "canvas", "theme", "scene", "widgets"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "projectId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "sceneId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "name": { "type": "string", "maxLength": 255 },
+    "canvas": {
+      "type": "object",
+      "required": ["width", "height", "gridSize", "background", "safeArea"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 320, "maximum": 7680 },
+        "height": { "type": "integer", "minimum": 180, "maximum": 4320 },
+        "gridSize": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "background": { "type": "string", "maxLength": 512 },
+        "safeArea": { "type": "integer", "minimum": 0, "maximum": 400 }
+      },
+      "additionalProperties": true
+    },
+    "theme": { "type": "object" },
+    "scene": { "type": "object" },
+    "widgets": {
+      "type": "array",
+      "maxItems": 500,
+      "items": { "$ref": "#/$defs/widget" }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "frame": {
+      "type": "object",
+      "required": ["x", "y", "width", "height", "rotation"],
+      "properties": {
+        "x": { "type": "number", "minimum": -7680, "maximum": 15360 },
+        "y": { "type": "number", "minimum": -4320, "maximum": 8640 },
+        "width": { "type": "number", "minimum": 20, "maximum": 15360 },
+        "height": { "type": "number", "minimum": 20, "maximum": 8640 },
+        "rotation": { "type": "number", "minimum": -360, "maximum": 360 }
+      },
+      "additionalProperties": false
+    },
+    "dataBinding": {
+      "type": "object",
+      "required": ["mode", "readOnly"],
+      "properties": {
+        "mode": { "enum": ["static", "runtime", "plc"] },
+        "deviceId": { "type": "string", "maxLength": 128 },
+        "pointId": { "type": "string", "maxLength": 128 },
+        "path": { "type": "string", "maxLength": 255 },
+        "source": { "type": "string", "maxLength": 128 },
+        "unit": { "type": "string", "maxLength": 32 },
+        "decimals": { "type": "integer", "minimum": 0, "maximum": 8 },
+        "readOnly": { "const": true }
+      },
+      "additionalProperties": true
+    },
+    "event": {
+      "type": "object",
+      "required": ["trigger", "action"],
+      "properties": {
+        "trigger": { "enum": ["click", "doubleClick"] },
+        "action": { "enum": ["enter_device", "focus_factory", "focus_line", "focus_workshop", "play_voice", "open_link", "switch_scene"] },
+        "deviceId": { "type": "string", "maxLength": 128 },
+        "lineId": { "type": "string", "maxLength": 128 },
+        "workshopId": { "type": "string", "maxLength": 128 },
+        "sceneId": { "type": "string", "maxLength": 128 },
+        "url": { "type": "string", "maxLength": 2048 },
+        "audioUrl": { "type": "string", "maxLength": 2048 },
+        "text": { "type": "string", "maxLength": 500 }
+      },
+      "additionalProperties": false
+    },
+    "widget": {
+      "type": "object",
+      "required": ["id", "type", "title", "visible", "locked", "zIndex", "runtimeTarget", "frame", "content", "style", "data", "conditions", "animation", "events"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 128 },
+        "type": { "enum": ["text", "value", "status", "trend", "alarm_list", "device_list", "image", "container", "metrics", "marquee", "navigation", "device_label", "diagnostics", "line_overview_cards"] },
+        "title": { "type": "string", "maxLength": 255 },
+        "visible": { "type": "boolean" },
+        "locked": { "type": "boolean" },
+        "zIndex": { "type": "integer", "minimum": -1000, "maximum": 10000 },
+        "runtimeTarget": { "enum": ["overlay", "unity", "both"] },
+        "groupId": { "type": "string", "maxLength": 128 },
+        "frame": { "$ref": "#/$defs/frame" },
+        "content": { "type": "object" },
+        "style": { "type": "object" },
+        "data": { "$ref": "#/$defs/dataBinding" },
+        "conditions": { "type": "array", "maxItems": 20, "items": { "type": "object" } },
+        "animation": { "type": "object" },
+        "events": { "type": "array", "maxItems": 12, "items": { "$ref": "#/$defs/event" } }
+      },
+      "additionalProperties": true
+    }
+  }
+}
