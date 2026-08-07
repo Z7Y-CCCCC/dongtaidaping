@@ -187,6 +187,25 @@ internal static class NativeMethods
         return old.ToInt64();
     }
 
+    /// <summary>
+    /// Convert a layout metric authored at the Windows 96-DPI baseline to the
+    /// physical pixels expected by Win32 positioning APIs. WinForms and WebView2
+    /// can expose logical units while SetWindowPos always receives device pixels
+    /// for a PerMonitorV2 process, so all shared chrome metrics go through this
+    /// helper instead of multiplying ad hoc at each call site.
+    /// </summary>
+    internal static int Scale96(int value, uint dpi)
+    {
+        var effectiveDpi = dpi == 0 ? 96u : dpi;
+        return Math.Max(1, (int)Math.Round(value * effectiveDpi / 96d, MidpointRounding.AwayFromZero));
+    }
+
+    internal static uint GetWindowDpiOrDefault(IntPtr handle, uint fallback = 96)
+    {
+        var dpi = handle != IntPtr.Zero ? GetDpiForWindow(handle) : 0;
+        return dpi == 0 ? Math.Max(96u, fallback) : dpi;
+    }
+
     internal static IntPtr PackScreenPoint(int x, int y)
     {
         var packed = unchecked((int)((uint)(ushort)x | ((uint)(ushort)y << 16)));

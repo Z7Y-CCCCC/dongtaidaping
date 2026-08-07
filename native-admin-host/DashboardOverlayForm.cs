@@ -25,6 +25,7 @@ internal sealed class DashboardOverlayForm : Form
     private IntPtr _parentHandle;
     private Region? _interactionRegion;
     private Size _lastParentClientSize = Size.Empty;
+    private int _lastChromeHeight;
     private uint _lastDpi = 96;
     private bool _attached;
     private bool _initialized;
@@ -35,6 +36,7 @@ internal sealed class DashboardOverlayForm : Form
         _options = options;
         Text = "数字孪生透明数据层";
         FormBorderStyle = FormBorderStyle.None;
+        AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false;
         MinimizeBox = false;
@@ -103,18 +105,20 @@ internal sealed class DashboardOverlayForm : Form
         if (!_attached || _parentHandle == IntPtr.Zero || !NativeMethods.IsWindow(_parentHandle)) return;
         if (!NativeMethods.GetClientRect(_parentHandle, out var client)) return;
         var clientSize = new Size(Math.Max(1, client.Width), Math.Max(1, client.Height));
+        var chromeHeight = DashboardChromeForm.GetChromeHeightPixels(_parentHandle);
         ApplyDpiCompensatedZoom();
-        if (!force && clientSize == _lastParentClientSize) return;
+        if (!force && clientSize == _lastParentClientSize && chromeHeight == _lastChromeHeight) return;
         _lastParentClientSize = clientSize;
+        _lastChromeHeight = chromeHeight;
 
-        var height = Math.Max(1, clientSize.Height - DashboardChromeForm.ChromeHeight);
+        var height = Math.Max(1, clientSize.Height - chromeHeight);
         var flags = NativeMethods.SwpFrameChanged | NativeMethods.SwpNoActivate;
         if (_visibleRequested) flags |= NativeMethods.SwpShowWindow;
         NativeMethods.SetWindowPos(
             Handle,
             NativeMethods.HwndTop,
             0,
-            DashboardChromeForm.ChromeHeight,
+            chromeHeight,
             clientSize.Width,
             height,
             flags

@@ -66,6 +66,7 @@ internal sealed class AdminPanelForm : Form
 
         Text = "后台管理";
         FormBorderStyle = FormBorderStyle.None;
+        AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false;
         MinimizeBox = false;
@@ -453,7 +454,11 @@ internal sealed class AdminPanelForm : Form
         if (!TryResolveParentWindow()) return false;
         var parent = GetParentClientScreenBounds();
         if (parent == Rectangle.Empty) return false;
-        var dockBottom = parent.Top + Math.Min(ParentDockStripHeight, parent.Height);
+        var dockStripHeight = NativeMethods.Scale96(
+            ParentDockStripHeight,
+            NativeMethods.GetWindowDpiOrDefault(_parentHandle)
+        );
+        var dockBottom = parent.Top + Math.Min(dockStripHeight, parent.Height);
         return screenX >= parent.Left
             && screenX < parent.Right
             && screenY >= parent.Top - 8
@@ -683,7 +688,19 @@ internal sealed class AdminPanelForm : Form
     private Rectangle GetDashboardChromeBounds()
     {
         var client = GetParentClientSize();
-        return new Rectangle(0, 0, client.Width, HeaderHeight);
+        return new Rectangle(0, 0, client.Width, GetParentChromeHeightPixels());
+    }
+
+    private int GetParentChromeHeightPixels()
+    {
+        return DashboardChromeForm.GetChromeHeightPixels(_parentHandle);
+    }
+
+    private int GetCurrentChromeHeightPixels()
+    {
+        return _attached
+            ? GetParentChromeHeightPixels()
+            : NativeMethods.Scale96(HeaderHeight, (uint)Math.Max(96, DeviceDpi));
     }
 
     private void AttachToParent(bool preserveScreenPosition)
@@ -938,38 +955,22 @@ internal sealed class AdminPanelForm : Form
 
     private void ClampEmbeddedBounds()
     {
-        var client = GetVisibleParentClientSize();
+        // An embedded child must always use the complete Unity client area.
+        // Windows clips the part that is outside the monitor naturally. Using
+        // the visible monitor intersection here makes the child narrower than
+        // its parent whenever the borderless Unity window is moved partly off
+        // screen, leaving an exposed strip of the Unity background on the
+        // right/bottom (the top-bar gap seen in the field screenshot).
+        var client = GetParentClientSize();
         var minimumWidth = _adminVisible ? Math.Min(MinimumPanelWidth, client.Width) : 1;
-        var minimumHeight = _adminVisible ? Math.Min(MinimumPanelHeight, client.Height) : HeaderHeight;
+        var minimumHeight = _adminVisible
+            ? Math.Min(MinimumPanelHeight, client.Height)
+            : (_attached ? GetParentChromeHeightPixels() : HeaderHeight);
         var width = Math.Min(Math.Max(minimumWidth, _embeddedBounds.Width), client.Width);
         var height = Math.Min(Math.Max(minimumHeight, _embeddedBounds.Height), client.Height);
         var x = Math.Clamp(_embeddedBounds.X, 0, Math.Max(0, client.Width - width));
         var y = Math.Clamp(_embeddedBounds.Y, 0, Math.Max(0, client.Height - height));
         _embeddedBounds = new Rectangle(x, y, width, height);
-    }
-
-    /// <summary>
-    /// The Unity parent can extend past the visible desktop (taskbar overlap, a
-    /// restored window dragged partly off-screen, a monitor that was disconnected).
-    /// Sizing the embedded panel to the raw client rect then pushes the bottom of the
-    /// admin page off-screen permanently: the page believes it fits, so it never shows
-    /// a scrollbar and the last cards can never be reached. Clamp to the part of the
-    /// parent that is actually on a monitor's working area.
-    /// </summary>
-    private Size GetVisibleParentClientSize()
-    {
-        var client = GetParentClientSize();
-        var screenBounds = GetParentClientScreenBounds();
-        if (screenBounds == Rectangle.Empty) return client;
-
-        var workingArea = Screen.FromRectangle(screenBounds).WorkingArea;
-        var visible = Rectangle.Intersect(screenBounds, workingArea);
-        if (visible.Width <= 0 || visible.Height <= 0) return client;
-
-        return new Size(
-            Math.Max(1, Math.Min(client.Width, visible.Width)),
-            Math.Max(1, Math.Min(client.Height, visible.Height))
-        );
     }
 
     private void ShowPanel(bool focus = true)
@@ -1178,7 +1179,7 @@ internal sealed class AdminPanelForm : Form
                 ? Math.Clamp((screenX - currentBounds.Left) / (double)currentBounds.Width, 0.08d, 0.92d)
                 : 0.5d;
             var gripX = (int)Math.Round(restore.Width * horizontalRatio);
-            var gripY = Math.Clamp(screenY - currentBounds.Top, 0, HeaderHeight - 1);
+            var gripY = Math.Clamp(screenY - currentBounds.Top, 0, GetParentChromeHeightPixels() - 1);
             currentBounds = new Rectangle(screenX - gripX, screenY - gripY, restore.Width, restore.Height);
             NativeMethods.SetWindowPos(
                 _parentHandle,
@@ -1266,7 +1267,7 @@ internal sealed class AdminPanelForm : Form
             ? Math.Clamp((_dragStart.X - currentBounds.Left) / (double)currentBounds.Width, 0.08d, 0.92d)
             : 0.5d;
         var gripX = (int)Math.Round(restore.Width * horizontalRatio);
-        var gripY = Math.Clamp(_dragStart.Y - currentBounds.Top, 0, HeaderHeight - 1);
+        var gripY = Math.Clamp(_dragStart.Y - currentBounds.Top, 0, GetParentChromeHeightPixels() - 1);
         _dragStartBounds = new Rectangle(screenX - gripX, screenY - gripY, restore.Width, restore.Height);
         _dragPointerOffset = new Point(gripX, gripY);
         NativeMethods.SetWindowPos(
@@ -1301,7 +1302,11 @@ internal sealed class AdminPanelForm : Form
         _adminVisible = true;
         var detachedSize = FitDetachedSize(sourceSize, screenX, screenY);
         var gripX = Math.Clamp(_dragPointerOffset.X, 48, Math.Max(48, detachedSize.Width - 48));
-        var gripY = Math.Clamp(_dragPointerOffset.Y, 0, Math.Min(HeaderHeight - 1, detachedSize.Height - 1));
+        var gripY = Math.Clamp(
+            _dragPointerOffset.Y,
+            0,
+            Math.Min(GetCurrentChromeHeightPixels() - 1, detachedSize.Height - 1)
+        );
         var bounds = new Rectangle(screenX - gripX, screenY - gripY, detachedSize.Width, detachedSize.Height);
         DetachFromParent(bounds, false);
         _dragging = false;
@@ -1319,7 +1324,7 @@ internal sealed class AdminPanelForm : Form
             ? Math.Clamp((screenX - maximizedBounds.Left) / (double)maximizedBounds.Width, 0.08d, 0.92d)
             : 0.5d;
         var gripX = (int)Math.Round(restoredSize.Width * horizontalRatio);
-        var gripY = Math.Clamp(screenY - maximizedBounds.Top, 0, HeaderHeight - 1);
+        var gripY = Math.Clamp(screenY - maximizedBounds.Top, 0, GetCurrentChromeHeightPixels() - 1);
         _maximized = false;
         Bounds = new Rectangle(screenX - gripX, screenY - gripY, restoredSize.Width, restoredSize.Height);
         SendHostState();

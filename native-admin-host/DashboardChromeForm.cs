@@ -9,11 +9,13 @@ internal sealed class DashboardChromeForm : Form
     private readonly ChromeSurface _surface;
     private IntPtr _parentHandle;
     private Size _lastParentClientSize = Size.Empty;
+    private int _lastChromeHeight;
 
     public DashboardChromeForm(Action<string, int, int> action)
     {
         Text = "实时大屏";
         FormBorderStyle = FormBorderStyle.None;
+        AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false;
         MinimizeBox = false;
@@ -54,16 +56,26 @@ internal sealed class DashboardChromeForm : Form
         if (_parentHandle == IntPtr.Zero || !NativeMethods.IsWindow(_parentHandle)) return;
         if (!NativeMethods.GetClientRect(_parentHandle, out var client)) return;
         var clientSize = new Size(Math.Max(1, client.Width), Math.Max(1, client.Height));
-        if (!force && clientSize == _lastParentClientSize) return;
+        var chromeHeight = GetChromeHeightPixels(_parentHandle);
+        if (!force && clientSize == _lastParentClientSize && chromeHeight == _lastChromeHeight) return;
         _lastParentClientSize = clientSize;
+        _lastChromeHeight = chromeHeight;
         NativeMethods.SetWindowPos(
             Handle,
             NativeMethods.HwndTop,
             0,
             0,
             clientSize.Width,
-            ChromeHeight,
+            chromeHeight,
             NativeMethods.SwpFrameChanged | NativeMethods.SwpShowWindow
+        );
+    }
+
+    internal static int GetChromeHeightPixels(IntPtr parentHandle)
+    {
+        return NativeMethods.Scale96(
+            ChromeHeight,
+            NativeMethods.GetWindowDpiOrDefault(parentHandle)
         );
     }
 
@@ -74,7 +86,6 @@ internal sealed class DashboardChromeForm : Form
 
     private sealed class ChromeSurface : Control
     {
-        private const int ActionWidth = 40;
         private readonly Action<string, int, int> _action;
         private readonly Font _tabFont = new("Microsoft YaHei UI", 9f, FontStyle.Bold);
         private readonly Font _hintFont = new("Microsoft YaHei UI", 8.2f, FontStyle.Regular);
@@ -105,11 +116,30 @@ internal sealed class DashboardChromeForm : Form
             }
         }
 
-        private Rectangle DashboardTabRect => new(8, 6, 108, 35);
-        private Rectangle DetachedChipRect => new(126, 10, 204, 29);
-        private Rectangle MinimizeRect => new(Math.Max(0, Width - ActionWidth * 3 - 6), 7, ActionWidth, 32);
-        private Rectangle MaximizeRect => new(Math.Max(0, Width - ActionWidth * 2 - 6), 7, ActionWidth, 32);
-        private Rectangle CloseRect => new(Math.Max(0, Width - ActionWidth - 6), 7, ActionWidth, 32);
+        private Rectangle DashboardTabRect => LogicalRectangle(8, 6, 108, 35);
+        private Rectangle DetachedChipRect => LogicalRectangle(126, 10, 204, 29);
+        private Rectangle MinimizeRect => WindowActionRect(3);
+        private Rectangle MaximizeRect => WindowActionRect(2);
+        private Rectangle CloseRect => WindowActionRect(1);
+
+        private int ScaleMetric(int value) => NativeMethods.Scale96(value, (uint)Math.Max(96, DeviceDpi));
+        private float ScaleMetric(float value) => value * Math.Max(96, DeviceDpi) / 96f;
+
+        private Rectangle LogicalRectangle(int x, int y, int width, int height)
+        {
+            return new Rectangle(ScaleMetric(x), ScaleMetric(y), ScaleMetric(width), ScaleMetric(height));
+        }
+
+        private Rectangle WindowActionRect(int distanceFromRight)
+        {
+            var actionWidth = ScaleMetric(40);
+            return new Rectangle(
+                Math.Max(0, Width - actionWidth * distanceFromRight - ScaleMetric(6)),
+                ScaleMetric(7),
+                actionWidth,
+                ScaleMetric(32)
+            );
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -120,9 +150,9 @@ internal sealed class DashboardChromeForm : Form
             {
                 graphics.FillRectangle(background, ClientRectangle);
             }
-            using (var border = new Pen(Color.FromArgb(203, 213, 223)))
+            using (var border = new Pen(Color.FromArgb(203, 213, 223), ScaleMetric(1f)))
             {
-                graphics.DrawLine(border, 0, Height - 1, Width, Height - 1);
+                graphics.DrawLine(border, 0, Height - ScaleMetric(1), Width, Height - ScaleMetric(1));
             }
 
             DrawDashboardTab(graphics);
@@ -133,25 +163,25 @@ internal sealed class DashboardChromeForm : Form
         private void DrawDashboardTab(Graphics graphics)
         {
             var rect = DashboardTabRect;
-            using var path = RoundedPath(rect, 9);
+            using var path = RoundedPath(rect, ScaleMetric(9));
             using var fill = new SolidBrush(Color.FromArgb(248, 250, 252));
-            using var border = new Pen(Color.FromArgb(203, 213, 223));
+            using var border = new Pen(Color.FromArgb(203, 213, 223), ScaleMetric(1f));
             graphics.FillPath(fill, path);
             graphics.DrawPath(border, path);
-            using var bottomMask = new Pen(Color.FromArgb(248, 250, 252), 2f);
-            graphics.DrawLine(bottomMask, rect.Left + 12, rect.Bottom, rect.Right - 12, rect.Bottom);
+            using var bottomMask = new Pen(Color.FromArgb(248, 250, 252), ScaleMetric(2f));
+            graphics.DrawLine(bottomMask, rect.Left + ScaleMetric(12), rect.Bottom, rect.Right - ScaleMetric(12), rect.Bottom);
 
-            using var iconPen = new Pen(Color.FromArgb(71, 84, 103), 1.45f);
-            var monitor = new Rectangle(rect.Left + 15, rect.Top + 10, 14, 10);
+            using var iconPen = new Pen(Color.FromArgb(71, 84, 103), ScaleMetric(1.45f));
+            var monitor = new Rectangle(rect.Left + ScaleMetric(15), rect.Top + ScaleMetric(10), ScaleMetric(14), ScaleMetric(10));
             graphics.DrawRectangle(iconPen, monitor);
-            graphics.DrawLine(iconPen, monitor.Left + 5, monitor.Bottom + 3, monitor.Right - 5, monitor.Bottom + 3);
-            graphics.DrawLine(iconPen, monitor.Left + 7, monitor.Bottom, monitor.Left + 7, monitor.Bottom + 3);
+            graphics.DrawLine(iconPen, monitor.Left + ScaleMetric(5), monitor.Bottom + ScaleMetric(3), monitor.Right - ScaleMetric(5), monitor.Bottom + ScaleMetric(3));
+            graphics.DrawLine(iconPen, monitor.Left + ScaleMetric(7), monitor.Bottom, monitor.Left + ScaleMetric(7), monitor.Bottom + ScaleMetric(3));
 
             TextRenderer.DrawText(
                 graphics,
                 "实时大屏",
                 _tabFont,
-                new Rectangle(rect.Left + 39, rect.Top + 6, rect.Width - 44, rect.Height - 8),
+                new Rectangle(rect.Left + ScaleMetric(39), rect.Top + ScaleMetric(6), rect.Width - ScaleMetric(44), rect.Height - ScaleMetric(8)),
                 Color.FromArgb(23, 43, 63),
                 TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPadding
             );
@@ -161,20 +191,20 @@ internal sealed class DashboardChromeForm : Form
         {
             var rect = DetachedChipRect;
             var hovered = _hoverZone == 1;
-            using var path = RoundedPath(rect, 7);
+            using var path = RoundedPath(rect, ScaleMetric(7));
             using var fill = new SolidBrush(hovered ? Color.FromArgb(247, 250, 253) : Color.FromArgb(237, 242, 247));
             graphics.FillPath(fill, path);
 
             using var dot = new SolidBrush(Color.FromArgb(18, 183, 106));
-            graphics.FillEllipse(dot, rect.Left + 10, rect.Top + 10, 7, 7);
-            using var halo = new Pen(Color.FromArgb(55, 18, 183, 106), 3f);
-            graphics.DrawEllipse(halo, rect.Left + 8, rect.Top + 8, 11, 11);
+            graphics.FillEllipse(dot, rect.Left + ScaleMetric(10), rect.Top + ScaleMetric(10), ScaleMetric(7), ScaleMetric(7));
+            using var halo = new Pen(Color.FromArgb(55, 18, 183, 106), ScaleMetric(3f));
+            graphics.DrawEllipse(halo, rect.Left + ScaleMetric(8), rect.Top + ScaleMetric(8), ScaleMetric(11), ScaleMetric(11));
 
             TextRenderer.DrawText(
                 graphics,
                 "后台管理已在独立窗口",
                 _hintFont,
-                new Rectangle(rect.Left + 27, rect.Top + 2, rect.Width - 33, rect.Height - 4),
+                new Rectangle(rect.Left + ScaleMetric(27), rect.Top + ScaleMetric(2), rect.Width - ScaleMetric(33), rect.Height - ScaleMetric(4)),
                 hovered ? Color.FromArgb(23, 92, 211) : Color.FromArgb(82, 103, 122),
                 TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPadding
             );
@@ -186,33 +216,39 @@ internal sealed class DashboardChromeForm : Form
             DrawActionBackground(graphics, MaximizeRect, _hoverZone == 3, false);
             DrawActionBackground(graphics, CloseRect, _hoverZone == 4, true);
             var iconColor = _hoverZone == 4 ? Color.White : Color.FromArgb(71, 84, 103);
-            using var pen = new Pen(iconColor, 1.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+            using var pen = new Pen(iconColor, ScaleMetric(1.5f)) { StartCap = LineCap.Round, EndCap = LineCap.Round };
 
             var minimize = MinimizeRect;
-            graphics.DrawLine(pen, minimize.Left + 13, minimize.Top + 21, minimize.Left + 27, minimize.Top + 21);
+            graphics.DrawLine(pen, minimize.Left + ScaleMetric(13), minimize.Top + ScaleMetric(21), minimize.Left + ScaleMetric(27), minimize.Top + ScaleMetric(21));
 
             var max = MaximizeRect;
             if (_maximized)
             {
-                graphics.DrawRectangle(pen, max.Left + 15, max.Top + 8, 11, 11);
-                graphics.DrawRectangle(pen, max.Left + 11, max.Top + 12, 11, 11);
+                graphics.DrawRectangle(pen, max.Left + ScaleMetric(15), max.Top + ScaleMetric(8), ScaleMetric(11), ScaleMetric(11));
+                graphics.DrawRectangle(pen, max.Left + ScaleMetric(11), max.Top + ScaleMetric(12), ScaleMetric(11), ScaleMetric(11));
             }
             else
             {
-                graphics.DrawRectangle(pen, max.Left + 13, max.Top + 9, 14, 14);
+                graphics.DrawRectangle(pen, max.Left + ScaleMetric(13), max.Top + ScaleMetric(9), ScaleMetric(14), ScaleMetric(14));
             }
 
             var close = CloseRect;
-            graphics.DrawLine(pen, close.Left + 13, close.Top + 10, close.Left + 27, close.Top + 24);
-            graphics.DrawLine(pen, close.Left + 27, close.Top + 10, close.Left + 13, close.Top + 24);
+            graphics.DrawLine(pen, close.Left + ScaleMetric(13), close.Top + ScaleMetric(10), close.Left + ScaleMetric(27), close.Top + ScaleMetric(24));
+            graphics.DrawLine(pen, close.Left + ScaleMetric(27), close.Top + ScaleMetric(10), close.Left + ScaleMetric(13), close.Top + ScaleMetric(24));
         }
 
-        private static void DrawActionBackground(Graphics graphics, Rectangle rect, bool hovered, bool close)
+        private void DrawActionBackground(Graphics graphics, Rectangle rect, bool hovered, bool close)
         {
             if (!hovered) return;
-            using var path = RoundedPath(rect, 7);
+            using var path = RoundedPath(rect, ScaleMetric(7));
             using var brush = new SolidBrush(close ? Color.FromArgb(229, 72, 77) : Color.FromArgb(217, 225, 233));
             graphics.FillPath(brush, path);
+        }
+
+        protected override void OnDpiChangedAfterParent(EventArgs e)
+        {
+            base.OnDpiChangedAfterParent(e);
+            Invalidate();
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
