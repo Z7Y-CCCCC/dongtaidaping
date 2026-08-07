@@ -78,6 +78,9 @@ async function main() {
         const beforePublish = await api('/api/config');
         assert.equal(beforePublish.response.ok, true, beforePublish.body.error);
         assert.equal(beforePublish.body.platform.widgets.some(widget => widget.id === testWidgetId), false, '未发布草稿污染了运行时');
+        assert.equal(JSON.stringify(beforePublish.body.platform).includes(testWidgetId), false, '运行时接口泄露了未发布草稿');
+        assert.equal(Object.hasOwn(beforePublish.body.platform.activeScene || {}, 'draft_json'), false, '运行时场景不应暴露 draft_json');
+        assert.equal(Object.hasOwn(beforePublish.body.platform.activeScene || {}, 'draft_revision'), false, '运行时场景不应暴露 draft_revision');
         assert.equal(beforePublish.body.platform.currentRelease.id, originalReleaseId);
 
         const published = await api('/api/platform/releases', {

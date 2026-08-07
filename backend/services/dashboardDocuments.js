@@ -281,16 +281,23 @@ async function loadDesignerState(db, sceneId = '') {
 
 function runtimePlatformPayload({ project, scene, document, release }) {
     const publishedScene = objectValue(document.scene, {});
+    const runtimeScene = scene ? {
+        id: scene.id,
+        project_id: scene.project_id,
+        name: publishedScene.name || scene.name,
+        scene_type: publishedScene.type || scene.scene_type,
+        is_active: !!scene.is_active,
+        sort_order: Number(scene.sort_order || 0),
+        created_at: scene.created_at,
+        updated_at: scene.updated_at,
+        published_release_id: release?.id || scene.published_release_id || null,
+        layout: objectValue(publishedScene.layout, {}),
+        camera: objectValue(publishedScene.camera, {}),
+        theme: { ...objectValue(publishedScene.theme, {}), ...objectValue(document.theme, {}) }
+    } : null;
     return {
         activeProject: project || null,
-        activeScene: scene ? {
-            ...scene,
-            name: publishedScene.name || scene.name,
-            scene_type: publishedScene.type || scene.scene_type,
-            layout: objectValue(publishedScene.layout, {}),
-            camera: objectValue(publishedScene.camera, {}),
-            theme: { ...objectValue(publishedScene.theme, {}), ...objectValue(document.theme, {}) }
-        } : null,
+        activeScene: runtimeScene,
         canvas: document.canvas,
         theme: document.theme,
         document,
