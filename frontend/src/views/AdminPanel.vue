@@ -266,7 +266,10 @@ const {
     databaseTestStatus,
     databaseSaving,
     databaseBackupBusy,
+    databaseBackupPolicySaving,
     databaseBackupMessage,
+    databaseBackupPolicy,
+    databaseBackupRetentionPresets,
     databaseBackupStatus,
     dataSourceConnections,
     dataSourceEditor,
@@ -296,10 +299,13 @@ const {
     chooseSiteBackupFile,
     restoreSiteBackupFromFile,
     loadDatabaseBackups,
+    selectDatabaseBackupRetention,
+    saveDatabaseBackupPolicy,
     createDatabaseBackup,
     restoreDatabaseBackup,
     downloadDatabaseBackup,
     formatBackupSize,
+    formatBackupTime,
     formatBackupInterval,
     testDatabaseConnection,
     saveDatabaseConnection,
@@ -7591,14 +7597,14 @@ const mainTabs = [
                                 <div class="database-backup-header">
                                     <div>
                                         <strong>数据库自动压缩备份（仅防断电或数据库损坏）</strong>
-                                        <p>可同时选择主业务库和保存的外部数据库连接；外部数据库始终以只读方式导出。</p>
+                                        <p>可同时选择主业务库和保存的外部数据库连接；外部库只读导出，主库保留时间在下方单独设置。</p>
                                     </div>
                                     <button type="button" class="btn" :disabled="dataSourceBackupBusy" @click="runSelectedDatabaseBackups()">立即备份已选</button>
                                 </div>
                                 <div class="database-auto-backup-controls">
                                     <label class="checkbox-line"><input v-model="dataSourceBackupConfig.autoEnabled" type="checkbox" /> 启用自动备份</label>
                                     <label>间隔（小时）<input v-model.number="dataSourceBackupConfig.intervalHours" type="number" min="1" max="168" class="input input-small" /></label>
-                                    <label>每个连接保留份数<input v-model.number="dataSourceBackupConfig.retention" type="number" min="1" max="100" class="input input-small" /></label>
+                                    <label>外部连接保留份数<input v-model.number="dataSourceBackupConfig.retention" type="number" min="1" max="100" class="input input-small" /></label>
                                     <button type="button" class="btn btn-small" :disabled="dataSourceBackupBusy" @click="saveDataSourceBackupConfiguration">保存自动备份</button>
                                 </div>
                                 <div class="database-backup-source-grid">
@@ -7617,6 +7623,63 @@ const mainTabs = [
                                         <p>{{ databaseBackupStatus.type === 'mysql' ? '使用一致性 mysqldump 并 gzip 压缩。' : '使用 SQLite 一致性文件备份。' }}退出程序前仍会额外生成一份安全备份。</p>
                                     </div>
                                     <button @click="runSelectedDatabaseBackups('primary')" class="btn" :disabled="databaseBackupBusy || dataSourceBackupBusy">立即备份主库</button>
+                                </div>
+                                <div class="database-retention-card">
+                                    <div class="database-retention-heading">
+                                        <div class="database-retention-icon" aria-hidden="true">
+                                            <svg viewBox="0 0 24 24">
+                                                <path d="M12 7v5l3 2" />
+                                                <circle cx="12" cy="12" r="8" />
+                                            </svg>
+                                        </div>
+                                        <div>
+                                            <strong>备份保留策略</strong>
+                                            <span>超过期限自动清理，至少保留最近一份有效备份。</span>
+                                        </div>
+                                        <em>当前 {{ databaseBackupStatus.retentionDays || 30 }} 天</em>
+                                    </div>
+                                    <div class="database-retention-controls">
+                                        <div class="database-retention-presets" aria-label="常用保留天数">
+                                            <button
+                                                v-for="days in databaseBackupRetentionPresets"
+                                                :key="days"
+                                                type="button"
+                                                :class="{ active: Number(databaseBackupPolicy.retentionDays) === days }"
+                                                :aria-pressed="Number(databaseBackupPolicy.retentionDays) === days"
+                                                @click="selectDatabaseBackupRetention(days)"
+                                            >
+                                                {{ days }} 天
+                                            </button>
+                                        </div>
+                                        <label class="database-retention-custom">
+                                            <span>自定义</span>
+                                            <span class="database-retention-input">
+                                                <input
+                                                    v-model.number="databaseBackupPolicy.retentionDays"
+                                                    type="number"
+                                                    :min="databaseBackupStatus.retentionDaysMin || 1"
+                                                    :max="databaseBackupStatus.retentionDaysMax || 3650"
+                                                    step="1"
+                                                    inputmode="numeric"
+                                                />
+                                                <em>天</em>
+                                            </span>
+                                        </label>
+                                        <button
+                                            type="button"
+                                            class="btn btn-primary database-retention-save"
+                                            :disabled="databaseBackupPolicySaving"
+                                            @click="saveDatabaseBackupPolicy"
+                                        >
+                                            {{ databaseBackupPolicySaving ? '保存中…' : '保存策略' }}
+                                        </button>
+                                    </div>
+                                    <div class="database-retention-stats">
+                                        <div><span>现有备份</span><strong>{{ databaseBackupStatus.backups.length }} 份</strong></div>
+                                        <div><span>占用空间</span><strong>{{ formatBackupSize(databaseBackupStatus.totalBackupBytes) }}</strong></div>
+                                        <div><span>最早备份</span><strong>{{ formatBackupTime(databaseBackupStatus.oldestBackup?.createdAt) }}</strong></div>
+                                        <div><span>最新备份</span><strong>{{ formatBackupTime(databaseBackupStatus.newestBackup?.createdAt) }}</strong></div>
+                                    </div>
                                 </div>
                                 <p v-if="databaseBackupStatus.lastBackupError" class="database-recovery-notice">
                                     最近一次自动备份失败：{{ databaseBackupStatus.lastBackupError.error }}
@@ -11584,6 +11647,32 @@ button:enabled:active {
 .database-backup-panel { margin-top: 22px; padding-top: 20px; border-top: 1px solid #e5e5e7; }
 .database-backup-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .database-backup-header p { margin: 6px 0 0; color: #6e6e73; font-size: 13px; line-height: 1.6; }
+.database-retention-card { margin-top: 16px; overflow: hidden; background: linear-gradient(180deg,#fafafa 0%,#f5f5f7 100%); border: 1px solid #dedee2; border-radius: 14px; box-shadow: 0 8px 24px #00000008; }
+.database-retention-heading { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 12px; padding: 14px 16px 12px; }
+.database-retention-icon { display: grid; place-items: center; width: 36px; height: 36px; color: #fff; background: #1d1d1f; border-radius: 10px; box-shadow: 0 4px 10px #0000001f; }
+.database-retention-icon svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.database-retention-heading > div:nth-child(2) { min-width: 0; }
+.database-retention-heading strong,.database-retention-heading span { display: block; }
+.database-retention-heading strong { color: #1d1d1f; font-size: 13px; }
+.database-retention-heading span { margin-top: 3px; color: #77777c; font-size: 11px; line-height: 1.45; }
+.database-retention-heading > em { padding: 5px 9px; color: #3a3a3c; background: #fff; border: 1px solid #dfdfe3; border-radius: 999px; font-size: 11px; font-style: normal; white-space: nowrap; }
+.database-retention-controls { display: grid; grid-template-columns: minmax(0,1fr) auto auto; align-items: end; gap: 12px; padding: 0 16px 14px; }
+.database-retention-presets { display: grid; grid-template-columns: repeat(5,minmax(58px,1fr)); gap: 3px; min-width: 0; padding: 3px; background: #e8e8eb; border-radius: 10px; }
+.database-retention-presets button { min-height: 34px; padding: 5px 8px; color: #636366; background: transparent; border: 0; border-radius: 8px; font: inherit; font-size: 11px; font-weight: 600; cursor: pointer; transition: color 150ms ease,background-color 150ms ease,box-shadow 150ms ease,transform 150ms ease; }
+.database-retention-presets button:hover { color: #1d1d1f; }
+.database-retention-presets button.active { color: #1d1d1f; background: #fff; box-shadow: 0 1px 4px #0000001a; transform: translateY(-1px); }
+.database-retention-custom { display: flex; flex-direction: column; gap: 5px; color: #6e6e73; font-size: 10px; font-weight: 500; }
+.database-retention-input { display: grid; grid-template-columns: 72px auto; align-items: center; min-height: 40px; overflow: hidden; background: #fff; border: 1px solid #d9d9de; border-radius: 9px; transition: border-color 150ms ease,box-shadow 150ms ease; }
+.database-retention-input:focus-within { border-color: #8e8e93; box-shadow: 0 0 0 3px #0000000d; }
+.database-retention-input input { width: 72px; height: 38px; padding: 0 4px 0 11px; color: #1d1d1f; background: transparent; border: 0; outline: 0; font: inherit; font-size: 13px; font-weight: 600; }
+.database-retention-input em { padding-right: 10px; color: #86868b; font-size: 11px; font-style: normal; }
+.database-retention-save { min-height: 40px; white-space: nowrap; }
+.database-retention-stats { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); border-top: 1px solid #e2e2e5; background: #fff; }
+.database-retention-stats > div { min-width: 0; padding: 11px 14px; border-right: 1px solid #ededee; }
+.database-retention-stats > div:last-child { border-right: 0; }
+.database-retention-stats span,.database-retention-stats strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.database-retention-stats span { color: #8e8e93; font-size: 10px; }
+.database-retention-stats strong { margin-top: 4px; color: #353537; font-size: 11px; font-weight: 600; }
 .database-recovery-notice { margin: 14px 0 0; padding: 10px 12px; background: #fff8e6; border-left: 3px solid #c68a00; color: #5c4300; font-size: 13px; }
 .database-local-only-notice { margin: 14px 0 0; padding: 10px 12px; background: #fff8e6; border-left: 3px solid #c68a00; color: #5c4300; font-size: 13px; line-height: 1.55; }
 .database-backup-message { margin: 12px 0 0; color: #515154; font-size: 13px; }
@@ -11720,6 +11809,11 @@ button:enabled:active {
     .model-spec-form {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+    .database-retention-controls { grid-template-columns: minmax(0,1fr) auto; }
+    .database-retention-presets { grid-column: 1 / -1; }
+    .database-retention-stats { grid-template-columns: repeat(2,minmax(0,1fr)); }
+    .database-retention-stats > div:nth-child(2) { border-right: 0; }
+    .database-retention-stats > div:nth-child(-n+2) { border-bottom: 1px solid #ededee; }
     .database-backup-row {
         grid-template-columns: minmax(220px, 1fr) auto auto;
     }
@@ -11744,6 +11838,12 @@ button:enabled:active {
 }
 
 @media (max-width: 900px) {
+    .database-retention-heading { grid-template-columns: auto minmax(0,1fr); }
+    .database-retention-heading > em { grid-column: 2; justify-self: start; }
+    .database-retention-controls { grid-template-columns: 1fr; }
+    .database-retention-presets { grid-column: auto; grid-template-columns: repeat(5,minmax(48px,1fr)); }
+    .database-retention-custom { width: 112px; }
+    .database-retention-save { justify-self: start; }
     .secondary-page-nav-item { min-height: 58px; }
     .admin-header { padding: 0 16px; }
     .admin-header h1 { font-size: 16px; }

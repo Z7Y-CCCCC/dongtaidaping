@@ -649,17 +649,34 @@ export function useSystemSettings({
     const databaseTestStatus = ref('')
     const databaseSaving = ref(false)
     const databaseBackupBusy = ref(false)
+    const databaseBackupPolicySaving = ref(false)
     const databaseBackupMessage = ref('')
+    const databaseBackupPolicy = reactive({ retentionDays: 30 })
+    const databaseBackupRetentionPresets = [7, 30, 90, 180, 365]
     const databaseBackupStatus = reactive({
         supported: false,
         automatic: false,
         intervalMs: 0,
         retention: 0,
+        retentionDays: 30,
+        retentionDaysMin: 1,
+        retentionDaysMax: 3650,
+        totalBackupBytes: 0,
+        expiredCount: 0,
+        newestBackup: null,
+        oldestBackup: null,
+        lastCleanup: null,
         directory: '',
         lastBackup: null,
         lastRecovery: null,
         backups: []
     })
+
+    function assignDatabaseBackupStatus(status = {}) {
+        Object.assign(databaseBackupStatus, status, { backups: status.backups || [] })
+        const retentionDays = Number(status.retentionDays)
+        if (Number.isFinite(retentionDays)) databaseBackupPolicy.retentionDays = retentionDays
+    }
     const siteBackupFileInput = ref(null)
     const siteBackupBusy = ref(false)
     const siteBackupMessage = ref('')
@@ -904,7 +921,7 @@ export function useSystemSettings({
             const result = await adminApi.restoreSiteBackup(file)
             if (result?.error || !result?.success) throw new Error(result?.error || '后端没有返回成功状态')
             Object.assign(siteBackupStatus, result.status || {}, { backups: result.status?.backups || [] })
-            Object.assign(databaseBackupStatus, result.databaseStatus || {}, { backups: result.databaseStatus?.backups || [] })
+            assignDatabaseBackupStatus(result.databaseStatus || {})
             await loadWorkshops()
             await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform()])
             ensureComposerSelection()
@@ -925,9 +942,39 @@ export function useSystemSettings({
     async function loadDatabaseBackups() {
         try {
             const status = await adminApi.getDatabaseBackups()
-            Object.assign(databaseBackupStatus, status, { backups: status.backups || [] })
+            assignDatabaseBackupStatus(status)
         } catch (e) {
             databaseBackupMessage.value = `备份状态读取失败：${e.message || e}`
+        }
+    }
+
+    function selectDatabaseBackupRetention(days) {
+        databaseBackupPolicy.retentionDays = Number(days)
+    }
+
+    async function saveDatabaseBackupPolicy() {
+        const minimum = Number(databaseBackupStatus.retentionDaysMin || 1)
+        const maximum = Number(databaseBackupStatus.retentionDaysMax || 3650)
+        const retentionDays = Number(databaseBackupPolicy.retentionDays)
+        if (!Number.isInteger(retentionDays) || retentionDays < minimum || retentionDays > maximum) {
+            databaseBackupMessage.value = `保留天数请输入 ${minimum}-${maximum} 之间的整数。`
+            return
+        }
+        databaseBackupPolicySaving.value = true
+        databaseBackupMessage.value = '正在保存保留策略并清理过期备份...'
+        try {
+            const result = await adminApi.saveDatabaseBackupPolicy({ retentionDays })
+            if (!result?.success) throw new Error(result?.error || '保存失败')
+            assignDatabaseBackupStatus(result.status || {})
+            const deletedCount = Number(result.cleanup?.deletedCount || 0)
+            const failedCount = Array.isArray(result.cleanup?.errors) ? result.cleanup.errors.length : 0
+            databaseBackupMessage.value = failedCount
+                ? `策略已保存，已清理 ${deletedCount} 份备份，另有 ${failedCount} 份清理失败。`
+                : (deletedCount ? `策略已保存，已自动清理 ${deletedCount} 份过期备份。` : '备份保留策略已保存。')
+        } catch (e) {
+            databaseBackupMessage.value = `保留策略保存失败：${e.message || e}`
+        } finally {
+            databaseBackupPolicySaving.value = false
         }
     }
 
@@ -936,7 +983,7 @@ export function useSystemSettings({
         databaseBackupMessage.value = '正在创建一致性备份...'
         try {
             const result = await adminApi.createDatabaseBackup()
-            Object.assign(databaseBackupStatus, result.status || {})
+            assignDatabaseBackupStatus(result.status || {})
             databaseBackupMessage.value = `备份完成：${result.backup?.filename || ''}`
         } catch (e) {
             databaseBackupMessage.value = `备份失败：${e.message || e}`
@@ -951,7 +998,7 @@ export function useSystemSettings({
         databaseBackupMessage.value = '正在校验并恢复备份...'
         try {
             const result = await adminApi.restoreDatabaseBackup(backup.filename)
-            Object.assign(databaseBackupStatus, result.status || {})
+            assignDatabaseBackupStatus(result.status || {})
             databaseBackupMessage.value = `已恢复：${backup.filename}`
             await Promise.all([loadSettings(), loadWorkshops(), loadLines(), loadDevices(), loadModels(), loadPlatform()])
         } catch (e) {
@@ -972,8 +1019,15 @@ export function useSystemSettings({
 
     function formatBackupSize(bytes) {
         const value = Number(bytes || 0)
+        if (value <= 0) return '0 KB'
+        if (value >= 1024 * 1024 * 1024) return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`
         if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`
         return `${(value / 1024 / 1024).toFixed(1)} MB`
+    }
+
+    function formatBackupTime(value) {
+        const date = new Date(value || '')
+        return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString()
     }
 
     function formatBackupInterval(milliseconds) {
@@ -1208,7 +1262,10 @@ export function useSystemSettings({
         databaseTestStatus,
         databaseSaving,
         databaseBackupBusy,
+        databaseBackupPolicySaving,
         databaseBackupMessage,
+        databaseBackupPolicy,
+        databaseBackupRetentionPresets,
         databaseBackupStatus,
         dataSourceConnections,
         dataSourceEditor,
@@ -1239,10 +1296,13 @@ export function useSystemSettings({
         chooseSiteBackupFile,
         restoreSiteBackupFromFile,
         loadDatabaseBackups,
+        selectDatabaseBackupRetention,
+        saveDatabaseBackupPolicy,
         createDatabaseBackup,
         restoreDatabaseBackup,
         downloadDatabaseBackup,
         formatBackupSize,
+        formatBackupTime,
         formatBackupInterval,
         testDatabaseConnection,
         saveDatabaseConnection,

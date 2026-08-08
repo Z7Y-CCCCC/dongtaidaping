@@ -36,9 +36,22 @@ const CONFIG_PATH = path.join(DATA_DIR, 'database-config.json');
 const BACKUP_DIR = path.resolve(process.env.DB_BACKUP_DIR || path.join(DATA_DIR, 'backups'));
 const RECOVERY_DIR = path.resolve(process.env.DB_RECOVERY_DIR || path.join(DATA_DIR, 'recovery'));
 const BACKUP_INTERVAL_MS = positiveInteger(process.env.DB_BACKUP_INTERVAL_MS, 6 * 60 * 60 * 1000);
-const BACKUP_RETENTION = positiveInteger(process.env.DB_BACKUP_RETENTION, 10);
+const BACKUP_RETENTION_DAYS_MIN = 1;
+const BACKUP_RETENTION_DAYS_MAX = 3650;
+const BACKUP_RETENTION_DAYS_DEFAULT = boundedInteger(
+    process.env.DB_BACKUP_RETENTION_DAYS,
+    30,
+    BACKUP_RETENTION_DAYS_MIN,
+    BACKUP_RETENTION_DAYS_MAX
+);
+// 兼容旧部署中的“保留份数”环境变量，同时把默认上限放宽；主清理策略改为按天数。
+const BACKUP_RETENTION = positiveInteger(process.env.DB_BACKUP_RETENTION, 1000);
 const BACKUP_MAX_TOTAL_BYTES = positiveInteger(process.env.DB_BACKUP_MAX_TOTAL_BYTES, 20 * 1024 * 1024 * 1024);
 const BACKUP_MIN_FREE_BYTES = positiveInteger(process.env.DB_BACKUP_MIN_FREE_BYTES, 512 * 1024 * 1024);
+const BACKUP_PRUNE_INTERVAL_MS = positiveInteger(process.env.DB_BACKUP_PRUNE_INTERVAL_MS, 6 * 60 * 60 * 1000);
+const BACKUP_ORPHAN_GRACE_MS = positiveInteger(process.env.DB_BACKUP_ORPHAN_GRACE_MS, 60 * 60 * 1000);
+const DAY_MS = 24 * 60 * 60 * 1000;
+const SQLITE_BACKUP_SIDECAR_SUFFIXES = ['-wal', '-shm', '-journal'];
 
 const DEFAULT_CONFIG = {
     type: 'mysql',
@@ -48,6 +61,7 @@ const DEFAULT_CONFIG = {
     password: 'root',
     database: 'dongtai_daping',
     filename: path.join(DATA_DIR, 'factory.db'),
+    backupRetentionDays: BACKUP_RETENTION_DAYS_DEFAULT,
     encrypt: false,
     trustServerCertificate: true
 };
@@ -66,10 +80,19 @@ let backupPromise;
 let lastBackup = null;
 let lastRecovery = null;
 let lastBackupError = null;
+let lastBackupCleanup = null;
+const protectedBackupFiles = new Set();
 
 function positiveInteger(value, fallback) {
     const parsed = Number(value);
     return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : fallback;
+}
+
+function boundedInteger(value, fallback, minimum, maximum) {
+    if (value === undefined || value === null || String(value).trim() === '') return fallback;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(maximum, Math.max(minimum, Math.round(parsed)));
 }
 
 function getMysql() {
@@ -178,6 +201,67 @@ function ensureBackupDiskSpace(directory) {
     }
 }
 
+function databaseBackupArtifactPaths(filename) {
+    const resolved = path.resolve(filename);
+    const lower = resolved.toLowerCase();
+    if (!lower.endsWith('.db') && !lower.includes('.db.')) return [resolved];
+    return [resolved, ...SQLITE_BACKUP_SIDECAR_SUFFIXES.map(suffix => `${resolved}${suffix}`)];
+}
+
+function removeDatabaseBackupArtifacts(filename) {
+    const artifacts = databaseBackupArtifactPaths(filename);
+    let bytes = 0;
+    const errors = [];
+    for (const artifact of artifacts) {
+        try {
+            if (fs.existsSync(artifact)) bytes += Number(fs.statSync(artifact).size || 0);
+        } catch (error) {
+            errors.push({ filename: path.basename(artifact), error: error.message });
+        }
+    }
+    for (const artifact of artifacts) {
+        try {
+            fs.rmSync(artifact, { force: true });
+        } catch (error) {
+            errors.push({ filename: path.basename(artifact), error: error.message });
+        }
+    }
+    return { bytes, errors, primaryExists: fs.existsSync(artifacts[0]) };
+}
+
+function pruneOrphanBackupArtifacts() {
+    ensureDirectory(BACKUP_DIR);
+    const now = Date.now();
+    let deletedCount = 0;
+    let deletedBytes = 0;
+    const errors = [];
+    const removedBases = new Set();
+    const entries = fs.readdirSync(BACKUP_DIR, { withFileTypes: true }).filter(entry => entry.isFile());
+    for (const entry of entries) {
+        const filename = entry.name;
+        const lower = filename.toLowerCase();
+        const isTemporary = /\.db\.[^.]+\.tmp$|\.sql\.gz\.[^.]+\.tmp$/i.test(filename);
+        const sidecarSuffix = SQLITE_BACKUP_SIDECAR_SUFFIXES.find(suffix => lower.endsWith(suffix));
+        if (!isTemporary && !sidecarSuffix) continue;
+        const fullPath = path.join(BACKUP_DIR, filename);
+        let ageMs = 0;
+        try { ageMs = now - fs.statSync(fullPath).mtimeMs; } catch (error) { continue; }
+        if (ageMs < BACKUP_ORPHAN_GRACE_MS) continue;
+        const basePath = isTemporary
+            ? fullPath
+            : fullPath.slice(0, -sidecarSuffix.length);
+        if (!isTemporary && fs.existsSync(basePath)) continue;
+        if (removedBases.has(basePath)) continue;
+        const removed = removeDatabaseBackupArtifacts(basePath);
+        if (removed.primaryExists) continue;
+        removedBases.add(basePath);
+        deletedCount += 1;
+        deletedBytes += removed.bytes;
+        errors.push(...removed.errors);
+    }
+    return { deletedCount, deletedBytes, errors };
+}
+
 function listDatabaseBackups({ validate = true } = {}) {
     ensureDirectory(BACKUP_DIR);
     return fs.readdirSync(BACKUP_DIR, { withFileTypes: true })
@@ -218,7 +302,7 @@ function latestRecoverySource() {
 }
 
 function removeSqliteSidecars(filename) {
-    for (const suffix of ['-wal', '-shm']) {
+    for (const suffix of SQLITE_BACKUP_SIDECAR_SUFFIXES) {
         try { fs.rmSync(`${filename}${suffix}`, { force: true }); } catch (error) { /* ignore */ }
     }
 }
@@ -229,12 +313,13 @@ function installSqliteCopy(source, destination) {
     fs.copyFileSync(source, temporary);
     const verification = verifySqliteFile(temporary);
     if (!verification.valid) {
-        fs.rmSync(temporary, { force: true });
+        removeDatabaseBackupArtifacts(temporary);
         throw new Error(`恢复源无效: ${verification.error}`);
     }
     removeSqliteSidecars(destination);
-    fs.rmSync(destination, { force: true });
+    removeDatabaseBackupArtifacts(destination);
     fs.renameSync(temporary, destination);
+    removeDatabaseBackupArtifacts(temporary);
 }
 
 function quarantineSqliteFiles(filename, label = 'corrupt') {
@@ -319,10 +404,11 @@ async function upgradeLegacyDemoDatabase(filename) {
     }
     const backupVerification = verifySqliteFile(temporaryBackup);
     if (!backupVerification.valid) {
-        fs.rmSync(temporaryBackup, { force: true });
+        removeDatabaseBackupArtifacts(temporaryBackup);
         throw new Error(`旧演示数据库备份校验失败: ${backupVerification.error}`);
     }
     fs.renameSync(temporaryBackup, backupPath);
+    removeDatabaseBackupArtifacts(temporaryBackup);
     installSqliteCopy(template, filename);
     const migration = {
         reason: 'legacy_demo_upgrade',
@@ -421,6 +507,7 @@ function loadDatabaseConfig() {
     if (process.env.MYSQL_PASSWORD || process.env.DB_PASSWORD) merged.password = process.env.MYSQL_PASSWORD || process.env.DB_PASSWORD;
     if (process.env.MYSQL_DATABASE || process.env.DB_NAME) merged.database = process.env.MYSQL_DATABASE || process.env.DB_NAME;
     if (process.env.SQLITE_FILE) merged.filename = process.env.SQLITE_FILE;
+    if (process.env.DB_BACKUP_RETENTION_DAYS) merged.backupRetentionDays = process.env.DB_BACKUP_RETENTION_DAYS;
     return normalizeConfig(merged);
 }
 
@@ -433,6 +520,12 @@ function normalizeConfig(config) {
         port: Number.isFinite(port) ? port : defaultPort(type),
         database: config.database || DEFAULT_CONFIG.database,
         filename: config.filename || DEFAULT_CONFIG.filename,
+        backupRetentionDays: boundedInteger(
+            config.backupRetentionDays,
+            BACKUP_RETENTION_DAYS_DEFAULT,
+            BACKUP_RETENTION_DAYS_MIN,
+            BACKUP_RETENTION_DAYS_MAX
+        ),
         encrypt: !!config.encrypt,
         trustServerCertificate: config.trustServerCertificate !== false
     };
@@ -463,6 +556,33 @@ function saveDatabaseConfig(input) {
     });
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), 'utf8');
     return publicDatabaseConfig(next);
+}
+
+function parseBackupRetentionDays(value) {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < BACKUP_RETENTION_DAYS_MIN || parsed > BACKUP_RETENTION_DAYS_MAX) {
+        throw new Error(`备份保留天数必须是 ${BACKUP_RETENTION_DAYS_MIN}-${BACKUP_RETENTION_DAYS_MAX} 之间的整数`);
+    }
+    return parsed;
+}
+
+async function saveDatabaseBackupPolicy(input = {}) {
+    if (backupPromise) await backupPromise;
+    const retentionDays = parseBackupRetentionDays(input.retentionDays ?? input.backupRetentionDays);
+    ensureDataDir();
+    const current = loadDatabaseConfig();
+    const next = normalizeConfig({ ...current, backupRetentionDays: retentionDays });
+    if (!['sqlite', 'mysql'].includes(dialectName(next))) {
+        throw new Error('当前数据库类型暂不支持本地文件备份保留策略');
+    }
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), 'utf8');
+    if (activeConfig) activeConfig = { ...activeConfig, backupRetentionDays: retentionDays };
+    const cleanup = pruneDatabaseBackups({ retentionDays, reason: 'policy-save' });
+    return {
+        config: { retentionDays },
+        cleanup,
+        status: getDatabaseBackupStatus()
+    };
 }
 
 function dialectName(config = activeConfig || loadDatabaseConfig()) {
@@ -666,19 +786,88 @@ async function reconnectDb() {
     return getDb();
 }
 
-function pruneDatabaseBackups() {
-    const backups = listDatabaseBackups({ validate: false });
-    for (const backup of backups.slice(BACKUP_RETENTION)) {
-        fs.rmSync(path.join(BACKUP_DIR, backup.filename), { force: true });
+function databaseBackupRetentionDays(config = activeConfig || loadDatabaseConfig()) {
+    return boundedInteger(
+        config?.backupRetentionDays,
+        BACKUP_RETENTION_DAYS_DEFAULT,
+        BACKUP_RETENTION_DAYS_MIN,
+        BACKUP_RETENTION_DAYS_MAX
+    );
+}
+
+function protectedDatabaseBackupNames(backups) {
+    const names = new Set(protectedBackupFiles);
+    if (backups[0]?.filename) names.add(backups[0].filename);
+    const latestValid = backups.find(backup => backup.valid === true);
+    if (latestValid?.filename) names.add(latestValid.filename);
+    return names;
+}
+
+function pruneDatabaseBackups(options = {}) {
+    const retentionDays = boundedInteger(
+        options.retentionDays,
+        databaseBackupRetentionDays(),
+        BACKUP_RETENTION_DAYS_MIN,
+        BACKUP_RETENTION_DAYS_MAX
+    );
+    const cutoffMs = Date.now() - retentionDays * DAY_MS;
+    const backups = listDatabaseBackups({ validate: true });
+    const protectedNames = protectedDatabaseBackupNames(backups);
+    const deletedNames = new Set();
+    const deleted = [];
+    const errors = [];
+
+    const remainingBackups = () => backups.filter(backup => !deletedNames.has(backup.filename));
+    const removeBackup = (backup, cause) => {
+        if (!backup || protectedNames.has(backup.filename) || deletedNames.has(backup.filename)) return false;
+        const removed = removeDatabaseBackupArtifacts(path.join(BACKUP_DIR, backup.filename));
+        if (!removed.primaryExists) {
+            deletedNames.add(backup.filename);
+            deleted.push({ filename: backup.filename, size: removed.bytes, cause });
+            errors.push(...removed.errors);
+            return true;
+        }
+        errors.push(...removed.errors, { filename: backup.filename, error: '主备份文件删除后仍存在' });
+        return false;
+    };
+
+    for (const backup of [...backups].reverse()) {
+        const createdAt = Date.parse(backup.createdAt);
+        if (Number.isFinite(createdAt) && createdAt < cutoffMs) removeBackup(backup, 'expired');
     }
 
-    const retained = listDatabaseBackups({ validate: false });
-    let totalBytes = retained.reduce((sum, backup) => sum + Number(backup.size || 0), 0);
-    for (const backup of retained.slice(1).reverse()) {
-        if (totalBytes <= BACKUP_MAX_TOTAL_BYTES) break;
-        fs.rmSync(path.join(BACKUP_DIR, backup.filename), { force: true });
-        totalBytes -= Number(backup.size || 0);
+    let retained = remainingBackups();
+    for (const backup of [...retained].reverse()) {
+        if (retained.length <= BACKUP_RETENTION) break;
+        if (removeBackup(backup, 'count-limit')) retained = remainingBackups();
     }
+
+    retained = remainingBackups();
+    let totalBytes = retained.reduce((sum, backup) => sum + Number(backup.size || 0), 0);
+    for (const backup of [...retained].reverse()) {
+        if (totalBytes <= BACKUP_MAX_TOTAL_BYTES) break;
+        if (removeBackup(backup, 'size-limit')) totalBytes -= Number(backup.size || 0);
+    }
+
+    const orphanCleanup = backupPromise ? { deletedCount: 0, deletedBytes: 0, errors: [] } : pruneOrphanBackupArtifacts();
+    const remaining = remainingBackups();
+    lastBackupCleanup = {
+        at: new Date().toISOString(),
+        reason: String(options.reason || 'automatic'),
+        retentionDays,
+        deletedCount: deleted.length,
+        deletedBytes: deleted.reduce((sum, backup) => sum + backup.size, 0),
+        orphanDeletedCount: orphanCleanup.deletedCount,
+        orphanDeletedBytes: orphanCleanup.deletedBytes,
+        remainingCount: remaining.length,
+        remainingBytes: remaining.reduce((sum, backup) => sum + Number(backup.size || 0), 0),
+        deleted,
+        errors: [...errors, ...orphanCleanup.errors]
+    };
+    if (errors.length) {
+        console.warn(`[DB] 有 ${errors.length} 个过期备份清理失败: ${errors.map(item => `${item.filename}: ${item.error}`).join('；')}`);
+    }
+    return lastBackupCleanup;
 }
 
 async function createDatabaseBackup(reason = 'manual') {
@@ -711,7 +900,7 @@ async function createDatabaseBackup(reason = 'manual') {
             }
             if (!verification.valid) throw new Error(verification.error);
             fs.renameSync(temporary, destination);
-            pruneDatabaseBackups();
+            pruneDatabaseBackups({ reason: `backup-${safeReason}` });
             lastBackup = {
                 ...backupDescriptor(destination, { valid: true }),
                 reason: safeReason
@@ -723,7 +912,7 @@ async function createDatabaseBackup(reason = 'manual') {
             lastBackupError = { at: new Date().toISOString(), reason: safeReason, error: error.message };
             throw error;
         } finally {
-            fs.rmSync(temporary, { force: true });
+            removeDatabaseBackupArtifacts(temporary);
         }
     })().finally(() => {
         backupPromise = null;
@@ -759,13 +948,13 @@ async function importDatabaseBackupFile(sourceFilename, reason = 'site-import') 
         const copiedVerification = isMysql ? await verifyMysqlDumpFile(temporary) : verifySqliteFile(temporary);
         if (!copiedVerification.valid) throw new Error(copiedVerification.error);
         fs.renameSync(temporary, destination);
-        pruneDatabaseBackups();
+        pruneDatabaseBackups({ reason: `import-${safeReason}` });
         return {
             ...backupDescriptor(destination, { valid: true }),
             reason: safeReason
         };
     } finally {
-        fs.rmSync(temporary, { force: true });
+        removeDatabaseBackupArtifacts(temporary);
     }
 }
 
@@ -818,50 +1007,56 @@ async function restoreMysqlDatabaseBackup(filename) {
 }
 
 async function restoreDatabaseBackup(filename) {
-    await getDb();
-    if (dialectName() === 'mysql') return restoreMysqlDatabaseBackup(filename);
-    if (dialectName() !== 'sqlite') throw new Error('文件恢复当前支持 SQLite 和 MySQL 数据库');
-
-    if (backupPromise) await backupPromise;
-    const source = resolveDatabaseBackupPath(filename);
-    const verification = verifySqliteFile(source);
-    if (!verification.valid) throw new Error(`备份完整性检查失败: ${verification.error}`);
-
-    const target = path.resolve(activeConfig.filename || DEFAULT_CONFIG.filename);
-    ensureDirectory(RECOVERY_DIR);
-    const restoreSource = path.join(RECOVERY_DIR, `restore-source-${timestampToken()}-${process.pid}.db`);
-    fs.rmSync(restoreSource, { force: true });
-
+    const protectedName = path.basename(String(filename || ''));
+    if (protectedName && protectedName === filename) protectedBackupFiles.add(protectedName);
     try {
-        // Keep the selected source outside the rotating backup directory. With a
-        // retention of 1, creating the rollback backup below would otherwise
-        // prune the very file we are about to restore.
-        fs.copyFileSync(source, restoreSource);
-        const copiedVerification = verifySqliteFile(restoreSource);
-        if (!copiedVerification.valid) throw new Error(`恢复源复制后校验失败: ${copiedVerification.error}`);
+        await getDb();
+        if (dialectName() === 'mysql') return await restoreMysqlDatabaseBackup(filename);
+        if (dialectName() !== 'sqlite') throw new Error('文件恢复当前支持 SQLite 和 MySQL 数据库');
 
-        const rollback = await createDatabaseBackup('before-restore');
-        await closeDb();
+        if (backupPromise) await backupPromise;
+        const source = resolveDatabaseBackupPath(filename);
+        const verification = verifySqliteFile(source);
+        if (!verification.valid) throw new Error(`备份完整性检查失败: ${verification.error}`);
+
+        const target = path.resolve(activeConfig.filename || DEFAULT_CONFIG.filename);
+        ensureDirectory(RECOVERY_DIR);
+        const restoreSource = path.join(RECOVERY_DIR, `restore-source-${timestampToken()}-${process.pid}.db`);
+        fs.rmSync(restoreSource, { force: true });
 
         try {
-            quarantineSqliteFiles(target, 'before-restore');
-            installSqliteCopy(restoreSource, target);
-            await getDb();
-            lastRecovery = {
-                reason: 'manual_restore',
-                sourceType: 'backup',
-                source: path.basename(source),
-                recoveredAt: new Date().toISOString()
-            };
-            return { success: true, recovery: lastRecovery, rollback };
-        } catch (error) {
+            // Keep the selected source outside the rotating backup directory. With a
+            // retention of 1, creating the rollback backup below would otherwise
+            // prune the very file we are about to restore.
+            fs.copyFileSync(source, restoreSource);
+            const copiedVerification = verifySqliteFile(restoreSource);
+            if (!copiedVerification.valid) throw new Error(`恢复源复制后校验失败: ${copiedVerification.error}`);
+
+            const rollback = await createDatabaseBackup('before-restore');
             await closeDb();
-            installSqliteCopy(path.join(BACKUP_DIR, rollback.filename), target);
-            await getDb();
-            throw error;
+
+            try {
+                quarantineSqliteFiles(target, 'before-restore');
+                installSqliteCopy(restoreSource, target);
+                await getDb();
+                lastRecovery = {
+                    reason: 'manual_restore',
+                    sourceType: 'backup',
+                    source: path.basename(source),
+                    recoveredAt: new Date().toISOString()
+                };
+                return { success: true, recovery: lastRecovery, rollback };
+            } catch (error) {
+                await closeDb();
+                installSqliteCopy(path.join(BACKUP_DIR, rollback.filename), target);
+                await getDb();
+                throw error;
+            }
+        } finally {
+            fs.rmSync(restoreSource, { force: true });
         }
     } finally {
-        fs.rmSync(restoreSource, { force: true });
+        if (protectedName) protectedBackupFiles.delete(protectedName);
     }
 }
 
@@ -870,20 +1065,38 @@ function getDatabaseBackupStatus() {
     const type = dialectName(config);
     const mysqlTools = type === 'mysql' ? resolveMysqlTools() : null;
     const supported = type === 'sqlite' || (type === 'mysql' && mysqlTools.available);
+    const retentionDays = databaseBackupRetentionDays(config);
+    const backups = supported ? listDatabaseBackups({ validate: true }) : [];
+    const totalBackupBytes = backups.reduce((sum, backup) => sum + Number(backup.size || 0), 0);
+    const cutoffMs = Date.now() - retentionDays * DAY_MS;
+    const protectedNames = protectedDatabaseBackupNames(backups);
+    const expiredCount = backups.filter(backup => {
+        const createdAt = Date.parse(backup.createdAt);
+        return Number.isFinite(createdAt) && createdAt < cutoffMs && !protectedNames.has(backup.filename);
+    }).length;
     return {
         type,
         supported,
         automatic: supported,
         intervalMs: BACKUP_INTERVAL_MS,
         retention: BACKUP_RETENTION,
+        retentionDays,
+        retentionDaysMin: BACKUP_RETENTION_DAYS_MIN,
+        retentionDaysMax: BACKUP_RETENTION_DAYS_MAX,
+        cleanupIntervalMs: BACKUP_PRUNE_INTERVAL_MS,
         maxTotalBytes: BACKUP_MAX_TOTAL_BYTES,
+        totalBackupBytes,
+        expiredCount,
+        newestBackup: backups[0] || null,
+        oldestBackup: backups[backups.length - 1] || null,
         directory: BACKUP_DIR,
         lastBackup,
         lastBackupError,
+        lastCleanup: lastBackupCleanup,
         lastRecovery,
         toolAvailable: type !== 'mysql' || mysqlTools.available,
         toolError: type === 'mysql' ? mysqlTools.error : null,
-        backups: supported ? listDatabaseBackups({ validate: true }) : []
+        backups
     };
 }
 
@@ -891,8 +1104,19 @@ async function startDatabaseMaintenance() {
     await getDb();
     if (backupTimer) clearInterval(backupTimer);
     backupTimer = null;
+    if (dialectName() === 'sqlite' || dialectName() === 'mysql') {
+        pruneDatabaseBackups({ reason: 'startup' });
+        backupTimer = setInterval(() => {
+            try {
+                pruneDatabaseBackups({ reason: 'scheduled' });
+            } catch (error) {
+                console.error('[DB] 定时清理过期备份失败:', error.message);
+            }
+        }, BACKUP_PRUNE_INTERVAL_MS);
+        backupTimer.unref?.();
+    }
     // 自动备份的连接选择、周期和外部只读库统一由 dataSources 服务调度。
-    // 这里仍保留手工备份、恢复以及退出前一致性备份能力。
+    // 这里仍保留手工备份、恢复、退出前一致性备份，以及过期文件清理能力。
     return getDatabaseBackupStatus();
 }
 
@@ -2189,6 +2413,7 @@ module.exports = {
     importDatabaseBackupFile,
     restoreDatabaseBackup,
     getDatabaseBackupStatus,
+    saveDatabaseBackupPolicy,
     resolveDatabaseBackupPath,
     startDatabaseMaintenance,
     stopDatabaseMaintenance,

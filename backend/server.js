@@ -18,6 +18,7 @@ const {
     createDatabaseBackup,
     restoreDatabaseBackup,
     getDatabaseBackupStatus,
+    saveDatabaseBackupPolicy,
     resolveDatabaseBackupPath,
     startDatabaseMaintenance,
     stopDatabaseMaintenance,
@@ -426,6 +427,15 @@ app.get('/api/database/backups', (req, res) => {
         res.json(getDatabaseBackupStatus());
     } catch (e) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+app.put('/api/database/backups/config', backupOperationLimiter, async (req, res) => {
+    try {
+        const result = await saveDatabaseBackupPolicy(req.body || {});
+        res.json({ success: true, ...result });
+    } catch (e) {
+        res.status(400).json({ success: false, error: e.message });
     }
 });
 

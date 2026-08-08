@@ -264,6 +264,7 @@ export const adminApi = {
         return readApiJson(await fetch(`${API_BASE}/data-sources/runtime-values${suffix}`), '读取外部数据库数据失败')
     },
     async getDatabaseBackups() { return readApiJson(await fetch(`${API_BASE}/database/backups`), '读取数据库备份失败') },
+    async saveDatabaseBackupPolicy(config) { return readApiJson(await fetch(`${API_BASE}/database/backups/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(config) }), '保存备份保留策略失败') },
     async createDatabaseBackup() { return readApiJson(await fetch(`${API_BASE}/database/backups`, { method: 'POST' }), '创建数据库备份失败') },
     async restoreDatabaseBackup(filename) { return readApiJson(await fetch(`${API_BASE}/database/backups/${pathId(filename)}/restore`, { method: 'POST' }), '恢复数据库备份失败') },
     databaseBackupDownloadUrl(filename) { return `${API_BASE}/database/backups/${pathId(filename)}/download` },
