@@ -1784,6 +1784,7 @@ async function seedDefaults() {
         ['simulation_interval_ms', '2000'],
         ['realtime_stale_ms', '6000'],
         ['display_mode', 'industrial_twin'],
+        ['native_quality_profile', 'auto'],
         ['render_profile', 'balanced'],
         ['render_target_fps', '45'],
         ['render_scale', '1'],

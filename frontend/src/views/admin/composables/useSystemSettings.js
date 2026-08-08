@@ -572,6 +572,9 @@ export function useSystemSettings({
         delete loadedSettings.native_dashboard_config
         for (const key of Object.keys(settings)) delete settings[key]
         Object.assign(settings, defaultSettings, loadedSettings)
+        if (!['auto', 'integrated_gpu', 'balanced', 'showcase'].includes(String(settings.native_quality_profile))) {
+            settings.native_quality_profile = 'auto'
+        }
         settings.render_target_fps = Number(settings.render_target_fps || 45)
         settings.render_scale = Number(settings.render_scale || 1)
         settings.render_label_fps = Number(settings.render_label_fps || 12)

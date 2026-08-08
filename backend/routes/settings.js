@@ -6,8 +6,16 @@ const JSON_OBJECT_SETTING_LABELS = {
     native_dashboard_config: 'Unity 大屏组件配置',
     native_environment_config: 'Unity 场景与光效配置'
 };
+const NATIVE_QUALITY_PROFILES = new Set(['auto', 'integrated_gpu', 'balanced', 'showcase']);
 
 function normalizeSettingValue(key, value) {
+    if (key === 'native_quality_profile') {
+        const profile = String(value ?? '').trim().toLowerCase();
+        if (!NATIVE_QUALITY_PROFILES.has(profile)) {
+            throw new Error('Unity 画质档位无效，只能选择自动识别、核显稳定档、均衡专业档或展示高画质档');
+        }
+        return profile;
+    }
     const label = JSON_OBJECT_SETTING_LABELS[key];
     if (!label) return String(value);
 

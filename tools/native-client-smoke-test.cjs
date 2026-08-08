@@ -58,6 +58,29 @@ async function waitForUnityLiveConfiguration(previousCount, timeoutMs = 15000) {
     return fs.existsSync(unityLog) ? fs.readFileSync(unityLog, 'utf8') : '';
 }
 
+async function waitForUnityQuality(profile, previousCount, timeoutMs = 15000) {
+    const escaped = String(profile).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`\\[NativeQuality\\] Applied ${escaped}\\b`, 'g');
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const text = fs.existsSync(unityLog) ? fs.readFileSync(unityLog, 'utf8') : '';
+        if ((text.match(pattern) || []).length > previousCount) return text;
+        await wait(250);
+    }
+    return fs.existsSync(unityLog) ? fs.readFileSync(unityLog, 'utf8') : '';
+}
+
+async function waitForUnityAnyQuality(previousCount, timeoutMs = 15000) {
+    const pattern = /\[NativeQuality\] Applied (integrated_gpu|balanced|showcase)\b/g;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const text = fs.existsSync(unityLog) ? fs.readFileSync(unityLog, 'utf8') : '';
+        if ((text.match(pattern) || []).length > previousCount) return text;
+        await wait(250);
+    }
+    return fs.existsSync(unityLog) ? fs.readFileSync(unityLog, 'utf8') : '';
+}
+
 function terminate(child) {
     if (!child || child.exitCode !== null || child.killed) return;
     try { child.kill(); } catch (error) { /* ignore */ }
@@ -76,6 +99,7 @@ async function main() {
     let backend;
     let unity;
     let originalDashboardConfig;
+    let originalQualityProfile;
     try {
         const databaseType = process.env.NATIVE_SMOKE_DB_TYPE || 'mysql';
         backend = spawn(process.execPath, ['server.js'], {
@@ -155,7 +179,27 @@ async function main() {
         ) || '';
         const settings = await fetch(`${origin}/api/settings`).then(response => response.json());
         originalDashboardConfig = settings.native_dashboard_config || '{}';
+        originalQualityProfile = settings.native_quality_profile || 'auto';
         const dashboardConfig = JSON.parse(originalDashboardConfig);
+
+        const qualityApplicationsBefore = (unityText.match(/\[NativeQuality\] Applied (integrated_gpu|balanced|showcase)\b/g) || []).length;
+        const integratedApplicationsBefore = (unityText.match(/\[NativeQuality\] Applied integrated_gpu\b/g) || []).length;
+        await fetch(`${origin}/api/settings`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ native_quality_profile: 'integrated_gpu' })
+        });
+        unityText = await waitForUnityQuality('integrated_gpu', integratedApplicationsBefore);
+        const integratedQualityApplied = (unityText.match(/\[NativeQuality\] Applied integrated_gpu\b/g) || []).length > integratedApplicationsBefore;
+        const qualityApplicationsAfterIntegrated = (unityText.match(/\[NativeQuality\] Applied (integrated_gpu|balanced|showcase)\b/g) || []).length;
+        await fetch(`${origin}/api/settings`, {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ native_quality_profile: 'auto' })
+        });
+        unityText = await waitForUnityAnyQuality(qualityApplicationsAfterIntegrated);
+        const automaticQualityApplied = (unityText.match(/\[NativeQuality\] Applied (integrated_gpu|balanced|showcase)\b/g) || []).length > qualityApplicationsAfterIntegrated;
+
         const previousLiveUpdates = (unityText.match(/\[FactoryRuntime\] Dashboard configuration updated live/g) || []).length;
         await fetch(`${origin}/api/settings`, {
             method: 'PUT',
@@ -177,6 +221,8 @@ async function main() {
                 && modelResults.every(model => model.status === 200 && model.bytes > 0)
                 && loadedModels.length === deviceModels.length
                 && Boolean(readyLine)
+                && integratedQualityApplied
+                && automaticQualityApplied
                 && liveConfigurationApplied
                 && !usedFallback
                 && runtimeExceptions.length === 0,
@@ -187,6 +233,8 @@ async function main() {
             modelResults,
             loadedModels,
             readyLine,
+            integratedQualityApplied,
+            automaticQualityApplied,
             liveConfigurationApplied,
             usedFallback,
             runtimeExceptionCount: runtimeExceptions.length,
@@ -201,6 +249,15 @@ async function main() {
                     method: 'PUT',
                     headers: { 'content-type': 'application/json' },
                     body: JSON.stringify({ native_dashboard_config: originalDashboardConfig })
+                });
+            } catch (error) { /* best effort restore */ }
+        }
+        if (backend && originalQualityProfile !== undefined) {
+            try {
+                await fetch(`${origin}/api/settings`, {
+                    method: 'PUT',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ native_quality_profile: originalQualityProfile })
                 });
             } catch (error) { /* best effort restore */ }
         }

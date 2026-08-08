@@ -46,12 +46,13 @@ namespace HeatTreatment.DigitalTwin.Rendering
             _settings = settings ?? new NativeClientSettings();
             _hotkeysEnabled = _settings.enableQualityHotkeys;
             var requested = _settings.qualityProfile;
-            if (string.Equals(requested, "auto", StringComparison.OrdinalIgnoreCase))
-            {
-                var persisted = ReadPersistedProfile();
-                requested = string.IsNullOrWhiteSpace(persisted) ? ToConfigName(DetectProfile()) : persisted;
-            }
-            Apply(Parse(requested), false);
+            if (string.Equals(requested, "auto", StringComparison.OrdinalIgnoreCase)) ApplyAuto(false);
+            else Apply(Parse(requested), false);
+        }
+
+        public void ApplyAuto(bool persist = false)
+        {
+            Apply(DetectProfile(), persist);
         }
 
         public void Apply(NativeQualityProfile profile, bool persist = true)
@@ -109,16 +110,21 @@ namespace HeatTreatment.DigitalTwin.Rendering
 
         public void Apply(string profile, bool persist = true)
         {
-            Apply(string.Equals(profile, "auto", StringComparison.OrdinalIgnoreCase) ? DetectProfile() : Parse(profile), persist);
+            if (string.Equals(profile, "auto", StringComparison.OrdinalIgnoreCase))
+            {
+                ApplyAuto(persist);
+                return;
+            }
+            Apply(Parse(profile), persist);
         }
 
         private void Update()
         {
             if (!_hotkeysEnabled) return;
-            if (Input.GetKeyDown(KeyCode.F1)) Apply(NativeQualityProfile.IntegratedGpu);
-            else if (Input.GetKeyDown(KeyCode.F2)) Apply(NativeQualityProfile.Balanced);
-            else if (Input.GetKeyDown(KeyCode.F3)) Apply(NativeQualityProfile.Showcase);
-            else if (Input.GetKeyDown(KeyCode.F4)) Apply(DetectProfile());
+            if (Input.GetKeyDown(KeyCode.F1)) Apply(NativeQualityProfile.IntegratedGpu, false);
+            else if (Input.GetKeyDown(KeyCode.F2)) Apply(NativeQualityProfile.Balanced, false);
+            else if (Input.GetKeyDown(KeyCode.F3)) Apply(NativeQualityProfile.Showcase, false);
+            else if (Input.GetKeyDown(KeyCode.F4)) ApplyAuto(false);
         }
 
         private static NativeQualityProfile DetectProfile()
@@ -211,12 +217,6 @@ namespace HeatTreatment.DigitalTwin.Rendering
         }
 
         private static string ProfilePath => Path.Combine(Application.persistentDataPath, "native-quality-profile.txt");
-
-        private static string ReadPersistedProfile()
-        {
-            try { return File.Exists(ProfilePath) ? File.ReadAllText(ProfilePath).Trim() : string.Empty; }
-            catch { return string.Empty; }
-        }
 
         private static void PersistProfile(NativeQualityProfile profile)
         {

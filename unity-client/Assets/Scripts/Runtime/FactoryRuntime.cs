@@ -191,14 +191,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _factoryRoot = root.transform;
             _dashboard.BeginFactory(config);
 
-            if (config.Settings != null
-                && config.Settings.TryGetValue("native_quality_profile", out var backendQuality)
-                && !string.IsNullOrWhiteSpace(backendQuality)
-                && !string.Equals(backendQuality, "auto", StringComparison.OrdinalIgnoreCase)
-                && string.Equals(_settings.qualityProfile, "auto", StringComparison.OrdinalIgnoreCase))
-            {
-                _quality.Apply(backendQuality, false);
-            }
+            ApplyBackendQuality(config.Settings);
             _environment.ApplySettings(config.Settings);
 
             var placements = CreateHierarchy(config, _factoryRoot);
@@ -907,15 +900,28 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _dashboard.ApplySettings(merged);
             _environment.ApplySettings(merged);
 
-            if (merged.TryGetValue("native_quality_profile", out var qualityProfile)
-                && !string.IsNullOrWhiteSpace(qualityProfile)
-                && !string.Equals(qualityProfile, "auto", StringComparison.OrdinalIgnoreCase)
-                && string.Equals(_settings.qualityProfile, "auto", StringComparison.OrdinalIgnoreCase))
-            {
-                _quality.Apply(qualityProfile, false);
-            }
+            if (changedSettings.Property("native_quality_profile") != null) ApplyBackendQuality(merged);
             _diagnostics.Activity = "Dashboard configuration updated live";
             Debug.Log("[FactoryRuntime] Dashboard configuration updated live");
+        }
+
+        private void ApplyBackendQuality(IReadOnlyDictionary<string, string> settings)
+        {
+            if (_quality == null || !string.Equals(_settings?.qualityProfile, "auto", StringComparison.OrdinalIgnoreCase)) return;
+
+            var qualityProfile = "auto";
+            if (settings != null && settings.TryGetValue("native_quality_profile", out var configured))
+            {
+                qualityProfile = string.IsNullOrWhiteSpace(configured) ? "auto" : configured.Trim();
+            }
+
+            if (string.Equals(qualityProfile, "auto", StringComparison.OrdinalIgnoreCase))
+            {
+                _quality.ApplyAuto(false);
+                return;
+            }
+
+            _quality.Apply(qualityProfile, false);
         }
 
         private void OnConnectionStateChanged(string state)
