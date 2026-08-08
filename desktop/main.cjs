@@ -207,6 +207,18 @@ function startDesktopControlServer() {
             return;
         }
 
+        if (request.method === 'POST' && (pathname === '/prepare-cast' || pathname === '/restore-cast')) {
+            const command = pathname === '/prepare-cast' ? 'prepare_cast' : 'restore_cast';
+            sendNativeHostCommandWithRetry(command).then(success => {
+                response.writeHead(success ? 202 : 503, { 'content-type': 'application/json; charset=utf-8' });
+                response.end(JSON.stringify({ success, command }));
+            }).catch(error => {
+                response.writeHead(503, { 'content-type': 'application/json; charset=utf-8' });
+                response.end(JSON.stringify({ success: false, error: error.message }));
+            });
+            return;
+        }
+
         if (request.method === 'POST' && pathname === '/minimize-to-tray') {
             response.writeHead(202, { 'content-type': 'application/json; charset=utf-8' });
             response.end(JSON.stringify({ success: true }));
@@ -240,6 +252,52 @@ function startDesktopControlServer() {
             resolve(desktopControlOrigin);
         });
     });
+}
+
+function nativeHostPipePath() {
+    return nativeProcess?.pid
+        ? `\\\\.\\pipe\\HeatTreatmentAdminHost_${nativeProcess.pid}`
+        : '';
+}
+
+function sendNativeHostCommand(command, timeout = 1200) {
+    const pipePath = nativeHostPipePath();
+    if (!pipePath) return Promise.resolve(false);
+    return new Promise(resolve => {
+        let settled = false;
+        const finish = value => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+        };
+        let socket;
+        try {
+            socket = net.createConnection(pipePath);
+        } catch (error) {
+            finish(false);
+            return;
+        }
+        socket.setTimeout(timeout);
+        socket.once('connect', () => {
+            // 等待命令真正写入管道后再向后端确认，避免只连上管道但宿主尚未
+            // 收到换行结尾的命令时就误报成功。
+            socket.end(`${command}\n`, 'utf8', () => finish(true));
+        });
+        socket.once('timeout', () => {
+            try { socket.destroy(); } catch (error) { /* ignore */ }
+            finish(false);
+        });
+        socket.once('error', () => finish(false));
+        socket.once('close', () => finish(false));
+    });
+}
+
+async function sendNativeHostCommandWithRetry(command) {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+        if (await sendNativeHostCommand(command)) return true;
+        await new Promise(resolve => setTimeout(resolve, 120));
+    }
+    return false;
 }
 
 function stopDesktopControlServer() {
@@ -674,6 +732,9 @@ async function startBackend(port, writable) {
         const wasCurrent = backendProcess === child;
         if (wasCurrent) backendProcess = null;
         if (wasCurrent) closeBackendLogStreams();
+        // 后端在投屏期间崩溃时，Node 守护进程来不及执行 stop()；由桌面
+        // 宿主兜底把 AdminHost 从“纯展示态”恢复，避免壳长期保持隐藏。
+        if (wasCurrent) sendNativeHostCommandWithRetry('restore_cast').catch(() => {});
         if (!isQuitting && wasCurrent) {
             const error = new Error(`本地数据服务异常退出（代码 ${code ?? 'null'}，信号 ${signal || 'none'}）`);
             logDesktopError('backend-exit', error);
@@ -782,7 +843,7 @@ function minimizeApplicationToTray() {
     try {
         tray.displayBalloon({
             title: APP_NAME,
-            content: '程序仍在后台运行。双击右下角托盘图标可恢复 Unity 实时大屏。',
+            content: '程序仍在后台运行。双击右下角托盘图标可打开软件。',
             iconType: 'info'
         });
     } catch (error) {
@@ -794,30 +855,11 @@ function updateTrayMenu() {
     if (!tray) return;
     tray.setContextMenu(Menu.buildFromTemplate([
         {
-            label: '显示 Unity 实时大屏',
+            label: '打开软件',
             click: showNativeDashboard
         },
         {
-            label: '打开后台管理',
-            click: showNativeAdminPanel
-        },
-        {
-            label: nativeProcess ? '重启 Unity 原生大屏' : '启动 Unity 原生大屏',
-            click: restartNativeClient
-        },
-        {
-            label: '用默认浏览器打开后台',
-            click: () => {
-                if (applicationOrigin) shell.openExternal(`${applicationOrigin}/admin`);
-            }
-        },
-        {
-            label: '打开现场数据目录',
-            click: () => shell.openPath(app.getPath('userData'))
-        },
-        { type: 'separator' },
-        {
-            label: '退出整套软件',
+            label: '退出',
             click: () => app.quit()
         }
     ]));

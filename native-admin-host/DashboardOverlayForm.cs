@@ -31,6 +31,7 @@ internal sealed class DashboardOverlayForm : Form
     private bool _attached;
     private bool _initialized;
     private bool _visibleRequested;
+    private bool _presentationMode;
 
     public DashboardOverlayForm(HostOptions options)
     {
@@ -101,12 +102,28 @@ internal sealed class DashboardOverlayForm : Form
         PostHostState();
     }
 
+    /// <summary>
+    /// 投屏时隐藏 AdminHost 顶部页签，透明数据层需要随之扩展到 Unity
+    /// 客户区的最上方；停止投屏后恢复正常的嵌入布局。
+    /// </summary>
+    public void SetPresentationMode(bool enabled)
+    {
+        if (_presentationMode == enabled) return;
+        _presentationMode = enabled;
+        _lastParentClientSize = Size.Empty;
+        _lastChromeHeight = -1;
+        UpdateParentBounds(force: true);
+        PostHostState();
+    }
+
     public void UpdateParentBounds(bool force = false)
     {
         if (!_attached || _parentHandle == IntPtr.Zero || !NativeMethods.IsWindow(_parentHandle)) return;
         if (!NativeMethods.GetClientRect(_parentHandle, out var client)) return;
         var clientSize = new Size(Math.Max(1, client.Width), Math.Max(1, client.Height));
-        var chromeHeight = DashboardChromeForm.GetChromeHeightPixels(_parentHandle);
+        var chromeHeight = _presentationMode
+            ? 0
+            : DashboardChromeForm.GetChromeHeightPixels(_parentHandle);
         ApplyDpiCompensatedZoom();
         if (!force && clientSize == _lastParentClientSize && chromeHeight == _lastChromeHeight) return;
         _lastParentClientSize = clientSize;
@@ -349,7 +366,8 @@ internal sealed class DashboardOverlayForm : Form
                 width = ClientSize.Width,
                 height = ClientSize.Height,
                 dpi = _lastDpi,
-                zoomFactor = _webView.ZoomFactor
+                zoomFactor = _webView.ZoomFactor,
+                presentationMode = _presentationMode
             }));
         }
         catch

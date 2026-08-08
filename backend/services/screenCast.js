@@ -5,9 +5,10 @@
  * 把大屏画面实时编码成视频流，再把流地址交给电视。本服务负责：
  *   1. 找到可用的 ffmpeg；
  *   2. 起一个只在局域网内可访问的 HTTP 流服务（/cast/<token>/live.ts）；
- *   3. 将 Unity 窗口切回实时大屏，并读取它在桌面的物理像素范围；
- *   4. 电视来拉流时，为它单独拉起一路 ffmpeg（桌面捕获后只裁剪 Unity 区域），断开即回收；
- *   5. 通过 AVTransport 让电视开始/停止播放。
+ *   3. 将 Unity 窗口切回实时大屏，并把后台宿主的顶栏切换到“展示模式”；
+ *   4. 电视来拉流时，为它单独拉起一路 ffmpeg（只捕获 Unity 客户区，避免顶栏、任务栏和输入法浮层），断开即回收；
+ *   5. 启动独立的 Windows 窗口隔离守护，持续处理投屏期间新出现的置顶窗口；后端异常退出时守护也会自动恢复窗口；
+ *   6. 通过 AVTransport 让电视开始/停止播放。
  *
  * 正式安装包内置固定版本的 LGPL FFmpeg；开发环境未准备资源时会明确提示。
  */
@@ -24,6 +25,7 @@ const { ipv4ToLong, isPrivateIpv4, listLanIpv4Interfaces } = require('../utils/l
 const DEFAULT_STREAM_PORT = 8788;
 const STREAM_TITLE = '热处理数字孪生大屏';
 const DEFAULT_WINDOW_TITLE = 'Heat Treatment Digital Twin';
+const DASHBOARD_CHROME_HEIGHT = 46;
 const WINDOW_BOUNDS_SCRIPT = `
 $ProgressPreference = 'SilentlyContinue'
 Add-Type -TypeDefinition @"
@@ -32,10 +34,14 @@ using System.Runtime.InteropServices;
 public static class CastWindowProbe {
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr handle, out RECT rect);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X; public int Y; }
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr handle, out RECT rect);
+    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr handle, ref POINT point);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr handle);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr handle, uint command);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr handle);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr handle);
     [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
 }
@@ -50,22 +56,308 @@ if ([CastWindowProbe]::IsIconic($target.MainWindowHandle)) {
 }
 [void][CastWindowProbe]::SetForegroundWindow($target.MainWindowHandle)
 Start-Sleep -Milliseconds 220
-$rect = New-Object CastWindowProbe+RECT
-if (-not [CastWindowProbe]::GetWindowRect($target.MainWindowHandle, [ref]$rect)) { exit 3 }
+$client = New-Object CastWindowProbe+RECT
+if (-not [CastWindowProbe]::GetClientRect($target.MainWindowHandle, [ref]$client)) { exit 3 }
+$origin = New-Object CastWindowProbe+POINT
+if (-not [CastWindowProbe]::ClientToScreen($target.MainWindowHandle, [ref]$origin)) { exit 3 }
 $virtualLeft = [CastWindowProbe]::GetSystemMetrics(76)
 $virtualTop = [CastWindowProbe]::GetSystemMetrics(77)
 $virtualRight = $virtualLeft + [CastWindowProbe]::GetSystemMetrics(78)
 $virtualBottom = $virtualTop + [CastWindowProbe]::GetSystemMetrics(79)
-$left = [Math]::Max($rect.Left, $virtualLeft)
-$top = [Math]::Max($rect.Top, $virtualTop)
-$right = [Math]::Min($rect.Right, $virtualRight)
-$bottom = [Math]::Min($rect.Bottom, $virtualBottom)
+$clientRight = $origin.X + $client.Right
+$clientBottom = $origin.Y + $client.Bottom
+$left = [Math]::Max($origin.X, $virtualLeft)
+$top = [Math]::Max($origin.Y, $virtualTop)
+$right = [Math]::Min($clientRight, $virtualRight)
+$bottom = [Math]::Min($clientBottom, $virtualBottom)
 $width = $right - $left
 $height = $bottom - $top
 if ($width -lt 64 -or $height -lt 64) { exit 4 }
-[Console]::Out.Write(("{0},{1},{2},{3}" -f $left,$top,$width,$height))
+$dpi = [CastWindowProbe]::GetDpiForWindow($target.MainWindowHandle)
+if ($dpi -lt 96) { $dpi = 96 }
+$chromeHeight = [Math]::Round(${DASHBOARD_CHROME_HEIGHT} * $dpi / 96)
+[Console]::Out.Write(("{0},{1},{2},{3},{4},{5},{6}" -f $left,$top,$width,$height,$chromeHeight,$target.MainWindowHandle.ToInt64(),$target.Id))
 `;
 const WINDOW_BOUNDS_SCRIPT_BASE64 = Buffer.from(WINDOW_BOUNDS_SCRIPT, 'utf16le').toString('base64');
+// gdigrab 只能捕获桌面像素，不能像浏览器那样天然隔离其它窗口。
+// 投屏时临时隔离“捕获区域上方”的所有顶层窗口（输入法、通知、其它软件、任务栏等），
+// 停止投屏后按原来的显示状态恢复。窗口只隐藏，不结束进程，也不改系统输入法配置。
+const WINDOW_ISOLATION_SCRIPT = `
+$ProgressPreference = 'SilentlyContinue'
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+public static class CastWindowIsolation {
+    private sealed class HiddenWindowRecord {
+        public long Handle;
+        public int RestoreCommand;
+        public uint ProcessId;
+    }
+
+    public delegate bool EnumWindowsProc(IntPtr handle, IntPtr lParam);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr handle);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr handle);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr handle, int command);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr handle);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr handle, out RECT rect);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr handle, out uint processId);
+    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] private static extern IntPtr GetWindowLongPtr64(IntPtr handle, int index);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] private static extern IntPtr GetWindowLongPtr32(IntPtr handle, int index);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr handle, uint flags);
+    [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr handle, int attribute, out int value, int size);
+
+    private const int GwlExStyle = -20;
+    private const long WsExTopmost = 0x00000008L;
+    private const uint GaRoot = 2;
+    private const int DwmwaCloaked = 14;
+    private const int SwHide = 0;
+    private const int SwShowMaximized = 3;
+    // SW_SHOW is more reliable than SW_SHOWNOACTIVATE for shell-owned windows
+    // such as Shell_TrayWnd; it still does not change the active window when
+    // the target application remains foreground.
+    private const int SwShowNoActivate = 5;
+    private static readonly Dictionary<long, HiddenWindowRecord> GuardHidden = new Dictionary<long, HiddenWindowRecord>();
+
+    public static string HideOverlappingWindows(
+        long targetHandleValue,
+        uint targetProcessId,
+        int captureLeft,
+        int captureTop,
+        int captureWidth,
+        int captureHeight
+    ) {
+        var records = HideOverlappingWindowRecords(
+            targetHandleValue,
+            targetProcessId,
+            captureLeft,
+            captureTop,
+            captureWidth,
+            captureHeight
+        );
+        var lines = records.ConvertAll(record => string.Format(
+            "{0}|{1}|{2}",
+            record.Handle,
+            record.RestoreCommand,
+            record.ProcessId
+        ));
+        return string.Join("\\n", lines.ToArray());
+    }
+
+    public static void RunGuard(
+        long targetHandleValue,
+        uint targetProcessId,
+        int captureLeft,
+        int captureTop,
+        int captureWidth,
+        int captureHeight,
+        int parentProcessId,
+        string stopFilePath,
+        int intervalMilliseconds
+    ) {
+        GuardHidden.Clear();
+        try {
+            var ready = false;
+            while (!StopRequested(stopFilePath) && IsProcessAlive(parentProcessId)) {
+                var added = HideOverlappingWindowRecords(
+                    targetHandleValue,
+                    targetProcessId,
+                    captureLeft,
+                    captureTop,
+                    captureWidth,
+                    captureHeight
+                );
+                foreach (var record in added) {
+                    GuardHidden[record.Handle] = record;
+                    WriteGuardLine(string.Format(
+                        "HIDDEN|{0}|{1}|{2}",
+                        record.Handle,
+                        record.RestoreCommand,
+                        record.ProcessId
+                    ));
+                }
+                if (!ready) {
+                    ready = true;
+                    WriteGuardLine(string.Format("READY|{0}", GuardHidden.Count));
+                }
+                Thread.Sleep(Math.Max(100, intervalMilliseconds));
+            }
+        } finally {
+            RestoreGuardWindows();
+            try {
+                if (!string.IsNullOrWhiteSpace(stopFilePath) && File.Exists(stopFilePath)) File.Delete(stopFilePath);
+            } catch { }
+            WriteGuardLine("RESTORED");
+        }
+    }
+
+    private static List<HiddenWindowRecord> HideOverlappingWindowRecords(
+        long targetHandleValue,
+        uint targetProcessId,
+        int captureLeft,
+        int captureTop,
+        int captureWidth,
+        int captureHeight
+    ) {
+        var targetHandle = new IntPtr(targetHandleValue);
+        var captureRight = (long)captureLeft + Math.Max(0, captureWidth);
+        var captureBottom = (long)captureTop + Math.Max(0, captureHeight);
+        var hidden = new List<HiddenWindowRecord>();
+        var targetSeen = false;
+        EnumWindows((handle, lParam) => {
+            if (handle == targetHandle) targetSeen = true;
+            if (!IsWindowVisible(handle)) return true;
+            if (IsCloaked(handle)) return true;
+
+            uint processId;
+            GetWindowThreadProcessId(handle, out processId);
+            var isTarget = handle == targetHandle
+                || processId == targetProcessId
+                || GetAncestor(handle, GaRoot) == targetHandle;
+            if (isTarget) return true;
+
+            RECT rect;
+            if (!GetWindowRect(handle, out rect)) return true;
+            var overlaps = rect.Left < captureRight
+                && rect.Right > captureLeft
+                && rect.Top < captureBottom
+                && rect.Bottom > captureTop;
+            if (!overlaps) return true;
+
+            // EnumWindows 按 Z 序从上到下枚举。目标窗口之前的窗口在它上面，
+            // 目标窗口之后的普通窗口在它下面，不会进入 gdigrab 的最终像素。
+            // WS_EX_TOPMOST 窗口无论枚举位置如何都必须隔离。
+            var exStyle = GetWindowLong(handle, GwlExStyle);
+            var topmost = (exStyle & WsExTopmost) != 0;
+            if (targetSeen && !topmost) return true;
+
+            var restoreCommand = IsZoomed(handle) ? SwShowMaximized : SwShowNoActivate;
+            if (ShowWindow(handle, SwHide)) {
+                hidden.Add(new HiddenWindowRecord {
+                    Handle = handle.ToInt64(),
+                    RestoreCommand = restoreCommand,
+                    ProcessId = processId
+                });
+            }
+            return true;
+        }, IntPtr.Zero);
+        return hidden;
+    }
+
+    private static void RestoreGuardWindows() {
+        foreach (var record in GuardHidden.Values) {
+            try {
+                var handle = new IntPtr(record.Handle);
+                if (!IsWindow(handle)) continue;
+                uint actualProcessId;
+                GetWindowThreadProcessId(handle, out actualProcessId);
+                if (actualProcessId == record.ProcessId) {
+                    ShowWindow(handle, record.RestoreCommand);
+                }
+            } catch { }
+        }
+        GuardHidden.Clear();
+    }
+
+    private static bool IsProcessAlive(int processId) {
+        try {
+            var process = Process.GetProcessById(processId);
+            return !process.HasExited;
+        } catch {
+            return false;
+        }
+    }
+
+    private static bool StopRequested(string stopFilePath) {
+        try {
+            return !string.IsNullOrWhiteSpace(stopFilePath) && File.Exists(stopFilePath);
+        } catch {
+            return false;
+        }
+    }
+
+    private static void WriteGuardLine(string value) {
+        try {
+            Console.Out.WriteLine(value);
+            Console.Out.Flush();
+        } catch { }
+    }
+
+    private static long GetWindowLong(IntPtr handle, int index) {
+        var value = IntPtr.Size == 8
+            ? GetWindowLongPtr64(handle, index)
+            : GetWindowLongPtr32(handle, index);
+        return value.ToInt64();
+    }
+
+    private static bool IsCloaked(IntPtr handle) {
+        try {
+            int cloaked;
+            return DwmGetWindowAttribute(handle, DwmwaCloaked, out cloaked, sizeof(int)) == 0 && cloaked != 0;
+        } catch {
+            return false;
+        }
+    }
+}
+"@
+$null = [CastWindowIsolation]::SetProcessDpiAwarenessContext([IntPtr](-4))
+$targetHandle = [Int64]$env:CAST_TARGET_HWND
+$targetPid = [UInt32]$env:CAST_TARGET_PID
+$left = [Int32]$env:CAST_CAPTURE_LEFT
+$top = [Int32]$env:CAST_CAPTURE_TOP
+$width = [Int32]$env:CAST_CAPTURE_WIDTH
+$height = [Int32]$env:CAST_CAPTURE_HEIGHT
+if ($env:CAST_GUARD_MODE -eq '1') {
+    $parentPid = [Int32]$env:CAST_GUARD_PARENT_PID
+    $stopFile = [String]$env:CAST_GUARD_STOP_FILE
+    $interval = [Int32]$env:CAST_GUARD_INTERVAL_MS
+    [CastWindowIsolation]::RunGuard($targetHandle, $targetPid, $left, $top, $width, $height, $parentPid, $stopFile, $interval)
+} else {
+    [Console]::Out.Write([CastWindowIsolation]::HideOverlappingWindows($targetHandle, $targetPid, $left, $top, $width, $height))
+}
+`;
+const WINDOW_ISOLATION_SCRIPT_BASE64 = Buffer.from(WINDOW_ISOLATION_SCRIPT, 'utf16le').toString('base64');
+const WINDOW_RESTORE_SCRIPT = `
+$ProgressPreference = 'SilentlyContinue'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class CastWindowRestore {
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr handle);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr handle);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr handle, out uint processId);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr handle, int command);
+}
+"@
+foreach ($value in ($env:CAST_WINDOW_RECORDS -split ';')) {
+    if ([string]::IsNullOrWhiteSpace($value)) { continue }
+    try {
+        $parts = $value -split '\\|'
+        if ($parts.Count -lt 3) { continue }
+        $handle = [IntPtr]::new([Int64]$parts[0])
+        $restoreCommand = [Int32]$parts[1]
+        $expectedPid = [UInt32]$parts[2]
+        if ([CastWindowRestore]::IsWindow($handle)) {
+            [UInt32]$actualPid = 0
+            [CastWindowRestore]::GetWindowThreadProcessId($handle, [ref]$actualPid) | Out-Null
+            if ($actualPid -eq $expectedPid) {
+                [void][CastWindowRestore]::ShowWindow($handle, $restoreCommand)
+            }
+        }
+    } catch {
+        [Console]::Error.WriteLine($_.Exception.Message)
+    }
+}
+`;
+const WINDOW_RESTORE_SCRIPT_BASE64 = Buffer.from(WINDOW_RESTORE_SCRIPT, 'utf16le').toString('base64');
 
 function candidateFfmpegPaths() {
     const root = path.resolve(__dirname, '..', '..');
@@ -87,6 +379,158 @@ function runFfmpegCommand(command, args, timeout = 5000) {
             maxBuffer: 16 * 1024 * 1024
         }, (error, stdout = '', stderr = '') => resolve({ error, stdout, stderr }));
     });
+}
+
+function runPowerShellEncoded(encodedCommand, { env = {}, timeout = 5000, windowsHide = true } = {}) {
+    return new Promise(resolve => {
+        const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass'];
+        // CREATE_NO_WINDOW 会让跨进程 ShowWindow(SW_SHOW) 失效。恢复窗口时让
+        // PowerShell 正常加入当前桌面会话，再用 WindowStyle Hidden 隐藏它自己的控制台。
+        if (!windowsHide) args.push('-WindowStyle', 'Hidden');
+        args.push('-EncodedCommand', encodedCommand);
+        execFile('powershell.exe', args, {
+            timeout,
+            windowsHide,
+            encoding: 'utf8',
+            env: { ...process.env, ...env },
+            maxBuffer: 1024 * 1024
+        }, (error, stdout = '', stderr = '') => resolve({ error, stdout, stderr }));
+    });
+}
+
+async function restoreSuppressedWindows(records) {
+    if (process.platform !== 'win32' || !Array.isArray(records) || !records.length) return;
+    const result = await runPowerShellEncoded(WINDOW_RESTORE_SCRIPT_BASE64, {
+        timeout: 5000,
+        windowsHide: false,
+        env: { CAST_WINDOW_RECORDS: records.map(entry => `${entry.handle}|${entry.restoreCommand}|${entry.processId}`).join(';') }
+    });
+    if (result.error) {
+        const detail = String(result.stderr || result.error.message || '').trim().replace(/\s+/g, ' ');
+        if (detail) console.warn(`[投屏] 恢复桌面窗口失败：${detail}`);
+    }
+}
+
+function launchWindowIsolationGuard(captureBounds, { intervalMs = 250, timeout = 12000, onRecord } = {}) {
+    if (process.platform !== 'win32' || !captureBounds?.targetHwnd || !captureBounds?.targetPid) {
+        return Promise.reject(new Error('Unity 大屏窗口信息不完整，无法启动投屏隔离守护'));
+    }
+    return new Promise((resolve, reject) => {
+        const stopFile = path.join(
+            process.env.TEMP || process.env.TMP || path.dirname(process.execPath),
+            `heat-treatment-cast-guard-${process.pid}-${crypto.randomBytes(6).toString('hex')}.stop`
+        );
+        try { fs.unlinkSync(stopFile); } catch (error) { /* 不存在 */ }
+        const child = spawn('powershell.exe', [
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-WindowStyle', 'Hidden',
+            '-EncodedCommand', WINDOW_ISOLATION_SCRIPT_BASE64
+        ], {
+            windowsHide: false,
+            env: {
+                ...process.env,
+                CAST_TARGET_HWND: String(captureBounds.targetHwnd),
+                CAST_TARGET_PID: String(captureBounds.targetPid),
+                CAST_CAPTURE_LEFT: String(captureBounds.left),
+                CAST_CAPTURE_TOP: String(captureBounds.top),
+                CAST_CAPTURE_WIDTH: String(captureBounds.width),
+                CAST_CAPTURE_HEIGHT: String(captureBounds.height),
+                CAST_GUARD_MODE: '1',
+                CAST_GUARD_PARENT_PID: String(process.pid),
+                CAST_GUARD_STOP_FILE: stopFile,
+                CAST_GUARD_INTERVAL_MS: String(Math.max(100, Number(intervalMs) || 250))
+            },
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+        const guard = {
+            child,
+            stopFile,
+            records: new Map(),
+            restored: false,
+            ready: false,
+            stderr: '',
+            exitPromise: null
+        };
+        let stdoutBuffer = '';
+        let settled = false;
+        let resolveExit;
+        guard.exitPromise = new Promise(exitResolve => { resolveExit = exitResolve; });
+
+        const finish = (error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(readyTimer);
+            if (error) reject(error);
+            else resolve(guard);
+        };
+        const handleLine = rawLine => {
+            const line = String(rawLine || '').trim();
+            if (!line) return;
+            if (line.startsWith('HIDDEN|')) {
+                const [handle, restoreCommand, processId] = line.slice(7).split('|').map(Number);
+                if (Number.isSafeInteger(handle) && handle > 0
+                    && Number.isSafeInteger(restoreCommand) && restoreCommand >= 0
+                    && Number.isSafeInteger(processId) && processId > 0) {
+                    const record = { handle, restoreCommand, processId };
+                    guard.records.set(handle, record);
+                    onRecord?.(record);
+                }
+                return;
+            }
+            if (line.startsWith('READY|')) {
+                guard.ready = true;
+                finish();
+                return;
+            }
+            if (line === 'RESTORED') guard.restored = true;
+        };
+
+        child.stdout.on('data', chunk => {
+            stdoutBuffer += chunk.toString('utf8');
+            const lines = stdoutBuffer.split(/\r?\n/);
+            stdoutBuffer = lines.pop() || '';
+            for (const line of lines) handleLine(line);
+        });
+        child.stderr.on('data', chunk => {
+            guard.stderr = `${guard.stderr}\n${chunk.toString('utf8')}`.trim().slice(-8000);
+        });
+        child.once('error', error => finish(new Error(`投屏隔离守护启动失败：${error.message}`)));
+        child.once('exit', (code, signal) => {
+            if (stdoutBuffer) handleLine(stdoutBuffer);
+            try { fs.unlinkSync(stopFile); } catch (error) { /* 守护已清理 */ }
+            resolveExit({ code, signal });
+            if (!guard.ready) {
+                const detail = guard.stderr.replace(/\s+/g, ' ').trim();
+                finish(new Error(`投屏隔离守护未能启动${detail ? `：${detail}` : `（代码 ${code ?? 'unknown'}）`}`));
+            }
+        });
+        const readyTimer = setTimeout(() => {
+            try { fs.writeFileSync(stopFile, 'stop'); } catch (error) { /* ignore */ }
+            finish(new Error('投屏隔离守护启动超时'));
+        }, timeout);
+    });
+}
+
+async function stopWindowIsolationGuard(guard, timeout = 8000) {
+    if (!guard?.child) return;
+    const child = guard.child;
+    if (child.exitCode == null && child.signalCode == null) {
+        try { fs.writeFileSync(guard.stopFile, 'stop'); } catch (error) { /* 已退出 */ }
+        let timeoutTimer;
+        const timeoutPromise = new Promise(resolve => {
+            timeoutTimer = setTimeout(() => resolve({ timeout: true }), timeout);
+            timeoutTimer.unref?.();
+        });
+        await Promise.race([guard.exitPromise, timeoutPromise]);
+        clearTimeout(timeoutTimer);
+    }
+    if (!guard.restored && guard.records.size) {
+        await restoreSuppressedWindows([...guard.records.values()]);
+    }
+    if (child.exitCode == null && child.signalCode == null) {
+        try { child.kill(); } catch (error) { /* 已退出 */ }
+    }
+    try { fs.unlinkSync(guard.stopFile); } catch (error) { /* 已清理 */ }
 }
 
 function resolveWindowBounds(windowTitle, timeout = 6000) {
@@ -119,7 +563,7 @@ function resolveWindowBounds(windowTitle, timeout = 6000) {
                 reject(new Error(detail || `没有找到 Unity 大屏窗口“${windowTitle}”`));
                 return;
             }
-            const match = String(stdout).trim().match(/^(-?\d+),(-?\d+),(\d+),(\d+)$/);
+            const match = String(stdout).trim().match(/^(-?\d+),(-?\d+),(\d+),(\d+),(\d+),(\d+),(\d+)$/);
             if (!match) {
                 reject(new Error(`Unity 大屏窗口坐标无效：${String(stdout).trim() || 'empty'}`));
                 return;
@@ -128,20 +572,24 @@ function resolveWindowBounds(windowTitle, timeout = 6000) {
                 left: Number(match[1]),
                 top: Number(match[2]),
                 width: Number(match[3]),
-                height: Number(match[4])
+                height: Number(match[4]),
+                chromeHeight: Number(match[5]),
+                targetHwnd: Number(match[6]),
+                targetPid: Number(match[7]),
+                captureMode: 'desktop_client_region'
             });
         });
     });
 }
 
-function requestDashboardView(timeout = 2500) {
+function requestDesktopControl(action, timeout = 2500) {
     const origin = String(process.env.DESKTOP_CONTROL_URL || '').trim();
     const token = String(process.env.DESKTOP_CONTROL_TOKEN || '').trim();
     if (!origin || !token) return Promise.resolve(false);
     return new Promise(resolve => {
         let endpoint;
         try {
-            endpoint = new URL('/show-dashboard', origin);
+            endpoint = new URL(`/${String(action || '').replace(/^\/+/, '')}`, origin);
         } catch (error) {
             resolve(false);
             return;
@@ -157,6 +605,18 @@ function requestDashboardView(timeout = 2500) {
         request.on('error', () => resolve(false));
         request.end();
     });
+}
+
+function requestDashboardView(timeout = 2500) {
+    return requestDesktopControl('show-dashboard', timeout);
+}
+
+function requestCastPresentation(timeout = 2500) {
+    return requestDesktopControl('prepare-cast', timeout);
+}
+
+function requestCastRestore(timeout = 2500) {
+    return requestDesktopControl('restore-cast', timeout);
 }
 
 async function probeFfmpeg(command) {
@@ -192,13 +652,21 @@ function buildCaptureInputArgs(options, captureBounds) {
 
 function buildEncoderArgs(options, captureBounds) {
     const { frameRate, width, height, bitrateKbps } = options;
+    const cropTop = Math.max(0, Math.min(
+        Number(captureBounds?.chromeHeight) || 0,
+        Math.max(0, Number(captureBounds?.height) - 1)
+    ));
+    const croppedHeight = Math.max(1, Number(captureBounds?.height) - cropTop);
+    const cropFilter = cropTop > 0
+        ? `crop=iw:${croppedHeight}:0:${cropTop},`
+        : '';
     return [
         '-hide_banner', '-loglevel', 'error',
         ...buildCaptureInputArgs({ frameRate }, captureBounds),
         // 电视对纯视频的 TS 容错参差不齐，补一路静音音轨兼容性最好。
         '-thread_queue_size', '512',
         '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
-        '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease,`
+        '-vf', `${cropFilter}scale=${width}:${height}:force_original_aspect_ratio=decrease,`
             + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,format=nv12`,
         // h264_mf 使用 Windows 自带 Media Foundation，无独显也可用；不依赖 GPL libx264。
         '-c:v', 'h264_mf', '-rate_control', 'cbr', '-scenario', 'display_remoting',
@@ -253,6 +721,10 @@ class ScreenCastService {
         this.session = null;
         this.encoders = new Set();
         this.captureBounds = null;
+        this.castPresentationActive = false;
+        this.suppressedWindows = [];
+        this.windowIsolationGuard = null;
+        this.windowIsolationStopping = false;
         this.error = '';
         this.options = {
             frameRate: 20,
@@ -299,18 +771,93 @@ class ScreenCastService {
         if (process.platform !== 'win32') {
             throw new Error('Unity 原生大屏投屏目前只支持 Windows');
         }
-        const dashboardRequested = await requestDashboardView();
-        if (dashboardRequested) await new Promise(resolve => setTimeout(resolve, 450));
-        this.captureBounds = await resolveWindowBounds(this.windowTitle);
-        const result = await runFfmpegCommand(this.ffmpegPath, [
-            '-hide_banner', '-loglevel', 'error',
-            ...buildCaptureInputArgs({ frameRate: 1 }, this.captureBounds),
-            '-frames:v', '1', '-f', 'null', 'NUL'
-        ], 8000);
-        if (!result.error) return;
+        try {
+            const dashboardRequested = await requestDashboardView();
+            if (dashboardRequested) await new Promise(resolve => setTimeout(resolve, 450));
 
-        const detail = String(result.stderr || result.error.message || '').trim().replace(/\s+/g, ' ');
-        throw new Error(`无法读取 Unity 大屏画面“${this.windowTitle}”：${detail || result.error.message}`);
+            // 隐藏 AdminHost 的 46px 顶部页签，并把透明数据层扩展到整个 Unity 客户区。
+            // 这样桌面捕获仍能保留 DirectX 场景 + WebView2 数据面板，但不会把软件壳投出去。
+            this.castPresentationActive = await requestCastPresentation();
+            if (this.castPresentationActive) await new Promise(resolve => setTimeout(resolve, 220));
+
+            this.captureBounds = await resolveWindowBounds(this.windowTitle);
+            if (this.castPresentationActive) this.captureBounds.chromeHeight = 0;
+
+            // gdigrab 仍然是桌面捕获，因此把所有会出现在捕获区域上方的顶层窗口
+            // 临时隐藏。首次立即执行一次，之后在整个投屏期间持续监测新出现的浮层。
+            await this.startWindowIsolationGuard();
+
+            const result = await runFfmpegCommand(this.ffmpegPath, [
+                '-hide_banner', '-loglevel', 'error',
+                ...buildCaptureInputArgs({ frameRate: 1 }, this.captureBounds),
+                '-frames:v', '1', '-f', 'null', 'NUL'
+            ], 8000);
+            if (!result.error) return;
+
+            const detail = String(result.stderr || result.error.message || '').trim().replace(/\s+/g, ' ');
+            throw new Error(`无法读取 Unity 大屏画面“${this.windowTitle}”：${detail || result.error.message}`);
+        } catch (error) {
+            await this.restoreCapturePresentation();
+            throw error;
+        }
+    }
+
+    mergeSuppressedWindows(records) {
+        for (const record of records || []) {
+            if (!record) continue;
+            const index = this.suppressedWindows.findIndex(existing => existing.handle === record.handle);
+            if (index >= 0) this.suppressedWindows[index] = record;
+            else this.suppressedWindows.push(record);
+        }
+    }
+
+    async startWindowIsolationGuard() {
+        if (!this.captureBounds) throw new Error('Unity 大屏捕获区域尚未确定');
+        if (this.windowIsolationGuard) await this.stopWindowIsolationGuard();
+        this.suppressedWindows = [];
+        const guard = await launchWindowIsolationGuard(this.captureBounds, {
+            intervalMs: 250,
+            onRecord: record => this.mergeSuppressedWindows([record])
+        });
+        this.windowIsolationGuard = guard;
+        guard.exitPromise.then(async ({ code, signal }) => {
+            if (this.windowIsolationGuard !== guard) return;
+            this.windowIsolationGuard = null;
+            if (!guard.restored && guard.records.size) {
+                await restoreSuppressedWindows([...guard.records.values()]);
+            }
+            if (this.windowIsolationStopping || (!this.session && !this.castPresentationActive)) return;
+            const message = `投屏桌面隔离守护异常退出（${signal || code || 'unknown'}），已停止投屏以避免把其它窗口投到电视`;
+            setImmediate(async () => {
+                await this.stop().catch(() => {});
+                this.error = message;
+            });
+        }).catch(() => {});
+    }
+
+    async stopWindowIsolationGuard() {
+        const guard = this.windowIsolationGuard;
+        this.windowIsolationGuard = null;
+        if (!guard) return;
+        this.windowIsolationStopping = true;
+        try {
+            await stopWindowIsolationGuard(guard);
+        } finally {
+            this.windowIsolationStopping = false;
+        }
+    }
+
+    async restoreCapturePresentation() {
+        // 先停止隔离守护，再恢复 AdminHost。否则守护在恢复顶栏的瞬间可能
+        // 又把刚显示的窗口判定为遮挡并隐藏，造成恢复闪烁或状态不一致。
+        await this.stopWindowIsolationGuard();
+        if (this.castPresentationActive) {
+            await requestCastRestore().catch(() => {});
+            this.castPresentationActive = false;
+        }
+        const records = this.suppressedWindows;
+        this.suppressedWindows = [];
+        await restoreSuppressedWindows(records);
     }
 
     async ensureStreamServer() {
@@ -510,55 +1057,60 @@ class ScreenCastService {
                 + '开发环境请在 desktop 目录运行 npm run prepare:ffmpeg 后重启后端。'
             );
         }
-        await this.assertCaptureTarget();
-
         if (this.session) await this.stop().catch(() => {});
-        await this.ensureStreamServer();
-        this.streamToken = crypto.randomBytes(12).toString('hex');
+        await this.assertCaptureTarget();
+        try {
+            await this.ensureStreamServer();
+            this.streamToken = crypto.randomBytes(12).toString('hex');
 
-        const url = this.streamUrl(device.address);
-        let sinkProtocols = [];
-        try {
-            sinkProtocols = await dlna.getSinkProtocolInfo(device);
+            const url = this.streamUrl(device.address);
+            let sinkProtocols = [];
+            try {
+                sinkProtocols = await dlna.getSinkProtocolInfo(device);
+            } catch (error) {
+                // ConnectionManager 并非所有电视都完整实现；读取失败时使用通用类型继续。
+            }
+            const mimeType = dlna.chooseVideoMimeType(sinkProtocols);
+            this.error = '';
+            const session = {
+                device,
+                deviceId: device.id,
+                deviceName: device.name,
+                deviceAddress: device.address,
+                url,
+                mimeType,
+                sinkProtocols,
+                metadataMode: 'full',
+                state: 'starting',
+                startedAt: Date.now(),
+                viewers: 0,
+                streamRequests: 0,
+                retryCount: 0,
+                retryTimer: null,
+                firstViewerAt: 0,
+                lastViewerAt: 0,
+                lastReconnectError: ''
+            };
+            // Play 调用返回前电视就可能开始 GET，先登记临时会话，避免把合法请求当成过期流。
+            this.session = session;
+            try {
+                const playback = await dlna.startPlayback(device, { url, title: STREAM_TITLE, mimeType });
+                session.metadataMode = playback.metadataMode;
+            } catch (error) {
+                if (this.session === session) this.session = null;
+                this.stopEncoders();
+                await this.restoreCapturePresentation();
+                this.error = error.message;
+                throw error;
+            }
+            session.state = session.viewers > 0 ? 'casting' : 'waiting_for_tv';
+            this.schedulePlaybackRetry(session);
+            console.log(`[投屏] 已推送到电视「${device.name}」(${device.address})：${url}`);
+            return this.status();
         } catch (error) {
-            // ConnectionManager 并非所有电视都完整实现；读取失败时使用通用类型继续。
-        }
-        const mimeType = dlna.chooseVideoMimeType(sinkProtocols);
-        this.error = '';
-        const session = {
-            device,
-            deviceId: device.id,
-            deviceName: device.name,
-            deviceAddress: device.address,
-            url,
-            mimeType,
-            sinkProtocols,
-            metadataMode: 'full',
-            state: 'starting',
-            startedAt: Date.now(),
-            viewers: 0,
-            streamRequests: 0,
-            retryCount: 0,
-            retryTimer: null,
-            firstViewerAt: 0,
-            lastViewerAt: 0,
-            lastReconnectError: ''
-        };
-        // Play 调用返回前电视就可能开始 GET，先登记临时会话，避免把合法请求当成过期流。
-        this.session = session;
-        try {
-            const playback = await dlna.startPlayback(device, { url, title: STREAM_TITLE, mimeType });
-            session.metadataMode = playback.metadataMode;
-        } catch (error) {
-            if (this.session === session) this.session = null;
-            this.stopEncoders();
-            this.error = error.message;
+            await this.restoreCapturePresentation();
             throw error;
         }
-        session.state = session.viewers > 0 ? 'casting' : 'waiting_for_tv';
-        this.schedulePlaybackRetry(session);
-        console.log(`[投屏] 已推送到电视「${device.name}」(${device.address})：${url}`);
-        return this.status();
     }
 
     async stop() {
@@ -571,6 +1123,7 @@ class ScreenCastService {
             try { await dlna.stopPlayback(session.device); } catch (error) { /* 忽略 */ }
             console.log(`[投屏] 已停止推送到「${session.deviceName}」`);
         }
+        await this.restoreCapturePresentation();
         this.error = '';
         return this.status();
     }
@@ -595,9 +1148,12 @@ class ScreenCastService {
             ffmpegVersion: this.ffmpegVersion,
             ffmpegError: this.ffmpegProbeError,
             encoder: 'h264_mf',
-            captureMode: 'desktop_window_region',
+            captureMode: 'desktop_client_region_presentation',
             captureWindowTitle: this.windowTitle,
             captureBounds: this.captureBounds,
+            castPresentationActive: this.castPresentationActive,
+            windowIsolationGuardActive: Boolean(this.windowIsolationGuard),
+            suppressedWindows: this.suppressedWindows.length,
             streamPort: this.port,
             casting: Boolean(this.session),
             session: this.session
