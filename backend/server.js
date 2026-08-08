@@ -29,6 +29,7 @@ const {
 } = require('./db/database');
 const { mergeBuiltinModels } = require('./services/builtinModels');
 const { stringifyModelMetadata } = require('./services/modelAssetMetadata');
+const { publicProtocolDefinitions } = require('./services/plcProtocolConfig');
 const {
     createSiteBackup,
     restoreSiteBackup,
@@ -300,6 +301,10 @@ app.get('/api/engine/status', (req, res) => {
     } else {
         res.json({ mode: null, plcStatus: { status: 'not_started', message: '引擎未启动' } });
     }
+});
+
+app.get('/api/plc/protocols', (req, res) => {
+    res.json({ protocols: publicProtocolDefinitions() });
 });
 
 app.get('/api/plc/points/realtime', async (req, res) => {

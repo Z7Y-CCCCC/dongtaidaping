@@ -7,6 +7,7 @@ import QRCode from 'qrcode'
 import { adminApi } from '../../../config/factoryConfig.js'
 import { API_BASE } from '../../../runtime/backendEndpoint.js'
 import { RENDER_PROFILE_OPTIONS, normalizeRenderSettings } from '../../../runtime/renderConfig.js'
+import { normalizePlcOptions, normalizePlcProtocol } from '../../../config/plcProtocols.js'
 
 function createDefaultNativeEnvironmentConfig() {
     return {
@@ -624,7 +625,12 @@ export function useSystemSettings({
         const status = plcStatusByDevice.value[device.id]
         if (status?.endpoint) return status.endpoint
         if (!device.plc_ip) return '未填写 IP'
-        return `${device.plc_protocol || 'S7'} ${device.plc_ip}:${device.plc_port || 102} (Rack=${device.plc_rack ?? 0}, Slot=${device.plc_slot ?? 1})`
+        const protocol = normalizePlcProtocol(device.plc_protocol || 'S7')
+        const options = normalizePlcOptions(protocol, device.plc_options)
+        if (protocol === 'S7') return `S7 ${device.plc_ip}:${device.plc_port || 102} (Rack=${device.plc_rack ?? 0}, Slot=${device.plc_slot ?? 1})`
+        if (protocol === 'MODBUS_TCP') return `Modbus TCP ${device.plc_ip}:${device.plc_port || 502} (Unit ID=${options.unitId})`
+        if (protocol === 'OPC_UA') return `OPC UA ${device.plc_ip}:${device.plc_port || 4840}${options.endpointPath || ''}`
+        return `${protocol} ${device.plc_ip}:${device.plc_port || 102}`
     }
 
     function formatPlcIntervals(status) {

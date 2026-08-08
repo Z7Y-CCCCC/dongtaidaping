@@ -171,6 +171,8 @@ export function useFactoryConfig() {
 
 // Admin API helpers
 export const adminApi = {
+    // PLC 协议能力清单
+    async getPlcProtocols() { return readApiJson(await fetch(`${API_BASE}/plc/protocols`), '读取 PLC 协议清单失败') },
     // 车间
     async getWorkshops() { return (await fetch(`${API_BASE}/workshops`)).json() },
     async createWorkshop(data) { return readApiJson(await fetch(`${API_BASE}/workshops`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '创建车间失败') },

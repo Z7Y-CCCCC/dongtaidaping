@@ -1,6 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const { getDb } = require('../db/database');
+const {
+    defaultPortForProtocol,
+    getProtocolDefinition,
+    normalizePlcOptions,
+    normalizeProtocol,
+    sanitizePlcOptions
+} = require('../services/plcProtocolConfig');
 
 function numberWithDefault(value, defaultValue) {
     return value === undefined || value === null || value === '' ? defaultValue : Number(value);
@@ -29,6 +36,26 @@ function parseJson(value) {
     }
 }
 
+function normalizeProtocolValue(value) {
+    const protocol = normalizeProtocol(value || 'S7');
+    if (!getProtocolDefinition(protocol)) throw new Error(`不支持的 PLC 协议：${protocol}`);
+    return protocol;
+}
+
+function normalizePlcOptionsValue(protocol, value, existingValue = {}) {
+    return JSON.stringify(normalizePlcOptions(protocol, value, existingValue));
+}
+
+function publicDevice(device) {
+    if (!device) return device;
+    const protocol = normalizeProtocol(device.plc_protocol || 'S7');
+    return {
+        ...device,
+        plc_protocol: protocol,
+        plc_options: sanitizePlcOptions(protocol, device.plc_options)
+    };
+}
+
 function isAuxiliaryDevice(modelType, instanceConfig) {
     const config = parseJson(instanceConfig);
     return modelType === 'transfer_cart'
@@ -53,7 +80,7 @@ router.get('/', async (req, res) => {
         const devices = line_id
             ? await db.all('SELECT * FROM devices WHERE line_id = ? ORDER BY sort_order ASC', [line_id])
             : await db.all('SELECT * FROM devices ORDER BY line_id, sort_order ASC');
-        res.json(devices);
+        res.json(devices.map(publicDevice));
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -66,7 +93,7 @@ router.get('/:id', async (req, res) => {
         if (!device) return res.status(404).json({ error: '设备不存在' });
 
         const dataPoints = await db.all('SELECT * FROM data_points WHERE device_id = ?', [req.params.id]);
-        res.json({ ...device, dataPoints });
+        res.json({ ...publicDevice(device), dataPoints });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -77,7 +104,7 @@ router.post('/', async (req, res) => {
         id, name, line_id, model_type, model_file, template_id, instance_config,
         pos_x, pos_y, pos_z, rotation_y, scale, coordinate_space, sort_order,
         plc_enabled, plc_protocol, plc_ip, plc_port, plc_rack, plc_slot,
-        plc_timeout, plc_retry_interval, plc_max_retries
+        plc_timeout, plc_retry_interval, plc_max_retries, plc_options
     } = req.body;
     const nextModelType = model_type || 'builtin_furnace';
     if (!id || !name) {
@@ -88,12 +115,18 @@ router.post('/', async (req, res) => {
     }
     try {
         const db = await getDb();
+        const protocol = normalizeProtocolValue(plc_protocol || 'S7');
+        const normalizedOptions = normalizePlcOptionsValue(protocol, plc_options);
         await db.run(`INSERT INTO devices (
             id, name, line_id, model_type, model_file, template_id, instance_config,
             pos_x, pos_y, pos_z, rotation_y, scale, coordinate_space, sort_order,
             plc_enabled, plc_protocol, plc_ip, plc_port, plc_rack, plc_slot,
-            plc_timeout, plc_retry_interval, plc_max_retries
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+            plc_timeout, plc_retry_interval, plc_max_retries, plc_options
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?
+        )`, [
             id,
             name,
             line_id || null,
@@ -111,14 +144,15 @@ router.post('/', async (req, res) => {
                 : (line_id ? 'line_local' : 'workshop_local'),
             numberWithDefault(sort_order, 0),
             boolWithDefault(plc_enabled, 0),
-            plc_protocol || 'S7',
+            protocol,
             plc_ip || '',
-            numberWithDefault(plc_port, 102),
+            numberWithDefault(plc_port, defaultPortForProtocol(protocol)),
             numberWithDefault(plc_rack, 0),
             numberWithDefault(plc_slot, 1),
             numberWithDefault(plc_timeout, 5000),
             numberWithDefault(plc_retry_interval, 10000),
-            numberWithDefault(plc_max_retries, 0)
+            numberWithDefault(plc_max_retries, 0),
+            normalizedOptions
         ]);
         restartDataEngineSoon('create device');
         res.json({ success: true, id });
@@ -132,7 +166,7 @@ router.put('/:id', async (req, res) => {
         name, line_id, model_type, model_file, template_id, instance_config,
         pos_x, pos_y, pos_z, rotation_y, scale, coordinate_space, sort_order,
         plc_enabled, plc_protocol, plc_ip, plc_port, plc_rack, plc_slot,
-        plc_timeout, plc_retry_interval, plc_max_retries
+        plc_timeout, plc_retry_interval, plc_max_retries, plc_options
     } = req.body;
     if (!name) return res.status(400).json({ error: '设备名称不能为空' });
     try {
@@ -142,6 +176,12 @@ router.put('/:id', async (req, res) => {
         const nextLineId = line_id === undefined ? existing.line_id : (line_id || null);
         const nextModelType = model_type ?? existing.model_type;
         const nextInstanceConfig = instance_config ?? existing.instance_config;
+        const nextProtocol = normalizeProtocolValue(plc_protocol ?? existing.plc_protocol ?? 'S7');
+        const nextPlcOptions = normalizePlcOptionsValue(
+            nextProtocol,
+            plc_options === undefined ? existing.plc_options : plc_options,
+            existing.plc_options
+        );
         if (!isAuxiliaryDevice(nextModelType, nextInstanceConfig) && !nextLineId) {
             return res.status(400).json({ error: '普通设备必须选择所属产线' });
         }
@@ -152,7 +192,7 @@ router.put('/:id', async (req, res) => {
         await db.run(`UPDATE devices SET name=?, line_id=?, model_type=?, model_file=?,
             template_id=?, instance_config=?, pos_x=?, pos_y=?, pos_z=?,
             rotation_y=?, scale=?, coordinate_space=?, sort_order=?, plc_enabled=?, plc_protocol=?, plc_ip=?,
-            plc_port=?, plc_rack=?, plc_slot=?, plc_timeout=?, plc_retry_interval=?,
+            plc_port=?, plc_options=?, plc_rack=?, plc_slot=?, plc_timeout=?, plc_retry_interval=?,
             plc_max_retries=? WHERE id=?`, [
             name,
             nextLineId,
@@ -168,9 +208,10 @@ router.put('/:id', async (req, res) => {
             nextCoordinateSpace,
             numberWithDefault(sort_order, 0),
             boolWithDefault(plc_enabled, 0),
-            plc_protocol || 'S7',
-            plc_ip || '',
-            numberWithDefault(plc_port, 102),
+            nextProtocol,
+            plc_ip ?? existing.plc_ip ?? '',
+            numberWithDefault(plc_port, defaultPortForProtocol(nextProtocol)),
+            nextPlcOptions,
             numberWithDefault(plc_rack, 0),
             numberWithDefault(plc_slot, 1),
             numberWithDefault(plc_timeout, 5000),

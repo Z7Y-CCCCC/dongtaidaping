@@ -20,6 +20,7 @@
 %APPDATA%\heat-treatment-digital-twin-desktop\data\recovery\
 %APPDATA%\heat-treatment-digital-twin-desktop\data\site-backups\
 %APPDATA%\heat-treatment-digital-twin-desktop\data\site-backup-config.json
+%APPDATA%\heat-treatment-digital-twin-desktop\data\opcua-pki\（OPC UA 客户端证书与信任库）
 %APPDATA%\heat-treatment-digital-twin-desktop\uploads\models\
 %APPDATA%\heat-treatment-digital-twin-desktop\uploads\audio\
 %APPDATA%\heat-treatment-digital-twin-desktop\logs\backend.log
@@ -71,7 +72,19 @@
 - 后台页签、侧栏和弹窗带平滑过渡；在后台不同页签间切换，或临时返回大屏再回到后台，未保存的表单草稿会保持原样。
 - 草稿保留仅覆盖软件当前运行会话；刷新页面或退出软件前，仍应点击对应的保存按钮写入数据库。
 - 无独显电脑建议在“系统设置 → 大屏渲染性能”选择“低配兼容”。
-- PLC 地址和点位需要由现场工程师按设备实际情况配置。
+- PLC 地址和点位需要由现场工程师按设备实际情况配置。系统只读取数据，不向 PLC 写值。
+
+### PLC 协议配置
+
+设备编辑页目前只提供三种已真实接入的主流协议：
+
+| 协议 | 默认端口 | 点位地址示例 | 主要配置 |
+| --- | ---: | --- | --- |
+| 西门子 S7 | 102 | `DB1.DBW0`、`DB1.DBX6.0` | Rack、Slot |
+| Modbus TCP | 502 | `HR40001`、`IR30001`、`C00001`、`HR40003.2` | Unit ID、0/1 地址基准、字节序、字序 |
+| OPC UA | 4840 | `ns=2;s=Channel1.Device1.Tag1` | Endpoint 路径、安全模式/策略、用户名和密码 |
+
+Modbus 的 `HR/IR/C/DI` 分别表示保持寄存器、输入寄存器、线圈和离散输入；32/64 位数值不正确时，应按设备手册核对字节序和字序。OPC UA 密码不会通过后台查询接口明文返回；启用安全模式后，正式现场应核对服务器证书，只有明确处于调试阶段时才开启“自动信任服务器证书”。
 
 ## 点位语音播报配置
 
@@ -91,8 +104,8 @@
 
 2026-08-07 使用外部 Snap7 仿真器和独立临时数据库完成隔离测试：
 
-- `WORD/BOOL/REAL` 三类点位以 250/500/1000ms 持续采集，最近一轮延迟 p50 143ms、p95 161ms，最大帧间隔 267ms。
-- 强杀 PLC 后 0.207 秒发布坏质量、4.182 秒判离线；PLC 恢复后 1.064 秒出现首个好帧、1.065 秒恢复在线，随后连续读取 8/8 成功。
+- `WORD/BOOL/REAL` 三类点位以 250/500/1000ms 持续采集，最近一轮延迟 p50 143ms、p95 237ms，最大帧间隔 267ms。
+- 强杀 PLC 后 0.111 秒发布坏质量、4.152 秒判离线；PLC 恢复后 1.027 秒出现首个好帧、1.368 秒恢复在线，随后连续读取 8/8 成功。
 - 高频写入中强杀后端，重启后最后一次已确认写入仍存在，数据库 `quick_check=ok`。
 - 人为损坏主数据库后已验证自动恢复、损坏文件隔离、备份下载、手工恢复和恢复前回滚备份。
 - 已验证 MySQL `.sql.gz` 创建、校验、恢复、失败回滚，以及 MySQL/SQLite 两类整站 ZIP 对数据库和上传模型的恢复。
@@ -101,6 +114,7 @@
 - PLC 换算公式使用受限数学解析器，只允许 `x`、数字、四则运算和括号，不执行 JavaScript。
 - 已验证桌面后端异常退出后自动恢复，以及 Unity 父进程退出后后台宿主自动清理。
 - 后台与旧 Web 三维大屏已按需加载；进入 Unity 内嵌后台时不再预加载旧 Web 三维场景，基础入口包约 100.55 KB。
+- 2026-08-08 已完成 Modbus TCP 本地服务器真实读取（WORD、REAL、BOOL、输入寄存器）、字节序/字序组合、OPC UA 连接/会话/批量读取/失败清理流程、旧数据库字段迁移、协议地址校验和 OPC UA 密码掩码测试；S7 仿真断联与重连回归继续通过。OPC UA 正式上线仍需使用客户现场真实服务器和证书再验收一次。
 
 ## 商业交付注意事项
 

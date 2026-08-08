@@ -46,6 +46,14 @@ import { formatPointValue, formatQualityLabel, formatPointTime } from './admin/u
 import NativeEnvironmentSettings from './admin/components/NativeEnvironmentSettings.vue'
 import DashboardDesigner from './admin/components/DashboardDesigner.vue'
 import { normalizeWorkshopLayout } from '../utils/spatialLayout.js'
+import {
+    PLC_PROTOCOL_OPTIONS,
+    getPlcAddressHint,
+    getPlcAddressPlaceholder,
+    getPlcProtocolDefinition,
+    normalizePlcOptions,
+    normalizePlcProtocol
+} from '../config/plcProtocols.js'
 
 defineOptions({ name: 'AdminPanel' })
 
@@ -857,6 +865,7 @@ function defaultPlcConnectionConfig() {
         plc_protocol: 'S7',
         plc_ip: '',
         plc_port: 102,
+        plc_options: {},
         plc_rack: 0,
         plc_slot: 1,
         plc_timeout: 5000,
@@ -870,6 +879,39 @@ const editingDevice = reactive({
     ...defaultPlcConnectionConfig()
 })
 const isEditMode = ref(false)
+const plcProtocolOptions = PLC_PROTOCOL_OPTIONS
+const editingPlcProtocolDefinition = computed(() => getPlcProtocolDefinition(editingDevice.plc_protocol))
+const editingPlcOptions = computed(() => normalizePlcOptions(editingDevice.plc_protocol, editingDevice.plc_options))
+const editingPlcUsesRackSlot = computed(() => normalizePlcProtocol(editingDevice.plc_protocol) === 'S7')
+const editingPlcUsesModbusOptions = computed(() => normalizePlcProtocol(editingDevice.plc_protocol) === 'MODBUS_TCP')
+const editingPlcUsesOpcUaOptions = computed(() => normalizePlcProtocol(editingDevice.plc_protocol) === 'OPC_UA')
+
+function setEditingPlcProtocol(protocol) {
+    const normalized = normalizePlcProtocol(protocol)
+    const definition = getPlcProtocolDefinition(normalized)
+    const previousDefinition = getPlcProtocolDefinition(editingDevice.plc_protocol)
+    editingDevice.plc_protocol = normalized
+    if (!editingDevice.plc_port || Number(editingDevice.plc_port) === Number(previousDefinition.defaultPort)) {
+        editingDevice.plc_port = definition.defaultPort
+    }
+    editingDevice.plc_options = normalizePlcOptions(normalized, editingDevice.plc_options)
+}
+
+function plcEndpointFieldLabel() {
+    return normalizePlcProtocol(editingDevice.plc_protocol) === 'OPC_UA' ? '服务器地址 / IP' : 'PLC IP'
+}
+
+function plcEndpointPlaceholder() {
+    return normalizePlcProtocol(editingDevice.plc_protocol) === 'OPC_UA' ? '192.168.1.20 或 opc.tcp://...' : '192.168.1.10'
+}
+
+function plcOptionValue(key, fallback = '') {
+    return editingPlcOptions.value[key] ?? fallback
+}
+
+function setPlcOption(key, value) {
+    editingDevice.plc_options = { ...editingPlcOptions.value, [key]: value }
+}
 
 async function loadDevices() {
     devices.value = await adminApi.getDevices()
@@ -1015,6 +1057,8 @@ const {
     removeDataPoint,
     markPointsDirty,
     isBoolPoint,
+    getPointAddressPlaceholder,
+    getPointAddressTitle,
     autoConvertPlcTagForDataType,
     getPlcDuplicateWarning,
     getPlcAddressWarning,
@@ -3449,6 +3493,8 @@ function getDeviceWorkshopId(device) {
 
 function buildDevicePayloadForSave(device, workshopId) {
     const payload = { ...device }
+    payload.plc_protocol = normalizePlcProtocol(payload.plc_protocol || 'S7')
+    payload.plc_options = normalizePlcOptions(payload.plc_protocol, payload.plc_options)
     const isAuxiliary = isAuxiliaryDeviceConfig(payload)
     const config = parseInstanceConfig(payload.instance_config)
 
@@ -3478,6 +3524,8 @@ function normalizeDeviceConfig(device) {
         scale: numberOrDefault(device.scale, 1),
         coordinate_space: device.coordinate_space || (device.line_id ? 'line_local' : 'workshop_local'),
         sort_order: numberOrDefault(device.sort_order, 0),
+        plc_protocol: normalizePlcProtocol(device.plc_protocol || 'S7'),
+        plc_options: normalizePlcOptions(device.plc_protocol || 'S7', device.plc_options),
         instance_config: stringifyInstanceConfigForEdit(device.instance_config, defaultInstanceConfig)
     }
 }
@@ -6096,22 +6144,74 @@ const mainTabs = [
                                     </label>
                                     <div class="form-grid compact-form-grid" v-if="Number(editingDevice.plc_enabled || 0)">
                                         <label>协议
-                                            <select v-model="editingDevice.plc_protocol" class="input">
-                                                <option value="S7">西门子 S7</option>
+                                            <select :value="editingDevice.plc_protocol" class="input" @change="setEditingPlcProtocol($event.target.value)">
+                                                <option v-for="protocol in plcProtocolOptions" :key="protocol.value" :value="protocol.value">{{ protocol.label }}</option>
                                             </select>
                                         </label>
-                                        <label>PLC IP
-                                            <input v-model="editingDevice.plc_ip" class="input" placeholder="192.168.1.10" />
+                                        <label>{{ plcEndpointFieldLabel() }}
+                                            <input v-model="editingDevice.plc_ip" class="input" :placeholder="plcEndpointPlaceholder()" />
                                         </label>
                                         <label>端口
-                                            <input v-model.number="editingDevice.plc_port" type="number" class="input" placeholder="102" />
+                                            <input v-model.number="editingDevice.plc_port" type="number" class="input" :placeholder="String(editingPlcProtocolDefinition.defaultPort)" />
                                         </label>
-                                        <label>Rack
+                                        <label v-if="editingPlcUsesRackSlot">Rack
                                             <input v-model.number="editingDevice.plc_rack" type="number" class="input" placeholder="0" />
                                         </label>
-                                        <label>Slot
+                                        <label v-if="editingPlcUsesRackSlot">Slot
                                             <input v-model.number="editingDevice.plc_slot" type="number" class="input" placeholder="1" />
                                         </label>
+                                        <template v-if="editingPlcUsesModbusOptions">
+                                            <label>Unit ID
+                                                <input :value="plcOptionValue('unitId', 1)" @input="setPlcOption('unitId', Number($event.target.value))" type="number" min="1" max="247" class="input" placeholder="1" />
+                                            </label>
+                                            <label>地址基准
+                                                <select :value="plcOptionValue('addressBase', 1)" @change="setPlcOption('addressBase', Number($event.target.value))" class="input">
+                                                    <option :value="1">1（常见，HR40001 从 1 开始）</option>
+                                                    <option :value="0">0（部分网关从 0 开始）</option>
+                                                </select>
+                                            </label>
+                                            <label>字节序
+                                                <select :value="plcOptionValue('byteOrder', 'BE')" @change="setPlcOption('byteOrder', $event.target.value)" class="input">
+                                                    <option value="BE">大端（标准）</option>
+                                                    <option value="LE">小端</option>
+                                                </select>
+                                            </label>
+                                            <label>字序（32/64 位）
+                                                <select :value="plcOptionValue('wordOrder', 'BE')" @change="setPlcOption('wordOrder', $event.target.value)" class="input">
+                                                    <option value="BE">高字在前</option>
+                                                    <option value="LE">低字在前</option>
+                                                </select>
+                                            </label>
+                                        </template>
+                                        <template v-if="editingPlcUsesOpcUaOptions">
+                                            <label>Endpoint 路径（可选）
+                                                <input :value="plcOptionValue('endpointPath', '')" @input="setPlcOption('endpointPath', $event.target.value)" class="input" placeholder="/UA/Server" />
+                                            </label>
+                                            <label>安全模式
+                                                <select :value="plcOptionValue('securityMode', 'None')" @change="setPlcOption('securityMode', $event.target.value)" class="input">
+                                                    <option value="None">None（匿名/明文）</option>
+                                                    <option value="Sign">Sign</option>
+                                                    <option value="SignAndEncrypt">SignAndEncrypt</option>
+                                                </select>
+                                            </label>
+                                            <label v-if="plcOptionValue('securityMode', 'None') !== 'None'">安全策略
+                                                <select :value="plcOptionValue('securityPolicy', 'Basic256Sha256')" @change="setPlcOption('securityPolicy', $event.target.value)" class="input">
+                                                    <option value="Basic256Sha256">Basic256Sha256</option>
+                                                    <option value="Aes128_Sha256_RsaOaep">Aes128-Sha256-RsaOaep</option>
+                                                    <option value="Aes256_Sha256_RsaPss">Aes256-Sha256-RsaPss</option>
+                                                </select>
+                                            </label>
+                                            <label>用户名（可选）
+                                                <input :value="plcOptionValue('username', '')" @input="setPlcOption('username', $event.target.value)" class="input" placeholder="匿名留空" />
+                                            </label>
+                                            <label>密码（可选）
+                                                <input :value="plcOptionValue('password', '')" @input="setPlcOption('password', $event.target.value)" type="password" class="input" placeholder="匿名留空" />
+                                            </label>
+                                            <label class="inline-check" style="align-self:end">
+                                                <input :checked="plcOptionValue('trustServerCertificate', false)" @change="setPlcOption('trustServerCertificate', $event.target.checked)" type="checkbox" />
+                                                调试时自动信任服务器证书
+                                            </label>
+                                        </template>
                                         <label>连接超时(ms)
                                             <input v-model.number="editingDevice.plc_timeout" type="number" class="input" placeholder="5000" />
                                         </label>
@@ -6121,6 +6221,9 @@ const mainTabs = [
                                         <label>最大重试次数
                                             <input v-model.number="editingDevice.plc_max_retries" type="number" class="input" placeholder="0 表示一直重试" />
                                         </label>
+                                        <p class="plc-protocol-hint" style="grid-column:1 / -1">
+                                            {{ editingPlcProtocolDefinition.addressHint }} 点位地址请在“PLC 点位映射”中按所选协议填写；当前采集器为只读模式，不会向 PLC 写入。
+                                        </p>
                                     </div>
                                 </div>
                                 <label>X 坐标<input v-model.number="editingDevice.pos_x" type="number" class="input" /></label>
@@ -7087,8 +7190,8 @@ const mainTabs = [
                                                 <input v-model="p.plc_tag" @input="markPointsDirty" 
                                                        class="input input-sm plc-address-input" 
                                                        :class="{ 'has-warning': !!getPlcAddressWarning(p), 'has-duplicate': !!getPlcDuplicateWarning(p) }"
-                                                       :title="getPlcDuplicateWarning(p) || getPlcAddressWarning(p) || 'PLC 地址，如 DB1.DBW0 或 DB1.DBX0.0'" 
-                                                       placeholder="DB1.DBW0 / DB1.DBX6.0" />
+                                                       :title="getPlcDuplicateWarning(p) || getPlcAddressWarning(p) || getPointAddressTitle(p)"
+                                                       :placeholder="getPointAddressPlaceholder(p)" />
                                                 <span v-if="getPlcDuplicateWarning(p)" class="plc-warning-icon plc-duplicate-icon" :title="getPlcDuplicateWarning(p)">
                                                     <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
                                                         <rect x="1" y="1" width="10" height="10" rx="2" stroke="#ff3b30" stroke-width="1.3" fill="rgba(255, 59, 48, 0.1)"/>

@@ -1,15 +1,27 @@
 /**
- * 内置 S7 PLC 采集器
+ * 内置多协议 PLC 只读采集器
  *
  * 运行模型：
  * - 每台设备保存自己的 PLC 连接配置。
  * - 每个点位保存自己的采集周期 sample_interval_ms。
- * - 运行时按 “PLC 端点 + 采集周期” 合并任务，nodes7 会继续对同一 DB 内点位做批量优化读取。
+ * - 运行时按 “协议 + PLC 端点 + 采集周期” 合并任务。
+ * - S7 由 nodes7 批量读取；Modbus TCP 与 OPC UA 使用独立协议驱动。
  */
 
 const nodes7 = require('nodes7');
 const { getDb } = require('../db/database');
 const { evaluateMathExpression } = require('../utils/mathExpression');
+const { createProtocolDriver } = require('./plcProtocolDrivers');
+const {
+    PROTOCOL_DEFINITIONS,
+    canonicalDataType,
+    defaultPortForProtocol,
+    endpointKey,
+    formatEndpoint,
+    normalizePlcOptions,
+    normalizePointAddress,
+    normalizeProtocol
+} = require('./plcProtocolConfig');
 
 const DATA_GROUPS = ['analog', 'status', 'motors', 'doors', 'mechanisms', 'gas'];
 const MIN_SAMPLE_INTERVAL_MS = 100;
@@ -32,6 +44,7 @@ class PlcReader {
         this.offlineAfterMs = this._resolveOfflineAfterMs(options.offlineAfterMs);
         this.statusHeartbeatTimer = null;
         this.stopped = true;
+        this.driverFactory = options.driverFactory || createProtocolDriver;
     }
 
     async start(onData, onStatusChange) {
@@ -129,11 +142,11 @@ class PlcReader {
             this.deviceStatus.set(device.id, this._createBaseDeviceStatus(device, plc));
 
             if (!plc.enabled) return;
-            if (plc.protocol !== 'S7') {
+            if (!PROTOCOL_DEFINITIONS[plc.protocol]) {
                 this._updateBaseDeviceStatus(device.id, {
                     status: 'unsupported',
                     quality: 'bad',
-                    message: `暂不支持 ${plc.protocol} 协议`
+                    message: `不支持 ${plc.protocol} 协议`
                 });
                 return;
             }
@@ -155,10 +168,14 @@ class PlcReader {
             }
 
             let readableCount = 0;
+            let invalidAddressCount = 0;
             points.forEach(point => {
                 if (String(point.access_type || 'READ').toUpperCase() === 'WRITE') return;
-                const address = this._normalizePointAddress(point);
-                if (!address) return;
+                const address = this._normalizePointAddress(point, plc);
+                if (!address) {
+                    invalidAddressCount += 1;
+                    return;
+                }
 
                 readableCount += 1;
                 const interval = this._resolveSampleInterval(point);
@@ -171,7 +188,9 @@ class PlcReader {
                 if (!task.devices[device.id]) {
                     task.devices[device.id] = { deviceName: device.name, points: [] };
                 }
-                task.devices[device.id].points.push({ ...point, tagName, plc_address: address });
+                const runtimePoint = { ...point, tagName, plc_address: address };
+                task.devices[device.id].points.push(runtimePoint);
+                task.points.push(runtimePoint);
 
                 if (!this.deviceTaskIds.has(device.id)) this.deviceTaskIds.set(device.id, new Set());
                 this.deviceTaskIds.get(device.id).add(taskKey);
@@ -181,13 +200,15 @@ class PlcReader {
                 this._updateBaseDeviceStatus(device.id, {
                     status: 'no_points',
                     quality: 'stale',
-                    message: '未配置可读取点位或点位地址无效'
+                    message: invalidAddressCount > 0
+                        ? `没有可读取点位：${invalidAddressCount} 个地址不符合 ${plc.protocol} 格式`
+                        : '未配置可读取点位'
                 });
             }
         });
 
         const pointCount = Array.from(this.tasks.values())
-            .reduce((sum, task) => sum + Object.keys(task.tags).length, 0);
+            .reduce((sum, task) => sum + task.points.length, 0);
         console.log(`[PlcReader] 已加载 ${pointCount} 个可读取点位，覆盖 ${this.deviceTaskIds.size} 台启用 PLC 的设备`);
         this._refreshDeviceStatuses();
     }
@@ -200,8 +221,10 @@ class PlcReader {
             endpoint: plc,
             interval,
             tags: {},
+            points: [],
             devices: {},
             conn: null,
+            driver: null,
             timer: null,
             retryTimer: null,
             reading: false,
@@ -215,7 +238,8 @@ class PlcReader {
             lastFailureAt: null,
             outageStartedAt: null,
             lastError: '',
-            nextRetryAt: null
+            nextRetryAt: null,
+            connectionGeneration: 0
         };
         this.tasks.set(taskKey, task);
         return task;
@@ -225,38 +249,62 @@ class PlcReader {
         if (this.stopped) return;
         this._clearTaskTimers(task);
         this._dropTaskConnection(task);
+        task.connectionGeneration += 1;
+        const generation = task.connectionGeneration;
         const now = Date.now();
         if (!task.firstConnectAttemptAt) task.firstConnectAttemptAt = now;
         task.lastConnectAttemptAt = now;
         if (!task.outageStartedAt && !task.lastReadAt) task.outageStartedAt = now;
-        task.conn = new nodes7();
         this._setTaskStatus(task, 'connecting', `正在连接 ${this._formatEndpoint(task.endpoint)}...`);
 
-        const { ip, port, rack, slot, timeout } = task.endpoint;
-        task.conn.initiateConnection({ host: ip, port, rack, slot, timeout }, (err) => {
-            if (this.stopped) return;
-            if (err) {
-                this._handleTaskFailure(task, err, '连接失败');
-                return;
-            }
+        if (task.endpoint.protocol === 'S7') {
+            task.conn = new nodes7();
+            const { ip, port, rack, slot, timeout } = task.endpoint;
+            task.conn.initiateConnection({ host: ip, port, rack, slot, timeout }, (err) => {
+                if (this.stopped || generation !== task.connectionGeneration) return;
+                if (err) {
+                    this._handleTaskFailure(task, err, '连接失败');
+                    return;
+                }
 
-            try {
-                const tagNames = Object.keys(task.tags);
-                task.conn.setTranslationCB(tag => task.tags[tag]);
-                task.conn.addItems(tagNames);
-                task.lastConnectedAt = Date.now();
-                task.retryCount = 0;
-                task.firstConnectAttemptAt = null;
-                task.outageStartedAt = null;
-                task.lastFailureAt = null;
-                task.lastError = '';
-                task.nextRetryAt = null;
-                this._setTaskStatus(task, 'connected', `${this._formatEndpoint(task.endpoint)} 已连接，${tagNames.length} 点，${task.interval}ms`);
+                try {
+                    const tagNames = Object.keys(task.tags);
+                    task.conn.setTranslationCB(tag => task.tags[tag]);
+                    task.conn.addItems(tagNames);
+                    this._markTaskConnected(task, `${this._formatEndpoint(task.endpoint)} 已连接，${tagNames.length} 点，${task.interval}ms`);
+                    this._startTaskPolling(task);
+                } catch (e) {
+                    this._handleTaskFailure(task, e, '点位注册失败');
+                }
+            });
+            return;
+        }
+
+        Promise.resolve()
+            .then(() => {
+                task.driver = this.driverFactory(task.endpoint);
+                return task.driver.connect();
+            })
+            .then(() => {
+                if (this.stopped || generation !== task.connectionGeneration) return;
+                this._markTaskConnected(task, `${this._formatEndpoint(task.endpoint)} 已连接，${task.points.length} 点，${task.interval}ms`);
                 this._startTaskPolling(task);
-            } catch (e) {
-                this._handleTaskFailure(task, e, '点位注册失败');
-            }
-        });
+            })
+            .catch(error => {
+                if (this.stopped || generation !== task.connectionGeneration) return;
+                this._handleTaskFailure(task, error, '连接失败');
+            });
+    }
+
+    _markTaskConnected(task, message) {
+        task.lastConnectedAt = Date.now();
+        task.retryCount = 0;
+        task.firstConnectAttemptAt = null;
+        task.outageStartedAt = null;
+        task.lastFailureAt = null;
+        task.lastError = '';
+        task.nextRetryAt = null;
+        this._setTaskStatus(task, 'connected', message);
     }
 
     _startTaskPolling(task) {
@@ -265,40 +313,61 @@ class PlcReader {
     }
 
     _readTask(task) {
-        if (this.stopped || task.reading || task.status !== 'connected' || !task.conn) return;
+        const connection = task.endpoint.protocol === 'S7' ? task.conn : task.driver;
+        if (this.stopped || task.reading || task.status !== 'connected' || !connection) return;
         task.reading = true;
-        task.conn.readAllItems((err, values) => {
-            task.reading = false;
-            if (this.stopped) return;
-            if (err) {
-                this._handleTaskFailure(task, err, '读取失败');
-                return;
-            }
-
-            task.lastReadAt = Date.now();
-            task.firstConnectAttemptAt = null;
-            task.outageStartedAt = null;
-            task.lastFailureAt = null;
-            task.lastError = '';
-            task.nextRetryAt = null;
-            if (task.status !== 'connected') {
-                this._setTaskStatus(task, 'connected', `${this._formatEndpoint(task.endpoint)} 数据正常`);
-            } else {
-                this._refreshDeviceStatuses();
-                this._notifyAggregateStatus(false);
-            }
-
-            const deviceDataArray = [];
-            Object.entries(task.devices).forEach(([deviceId, info]) => {
-                const patch = this._assembleDeviceData(deviceId, info, values || {});
-                const merged = this._mergeDevicePatch(deviceId, patch);
-                deviceDataArray.push(merged);
+        const generation = task.connectionGeneration;
+        if (task.endpoint.protocol === 'S7') {
+            connection.readAllItems((err, values) => {
+                task.reading = false;
+                if (this.stopped || generation !== task.connectionGeneration) return;
+                if (err) {
+                    this._handleTaskFailure(task, err, '读取失败');
+                    return;
+                }
+                this._handleTaskReadSuccess(task, values || {});
             });
+            return;
+        }
 
-            if (this.onData && deviceDataArray.length > 0) {
-                this.onData(deviceDataArray);
-            }
+        Promise.resolve()
+            .then(() => connection.read(task.points))
+            .then(values => {
+                task.reading = false;
+                if (this.stopped || generation !== task.connectionGeneration) return;
+                this._handleTaskReadSuccess(task, values || {});
+            })
+            .catch(error => {
+                task.reading = false;
+                if (this.stopped || generation !== task.connectionGeneration) return;
+                this._handleTaskFailure(task, error, '读取失败');
+            });
+    }
+
+    _handleTaskReadSuccess(task, values) {
+        task.lastReadAt = Date.now();
+        task.firstConnectAttemptAt = null;
+        task.outageStartedAt = null;
+        task.lastFailureAt = null;
+        task.lastError = '';
+        task.nextRetryAt = null;
+        if (task.status !== 'connected') {
+            this._setTaskStatus(task, 'connected', `${this._formatEndpoint(task.endpoint)} 数据正常`);
+        } else {
+            this._refreshDeviceStatuses();
+            this._notifyAggregateStatus(false);
+        }
+
+        const deviceDataArray = [];
+        Object.entries(task.devices).forEach(([deviceId, info]) => {
+            const patch = this._assembleDeviceData(deviceId, info, values || {});
+            const merged = this._mergeDevicePatch(deviceId, patch);
+            deviceDataArray.push(merged);
         });
+
+        if (this.onData && deviceDataArray.length > 0) {
+            this.onData(deviceDataArray);
+        }
     }
 
     _handleTaskFailure(task, err, prefix) {
@@ -306,6 +375,7 @@ class PlcReader {
         const message = `${prefix}: ${err?.message || err}`;
         console.error(`[PlcReader] ${task.id} ${message}`);
         this._clearTaskTimers(task);
+        task.connectionGeneration += 1;
         this._dropTaskConnection(task);
         this._emitBadSnapshotsForTask(task);
 
@@ -592,7 +662,7 @@ class PlcReader {
             protocol: plc.protocol,
             endpoint: plc.ip ? this._formatEndpoint(plc) : '',
             plc_ip: plc.ip || '',
-            plc_port: plc.port || 102,
+            plc_port: plc.port || defaultPortForProtocol(plc.protocol),
             plc_rack: plc.rack || 0,
             plc_slot: plc.slot || 1,
             lastConnectedAt: null,
@@ -640,41 +710,39 @@ class PlcReader {
 
     _normalizePlcConfig(device) {
         const enabled = this._isTruthy(device.plc_enabled);
+        const protocol = normalizeProtocol(device.plc_protocol || 'S7');
         return {
             enabled,
-            protocol: String(device.plc_protocol || 'S7').trim().toUpperCase(),
+            protocol,
             ip: String(device.plc_ip || '').trim(),
-            port: this._clampInteger(device.plc_port, 1, 65535, 102),
+            port: this._clampInteger(device.plc_port, 1, 65535, defaultPortForProtocol(protocol)),
             rack: this._clampInteger(device.plc_rack, 0, 10, 0),
             slot: this._clampInteger(device.plc_slot, 0, 31, 1),
             timeout: this._clampInteger(device.plc_timeout, 1000, 30000, 5000),
             retryInterval: this._clampInteger(device.plc_retry_interval, 1000, 120000, 10000),
-            maxRetries: this._clampInteger(device.plc_max_retries, 0, 999, 0)
+            maxRetries: this._clampInteger(device.plc_max_retries, 0, 999, 0),
+            options: normalizePlcOptions(protocol, device.plc_options)
         };
     }
 
     _endpointKey(plc) {
-        return `${plc.protocol}:${plc.ip}:${plc.port}:${plc.rack}:${plc.slot}`;
+        return endpointKey(plc);
     }
 
     _formatEndpoint(plc) {
-        return `${plc.protocol || 'S7'} ${plc.ip}:${plc.port} (Rack=${plc.rack}, Slot=${plc.slot})`;
+        return formatEndpoint(plc);
     }
 
     _resolveSampleInterval(point) {
         return this._clampInteger(point.sample_interval_ms, MIN_SAMPLE_INTERVAL_MS, MAX_SAMPLE_INTERVAL_MS, 1000);
     }
 
-    _normalizePointAddress(point) {
-        const raw = String(point.plc_tag || '').trim();
-        if (raw) return this._normalizeS7Address(raw, point.data_type);
-
-        const dbNumber = Number(point.db_number);
-        const byteOffset = Number(point.db_byte_offset);
-        if (!Number.isInteger(dbNumber) || !Number.isInteger(byteOffset)) return null;
-
-        const bitOffset = this._clampInteger(point.bit_offset, 0, 7, 0);
-        return this._composeDbAddress(dbNumber, byteOffset, bitOffset, point.data_type);
+    _normalizePointAddress(point, plc = { protocol: 'S7', options: {} }) {
+        try {
+            return normalizePointAddress(plc.protocol, point, plc.options);
+        } catch (error) {
+            return null;
+        }
     }
 
     _normalizeS7Address(address, dataType) {
@@ -726,18 +794,7 @@ class PlcReader {
     }
 
     _canonicalDataType(dataType) {
-        const type = String(dataType || 'WORD').trim().toUpperCase();
-        if (type === 'BOOL' || type === 'BIT' || type === 'X') return 'BOOL';
-        if (type === 'FLOAT' || type === 'REAL' || type === 'R') return 'REAL';
-        if (type === 'LREAL' || type === 'LR') return 'LREAL';
-        if (type === 'DINT' || type === 'DI') return 'DINT';
-        if (type === 'DWORD' || type === 'DW') return 'DWORD';
-        if (type === 'INT' || type === 'I') return 'INT';
-        if (type === 'BYTE' || type === 'B') return 'BYTE';
-        if (type === 'STRING' || type === 'S') return 'STRING';
-        if (type === 'CHAR' || type === 'C') return 'CHAR';
-        if (['DT', 'DTZ', 'DTL', 'DTLZ'].includes(type)) return type;
-        return 'WORD';
+        return canonicalDataType(dataType);
     }
 
     _resolveQuality(rawValue, point) {
@@ -840,13 +897,21 @@ class PlcReader {
     }
 
     _dropTaskConnection(task) {
-        if (!task.conn) return;
-        try {
-            task.conn.dropConnection();
-        } catch (e) {
-            // nodes7 断开异常无需阻断重连。
+        if (task.conn) {
+            try {
+                task.conn.dropConnection();
+            } catch (e) {
+                // nodes7 断开异常无需阻断重连。
+            }
+            task.conn = null;
         }
-        task.conn = null;
+        if (task.driver) {
+            const driver = task.driver;
+            task.driver = null;
+            Promise.resolve(driver.disconnect?.()).catch(error => {
+                console.warn(`[PlcReader] ${task.id} 协议连接清理失败: ${error.message}`);
+            });
+        }
     }
 
     _isTruthy(value) {

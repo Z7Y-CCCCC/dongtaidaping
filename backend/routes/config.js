@@ -8,6 +8,7 @@ const {
     loadPublishedDocument,
     runtimePlatformPayload
 } = require('../services/dashboardDocuments');
+const { normalizeProtocol, sanitizePlcOptions } = require('../services/plcProtocolConfig');
 
 function safeJsonParse(value, fallback) {
     if (!value) return fallback;
@@ -37,7 +38,11 @@ router.get('/', async (req, res) => {
 
         const workshops = await db.all('SELECT * FROM workshops ORDER BY sort_order ASC');
         const lines = await db.all('SELECT * FROM `lines` ORDER BY sort_order ASC');
-        const allDevices = await db.all('SELECT * FROM devices ORDER BY line_id, sort_order ASC');
+        const allDevices = (await db.all('SELECT * FROM devices ORDER BY line_id, sort_order ASC')).map(device => ({
+            ...device,
+            plc_protocol: normalizeProtocol(device.plc_protocol || 'S7'),
+            plc_options: sanitizePlcOptions(device.plc_protocol || 'S7', device.plc_options)
+        }));
         const allPoints = await db.all('SELECT * FROM data_points ORDER BY device_id');
 
         const pointsByDevice = {};

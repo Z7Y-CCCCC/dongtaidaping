@@ -1520,6 +1520,7 @@ async function ensureSchemaColumns() {
     await ensureColumn('devices', 'plc_protocol', `${t.string(32)} DEFAULT 'S7'`);
     await ensureColumn('devices', 'plc_ip', `${t.string(128)} DEFAULT ''`);
     await ensureColumn('devices', 'plc_port', `${t.int} DEFAULT 102`);
+    await ensureColumn('devices', 'plc_options', `${t.json}`);
     await ensureColumn('devices', 'plc_rack', `${t.int} DEFAULT 0`);
     await ensureColumn('devices', 'plc_slot', `${t.int} DEFAULT 1`);
     await ensureColumn('devices', 'plc_timeout', `${t.int} DEFAULT 5000`);
@@ -1592,6 +1593,7 @@ async function initTables() {
         plc_protocol ${t.string(32)} DEFAULT 'S7',
         plc_ip ${t.string(128)} DEFAULT '',
         plc_port ${t.int} DEFAULT 102,
+        plc_options ${t.json},
         plc_rack ${t.int} DEFAULT 0,
         plc_slot ${t.int} DEFAULT 1,
         plc_timeout ${t.int} DEFAULT 5000,

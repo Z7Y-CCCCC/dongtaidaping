@@ -5,6 +5,13 @@
 
 import { ref, reactive, computed, watch, nextTick } from 'vue'
 import { adminApi } from '../../../config/factoryConfig.js'
+import {
+    getPlcAddressHint,
+    getPlcAddressPlaceholder,
+    normalizePlcOptions,
+    normalizePlcProtocol,
+    validatePlcAddress
+} from '../../../config/plcProtocols.js'
 import { parseVoiceConfig, normalizeVoiceRule, createVoiceAnnouncer } from '../../../runtime/VoiceAnnouncer.js'
 import { optionalNumber, isBlank } from '../utils/common.js'
 
@@ -415,8 +422,31 @@ export function useDataPoints({
         return String(point?.data_type || '').toUpperCase() === 'BOOL'
     }
 
+    function pointDevice(point) {
+        const deviceId = point?.device_id || selectedDeviceForPoints.value
+        return devices.value.find(device => device.id === deviceId) || null
+    }
+
+    function pointProtocol(point) {
+        return normalizePlcProtocol(pointDevice(point)?.plc_protocol || 'S7')
+    }
+
+    function pointProtocolOptions(point) {
+        const device = pointDevice(point)
+        return normalizePlcOptions(pointProtocol(point), device?.plc_options)
+    }
+
+    function getPointAddressPlaceholder(point) {
+        return getPlcAddressPlaceholder(pointProtocol(point))
+    }
+
+    function getPointAddressTitle(point) {
+        return `${getPlcAddressHint(pointProtocol(point))} ${validatePlcAddress(pointProtocol(point), point?.plc_tag, point?.data_type, pointProtocolOptions(point)) || ''}`.trim()
+    }
+
     function autoConvertPlcTagForDataType(point) {
         if (!point || !point.plc_tag || typeof point.plc_tag !== 'string') return
+        if (pointProtocol(point) !== 'S7') return
         const tag = point.plc_tag.trim()
         if (!tag) return
 
@@ -477,6 +507,10 @@ export function useDataPoints({
 
     function getPlcAddressWarning(point) {
         if (!point || !point.plc_tag || !String(point.plc_tag).trim()) return ''
+        const protocol = pointProtocol(point)
+        if (protocol !== 'S7') {
+            return validatePlcAddress(protocol, point.plc_tag, point.data_type, pointProtocolOptions(point))
+        }
         const tag = String(point.plc_tag).trim().toUpperCase()
         const dataType = String(point.data_type || 'WORD').toUpperCase()
 
@@ -765,6 +799,12 @@ export function useDataPoints({
             if (!hasPlcTag) {
                 errors.push(`第 ${row} 行：必须填写 PLC 地址`)
             }
+            if (hasPlcTag) {
+                const addressError = validatePlcAddress(pointProtocol(point), point.plc_tag, point.data_type, pointProtocolOptions(point))
+                if (addressError) errors.push(`第 ${row} 行：${addressError}`)
+            } else if (pointProtocol(point) !== 'S7') {
+                errors.push(`第 ${row} 行：${pointProtocol(point)} 必须直接填写协议地址`)
+            }
             if (isTextPointType(point) && !hasPlcTag) {
                 errors.push(`第 ${row} 行：文本点位请直接填写完整 PLC 地址，例如 DB10,S20.30`)
             }
@@ -999,6 +1039,8 @@ export function useDataPoints({
         removeDataPoint,
         markPointsDirty,
         isBoolPoint,
+        getPointAddressPlaceholder,
+        getPointAddressTitle,
         autoConvertPlcTagForDataType,
         getPlcDuplicateWarning,
         getPlcAddressWarning,

@@ -1,6 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const { getDb } = require('../db/database');
+const {
+    normalizePlcOptions,
+    normalizeProtocol,
+    validatePointAddress
+} = require('../services/plcProtocolConfig');
 
 function nullableNumber(value) {
     return value === undefined || value === null || value === '' ? null : Number(value);
@@ -164,8 +169,9 @@ function normalizePointPayload(point, fallback = '') {
     };
 }
 
-function validatePointPayload(point, rowLabel = '点位') {
+function validatePointPayload(point, rowLabel = '点位', protocolValue = 'S7', plcOptions = {}) {
     const errors = [];
+    const protocol = normalizeProtocol(protocolValue);
     let normalized;
     try {
         normalized = normalizePointPayload(point, rowLabel);
@@ -181,6 +187,12 @@ function validatePointPayload(point, rowLabel = '点位') {
     const hasDbByte = !isBlank(normalized.db_byte_offset);
     if (!hasPlcTag && (!hasDbNumber || !hasDbByte)) {
         errors.push(`${rowLabel}: 必须填写 PLC 地址`);
+    }
+    if (hasPlcTag) {
+        const addressError = validatePointAddress(protocol, normalized.plc_tag, normalized.data_type, plcOptions);
+        if (addressError) errors.push(`${rowLabel}: ${addressError}`);
+    } else if (protocol !== 'S7') {
+        errors.push(`${rowLabel}: ${protocol} 必须直接填写协议地址`);
     }
     if (['STRING', 'CHAR'].includes(normalized.data_type) && !hasPlcTag) {
         errors.push(`${rowLabel}: 文本点位请填写完整 PLC 地址，例如 DB10,S20.30`);
@@ -325,13 +337,18 @@ router.post('/', async (req, res) => {
     if (!device_id) {
         return res.status(400).json({ error: '设备ID不能为空' });
     }
-    const validationErrors = validatePointPayload(req.body);
-    if (validationErrors.length) {
-        return res.status(400).json({ error: validationErrors.join('\n') });
-    }
     const point = normalizePointPayload(req.body, device_id);
     try {
         const db = await getDb();
+        const device = await db.get('SELECT plc_protocol, plc_options FROM devices WHERE id = ?', [device_id]);
+        if (!device) return res.status(404).json({ error: '设备不存在，无法保存点位' });
+        const validationErrors = validatePointPayload(
+            req.body,
+            '点位',
+            device.plc_protocol,
+            normalizePlcOptions(device.plc_protocol, device.plc_options)
+        );
+        if (validationErrors.length) return res.status(400).json({ error: validationErrors.join('\n') });
         const result = await db.run(`INSERT INTO data_points (
             device_id, name, label, plc_tag, data_type, category, value_role,
             quality, scale, offset, expression, display_format, unit,
@@ -374,15 +391,20 @@ router.post('/', async (req, res) => {
 });
 
 router.put('/:id', async (req, res) => {
-    const validationErrors = validatePointPayload(req.body);
-    if (validationErrors.length) {
-        return res.status(400).json({ error: validationErrors.join('\n') });
-    }
-    const point = normalizePointPayload(req.body, req.params.id);
     try {
         const db = await getDb();
-        const existing = await db.get('SELECT id FROM data_points WHERE id = ?', [req.params.id]);
+        const existing = await db.get(`SELECT p.*, d.plc_protocol, d.plc_options
+            FROM data_points p LEFT JOIN devices d ON d.id = p.device_id
+            WHERE p.id = ?`, [req.params.id]);
         if (!existing) return res.status(404).json({ error: '点位不存在，可能已经被删除或 ID 未正确编码' });
+        const validationErrors = validatePointPayload(
+            req.body,
+            '点位',
+            existing.plc_protocol,
+            normalizePlcOptions(existing.plc_protocol, existing.plc_options)
+        );
+        if (validationErrors.length) return res.status(400).json({ error: validationErrors.join('\n') });
+        const point = normalizePointPayload(req.body, req.params.id);
 
         await db.run(`UPDATE data_points SET
             name=?, label=?, plc_tag=?, data_type=?, category=?, value_role=?, quality=?,
@@ -447,16 +469,16 @@ router.post('/sync', async (req, res) => {
         return res.status(400).json({ error: '需要 device_id 和 points 数组' });
     }
 
-    const validationErrors = [];
-    points.forEach((point, index) => {
-        validationErrors.push(...validatePointPayload(point, `第 ${index + 1} 行`));
-    });
-    if (validationErrors.length) {
-        return res.status(400).json({ error: validationErrors.join('\n') });
-    }
-
     try {
         const db = await getDb();
+        const deviceConfig = await db.get('SELECT id, plc_protocol, plc_options FROM devices WHERE id = ?', [device_id]);
+        if (!deviceConfig) return res.status(404).json({ error: '设备不存在，无法保存点位配置' });
+        const protocolOptions = normalizePlcOptions(deviceConfig.plc_protocol, deviceConfig.plc_options);
+        const validationErrors = [];
+        points.forEach((point, index) => {
+            validationErrors.push(...validatePointPayload(point, `第 ${index + 1} 行`, deviceConfig.plc_protocol, protocolOptions));
+        });
+        if (validationErrors.length) return res.status(400).json({ error: validationErrors.join('\n') });
         const result = await db.transaction(async (tx) => {
             const device = await tx.get('SELECT id FROM devices WHERE id = ?', [device_id]);
             if (!device) {
@@ -535,18 +557,16 @@ router.post('/batch', async (req, res) => {
         return res.status(400).json({ error: '需要 device_id 和 points 数组' });
     }
 
-    const validationErrors = [];
-    points.forEach((point, index) => {
-        validationErrors.push(...validatePointPayload(point, `第 ${index + 1} 行`));
-    });
-    if (validationErrors.length) {
-        return res.status(400).json({ error: validationErrors.join('\n') });
-    }
-
     try {
         const db = await getDb();
-        const device = await db.get('SELECT id FROM devices WHERE id = ?', [device_id]);
+        const device = await db.get('SELECT id, plc_protocol, plc_options FROM devices WHERE id = ?', [device_id]);
         if (!device) return res.status(404).json({ error: '设备不存在，无法保存点位配置' });
+        const protocolOptions = normalizePlcOptions(device.plc_protocol, device.plc_options);
+        const validationErrors = [];
+        points.forEach((point, index) => {
+            validationErrors.push(...validatePointPayload(point, `第 ${index + 1} 行`, device.plc_protocol, protocolOptions));
+        });
+        if (validationErrors.length) return res.status(400).json({ error: validationErrors.join('\n') });
 
         await db.transaction(async (tx) => {
             await tx.run('DELETE FROM data_points WHERE device_id = ?', [device_id]);
