@@ -7980,11 +7980,12 @@ const mainTabs = [
                                 <h3 class="section-title">旧 Web 大屏渲染性能（过渡保留）</h3>
                                 <button
                                     type="button"
-                                    class="btn btn-small legacy-web-render-toggle"
+                                    class="btn btn-small legacy-web-render-toggle icon-only"
                                     :aria-expanded="isLegacyWebRenderSettingsOpen"
+                                    :aria-label="isLegacyWebRenderSettingsOpen ? '收起旧 Web 渲染设置' : '显示旧 Web 渲染设置'"
+                                    :title="isLegacyWebRenderSettingsOpen ? '收起设置' : '显示设置'"
                                     @click="isLegacyWebRenderSettingsOpen = !isLegacyWebRenderSettingsOpen"
                                 >
-                                    {{ isLegacyWebRenderSettingsOpen ? '收起' : '显示设置' }}
                                     <svg viewBox="0 0 20 20" aria-hidden="true">
                                         <path d="M5.75 7.75 10 12l4.25-4.25" />
                                     </svg>
@@ -11534,8 +11535,10 @@ button:enabled:active {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 6px;
-    min-width: 96px;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    border-radius: 9px;
     color: #1d1d1f;
     background: #ffffff;
     border: 1px solid rgba(0, 0, 0, 0.1);
