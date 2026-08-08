@@ -11,7 +11,7 @@ const selectedWidgetId = ref('')
 const hostConnected = ref(false)
 const lineReturnBusy = ref(false)
 const databaseValues = reactive({})
-const runtimeContext = reactive({ viewMode: 'factory', sceneId: '', workshopId: '', lineId: '', deviceId: '' })
+const runtimeContext = reactive({ viewId: 'factory_overview', viewMode: 'factory', sceneReady: false, sceneId: '', workshopId: '', lineId: '', deviceId: '' })
 const groupVisibility = reactive({})
 const widgetVisibility = reactive({})
 
@@ -35,6 +35,26 @@ const CONFIG_ONLY_WIDGET_TYPES = new Set([
 ])
 
 const platform = computed(() => getPlatform() || {})
+const dashboardViews = computed(() => {
+    const views = platform.value.document?.scene?.views || platform.value.activeScene?.views || []
+    return Array.isArray(views) && views.length
+        ? views
+        : [{ id: 'factory_overview', name: '全厂总览', mode: 'factory', targetType: 'factory', returnViewId: '' }]
+})
+const currentView = computed(() => dashboardViews.value.find(view => view.id === runtimeContext.viewId)
+    || dashboardViews.value.find(view => view.mode === runtimeContext.viewMode)
+    || dashboardViews.value[0])
+const parentViewName = computed(() => {
+    const parentId = currentView.value?.returnViewId || currentView.value?.parentViewId
+    return dashboardViews.value.find(view => view.id === parentId)?.name || '上一级视角'
+})
+function viewComponentVisible(type, id = `widget_${type}`) {
+    const state = currentView.value?.componentState || {}
+    const candidates = [id, type, `system:${type}`].filter(Boolean)
+    if (candidates.some(candidate => state.hide?.includes(candidate))) return false
+    if (state.show?.length && !candidates.some(candidate => state.show.includes(candidate))) return false
+    return true
+}
 const dashboardCanvas = computed(() => platform.value.document?.canvas || platform.value.canvas || {
     width: 1920,
     height: 1080,
@@ -54,13 +74,22 @@ const configuredWidgets = computed(() => {
         .filter(widget => widget.runtimeTarget !== 'unity')
         .sort((left, right) => Number(left.zIndex ?? left.sort_order ?? 0) - Number(right.zIndex ?? right.sort_order ?? 0))
 })
-const widgets = computed(() => configuredWidgets.value.filter(widget => widgetRuntimeVisible(widget, {
+const widgets = computed(() => {
+    if (runtimeContext.sceneReady === false) return []
+    return configuredWidgets.value.filter(widget => {
+    const state = currentView.value?.componentState || {}
+    const groupId = widget.groupId ? `group:${widget.groupId}` : ''
+    if (state.hide?.includes(widget.id) || (groupId && state.hide?.includes(groupId))) return false
+    if (state.show?.length && !state.show.includes(widget.id) && (!groupId || !state.show.includes(groupId))) return false
+    return true
+    }).filter(widget => widgetRuntimeVisible(widget, {
     context: runtimeContext,
     dataValue: runtimeValueForWidget(widget),
     dataRecord: widget.data?.mode === 'database' ? databaseValues[widget.id] : null,
     groupVisibility,
     widgetVisibility
-})))
+    }))
+})
 
 function getByPath(source, path) {
     if (!path) return undefined
@@ -229,7 +258,9 @@ function eventQueryConfig() {
 }
 
 async function focusNativeScene(mode, event = {}) {
+    const configuredView = viewFor(mode, event.viewId)
     Object.assign(runtimeContext, {
+        viewId: configuredView?.id || event.viewId || runtimeContext.viewId,
         viewMode: mode,
         deviceId: mode === 'device' ? (event.deviceId || '') : '',
         lineId: mode === 'line' ? (event.lineId || runtimeContext.lineId || '') : (mode === 'device' ? runtimeContext.lineId : ''),
@@ -240,8 +271,9 @@ async function focusNativeScene(mode, event = {}) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                action: 'focus',
+                action: 'view',
                 source: 'dashboard_overlay',
+                viewId: configuredView?.id || event.viewId || '',
                 focus: {
                     mode,
                     deviceId: event.deviceId || '',
@@ -257,12 +289,51 @@ async function focusNativeScene(mode, event = {}) {
     }
 }
 
+function viewFor(mode, viewId = '') {
+    return dashboardViews.value.find(view => view.id === viewId)
+        || dashboardViews.value.find(view => view.mode === mode)
+        || dashboardViews.value[0]
+}
+
+async function focusNativeView(viewId, event = {}) {
+    const view = viewFor(event.mode || 'factory', viewId)
+    const mode = view?.mode === 'custom' ? (view.targetType || 'factory') : (view?.mode || event.mode || 'factory')
+    Object.assign(runtimeContext, {
+        viewId: view?.id || viewId || runtimeContext.viewId,
+        viewMode: mode,
+        deviceId: mode === 'device' ? (event.deviceId || view?.targetId || '') : '',
+        lineId: mode === 'line' ? (event.lineId || view?.targetId || runtimeContext.lineId || '') : (mode === 'device' ? runtimeContext.lineId : ''),
+        workshopId: mode === 'workshop' ? (event.workshopId || view?.targetId || '') : (['line', 'device'].includes(mode) ? runtimeContext.workshopId : '')
+    })
+    try {
+        const response = await fetch(API_BASE + '/native-preview', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                action: 'view',
+                source: 'dashboard_overlay',
+                viewId: view?.id || viewId || '',
+                focus: {
+                    mode,
+                    deviceId: event.deviceId || (view?.targetType === 'device' ? view.targetId : '') || '',
+                    lineId: event.lineId || (view?.targetType === 'line' ? view.targetId : '') || '',
+                    workshopId: event.workshopId || (view?.targetType === 'workshop' ? view.targetId : '') || ''
+                }
+            })
+        })
+        return response.ok
+    } catch {
+        return false
+    }
+}
+
 async function returnToLineView() {
     if (lineReturnBusy.value) return
     lineReturnBusy.value = true
     try {
-        // lineId 留空时，Unity 会依据当前设备自动解析所属产线。
-        await focusNativeScene('line')
+        const parentId = currentView.value?.returnViewId || currentView.value?.parentViewId
+        if (parentId) await focusNativeView(parentId, { mode: 'factory' })
+        else await focusNativeScene('line')
     } finally {
         lineReturnBusy.value = false
     }
@@ -291,6 +362,7 @@ function handleWidgetAction({ event }) {
     if (event.action === 'focus_factory') return focusNativeScene('factory', event)
     if (event.action === 'focus_line') return focusNativeScene('line', event)
     if (event.action === 'focus_workshop') return focusNativeScene('workshop', event)
+    if (event.action === 'switch_view' && event.viewId) return focusNativeView(event.viewId, event)
     if (event.action === 'play_voice') return playVoice(event)
     if (event.action === 'open_link' && /^https?:\/\//i.test(event.url || '')) {
         if (window.chrome?.webview) postHostMessage({ type: 'dashboard_action', action: 'open_link', url: event.url })
@@ -303,13 +375,17 @@ function handleWidgetAction({ event }) {
 
 async function handleRuntimeMessage(message) {
     if (message?.type === 'dashboard_context_changed') {
-        Object.assign(runtimeContext, message.payload || {})
+        const payload = message.payload || {}
+        Object.assign(runtimeContext, payload)
+        if (!Object.prototype.hasOwnProperty.call(payload, 'sceneReady')) runtimeContext.sceneReady = true
         scheduleRegionReport()
         return
     }
     if (message?.type === 'dashboard_release_changed') {
         await loadConfig()
         runtimeContext.sceneId = platform.value.activeScene?.id || runtimeContext.sceneId
+        runtimeContext.viewId = platform.value.document?.scene?.defaultViewId || platform.value.activeScene?.defaultViewId || runtimeContext.viewId
+        runtimeContext.viewMode = dashboardViews.value.find(view => view.id === runtimeContext.viewId)?.mode || 'factory'
         dataStore.setEventQueryOptions(eventQueryConfig())
         await refreshDatabaseValues(true)
         await nextTick()
@@ -320,7 +396,10 @@ async function handleRuntimeMessage(message) {
 function handleHostMessage(event) {
     if (event.data?.type !== 'overlay_host_state') return
     hostConnected.value = event.data.visible !== false
-    if (event.data.context) Object.assign(runtimeContext, event.data.context)
+    if (event.data.context) {
+        Object.assign(runtimeContext, event.data.context)
+        if (!Object.prototype.hasOwnProperty.call(event.data.context, 'sceneReady')) runtimeContext.sceneReady = true
+    }
     scheduleRegionReport()
 }
 
@@ -345,6 +424,9 @@ onMounted(async () => {
 
     await loadConfig()
     runtimeContext.sceneId = platform.value.activeScene?.id || ''
+    runtimeContext.viewId = platform.value.document?.scene?.defaultViewId || platform.value.activeScene?.defaultViewId || 'factory_overview'
+    runtimeContext.viewMode = dashboardViews.value.find(view => view.id === runtimeContext.viewId)?.mode || 'factory'
+    if (!window.chrome?.webview) runtimeContext.sceneReady = true
     registerConfiguredDevices()
     dataStore.setEventQueryOptions(eventQueryConfig())
     dataStore.setMessageHandler(handleRuntimeMessage)
@@ -388,15 +470,16 @@ onUnmounted(() => {
 </script>
 
 <template>
-    <div ref="rootRef" class="dashboard-overlay-root">
+    <div ref="rootRef" class="dashboard-overlay-root" :class="{ 'is-scene-ready': runtimeContext.sceneReady !== false }">
         <div class="overlay-canvas">
             <button
                 type="button"
+                v-if="runtimeContext.viewMode !== 'factory' && viewComponentVisible('navigation')"
                 class="overlay-line-return"
                 :class="{ 'is-busy': lineReturnBusy }"
                 :disabled="lineReturnBusy"
-                aria-label="返回产线视角"
-                title="返回产线视角"
+                :aria-label="`返回${parentViewName}`"
+                :title="`返回${parentViewName}`"
                 data-overlay-hit="true"
                 @pointerdown.stop
                 @click.stop="returnToLineView"
@@ -477,7 +560,10 @@ body,
 .overlay-canvas {
     position: absolute;
     inset: 0;
+    opacity: 0;
+    transition: opacity 240ms ease;
 }
+.dashboard-overlay-root.is-scene-ready .overlay-canvas { opacity: 1; }
 
 .overlay-line-return {
     position: absolute;
@@ -514,12 +600,13 @@ body,
     height: 20px;
     overflow: visible;
     fill: none;
-    stroke: currentColor;
+    stroke: #ffffff !important;
     stroke-width: 2.15;
     stroke-linecap: round;
     stroke-linejoin: round;
     transition: transform 160ms ease;
 }
+.overlay-line-return svg path { stroke: #ffffff !important; fill: none !important; }
 .overlay-line-return:hover:not(:disabled) svg { transform: translateX(-1px); }
 .overlay-line-return.is-busy svg { animation: overlayReturnPulse 700ms ease-in-out infinite alternate; }
 

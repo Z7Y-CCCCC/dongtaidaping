@@ -47,7 +47,7 @@ function normalizeDevice(device) {
 
 function normalizeFocus(value) {
     const source = safeObject(value);
-    const mode = ['factory', 'workshop', 'line', 'device'].includes(source.mode) ? source.mode : 'factory';
+    const mode = ['factory', 'workshop', 'line', 'device', 'custom'].includes(source.mode) ? source.mode : 'factory';
     return {
         mode,
         workshopId: shortText(source.workshopId, 120),
@@ -68,7 +68,7 @@ module.exports = function createNativePreviewRouter(controller) {
     });
 
     router.post('/', (req, res) => {
-        const action = ['apply', 'reset', 'reload', 'camera', 'focus'].includes(req.body?.action)
+        const action = ['apply', 'reset', 'reload', 'camera', 'focus', 'view'].includes(req.body?.action)
             ? req.body.action
             : 'apply';
         const devices = (Array.isArray(req.body?.devices) ? req.body.devices : [])
@@ -96,6 +96,8 @@ module.exports = function createNativePreviewRouter(controller) {
             sessionId: shortText(req.body?.sessionId, 120),
             sequence: finiteNumber(req.body?.sequence, 0, 0, Number.MAX_SAFE_INTEGER),
             source: shortText(req.body?.source || 'admin', 80),
+            viewId: shortText(req.body?.viewId, 128),
+            view: safeObject(req.body?.view),
             includeLayout: !!req.body?.includeLayout,
             devices,
             lines,

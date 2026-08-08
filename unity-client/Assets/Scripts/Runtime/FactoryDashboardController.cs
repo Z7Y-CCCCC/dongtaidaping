@@ -11,8 +11,8 @@ using UnityEngine;
 namespace HeatTreatment.DigitalTwin.Runtime
 {
     /// <summary>
-    /// Native two-level presentation shell:
-    /// factory overview -> click a device -> focused equipment detail.
+    /// Configurable multi-level presentation shell:
+    /// factory -> workshop -> line -> device (plus custom authored views).
     /// It intentionally uses the authored PBR materials without neon edge rendering.
     /// </summary>
     public sealed class FactoryDashboardController : MonoBehaviour
@@ -21,6 +21,26 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             Overview,
             Detail
+        }
+
+        public sealed class ConfiguredView
+        {
+            public string Id;
+            public string Name;
+            public string Mode;
+            public string TargetType;
+            public string TargetId;
+            public string ParentViewId;
+            public string ReturnViewId;
+            public float Yaw = -39f;
+            public float Pitch = 33f;
+            public float DistanceScale = 1.08f;
+            public float TransitionSeconds = 0.8f;
+            public bool RelativeToTarget;
+            public Vector3 TargetOffset = Vector3.zero;
+            public readonly HashSet<string> ShowComponents = new HashSet<string>();
+            public readonly HashSet<string> HideComponents = new HashSet<string>();
+            public bool HideNonTargetDevices;
         }
 
         private sealed class DeviceView
@@ -110,6 +130,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private DeviceView _selected;
         private DashboardMode _mode = DashboardMode.Overview;
         private string _factoryName = "智能热处理数字孪生控制中心";
+        private string _activeViewId = "factory_overview";
         private string _backendState = "starting";
         private string _plcState = "unknown";
         private float _uiScale = 1f;
@@ -120,6 +141,8 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private float _uiBlend = 1f;
         private bool _webOverlayActive;
         private NativeDashboardConfig _dashboardConfig = new NativeDashboardConfig();
+        private readonly Dictionary<string, ConfiguredView> _configuredViews = new Dictionary<string, ConfiguredView>();
+        private string _defaultViewId = "factory_overview";
 
         private Texture2D _whiteTexture;
         private Texture2D _buttonTexture;
@@ -163,7 +186,23 @@ namespace HeatTreatment.DigitalTwin.Runtime
         }
 
         public string SelectedDeviceId => _selected?.Device?.Id ?? string.Empty;
+        public string ActiveViewId => _activeViewId;
         public event Action<string, string> ViewContextChanged;
+
+        /// <summary>
+        /// Determines whether a native Unity component is enabled for the active
+        /// authored view. IDs are checked first, then the stable component type,
+        /// so old documents and newly generated designer IDs both work.
+        /// </summary>
+        public bool IsActiveViewComponentVisible(string id, string type = "")
+        {
+            var view = ResolveView(_activeViewId, _mode == DashboardMode.Detail ? "device" : "factory");
+            if (view == null) return true;
+            var candidates = new[] { id, type, string.IsNullOrWhiteSpace(type) ? string.Empty : $"system:{type}" }
+                .Where(value => !string.IsNullOrWhiteSpace(value));
+            if (candidates.Any(value => view.HideComponents.Contains(value))) return false;
+            return view.ShowComponents.Count == 0 || candidates.Any(value => view.ShowComponents.Contains(value));
+        }
 
         public void Initialize(
             Camera runtimeCamera,
@@ -179,6 +218,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             ClearFactory();
             _config = config;
+            ApplyPublishedViews(config?.Platform?["document"] as JObject);
             _lineNames.Clear();
             ApplySettings(config?.Settings);
 
@@ -233,6 +273,112 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _dashboardConfig = NormalizeDashboardConfig(next);
         }
 
+        public void ApplyPublishedViews(JObject document)
+        {
+            _configuredViews.Clear();
+            _defaultViewId = document?.SelectToken("scene.defaultViewId")?.Value<string>()
+                ?? document?.SelectToken("scene.default_view_id")?.Value<string>()
+                ?? "factory_overview";
+            var views = document?.SelectToken("scene.views") as JArray;
+            if (views != null)
+            {
+                foreach (var token in views.OfType<JObject>())
+                {
+                    var id = token.Value<string>("id");
+                    if (string.IsNullOrWhiteSpace(id)) continue;
+                    var camera = token["camera"] as JObject;
+                    var state = (token["componentState"] ?? token["components"]) as JObject;
+                    var targetOffset = camera?["targetOffset"] as JArray;
+                    var view = new ConfiguredView
+                    {
+                        Id = id,
+                        Name = token.Value<string>("name") ?? id,
+                        Mode = (token.Value<string>("mode") ?? "custom").ToLowerInvariant(),
+                        TargetType = (token.Value<string>("targetType") ?? token.Value<string>("target_type") ?? "factory").ToLowerInvariant(),
+                        TargetId = token.Value<string>("targetId") ?? token.Value<string>("target_id") ?? string.Empty,
+                        ParentViewId = token.Value<string>("parentViewId") ?? token.Value<string>("parent_view_id") ?? string.Empty,
+                        ReturnViewId = token.Value<string>("returnViewId") ?? token.Value<string>("return_view_id") ?? string.Empty,
+                        Yaw = Mathf.Clamp(camera?.Value<float?>("yaw") ?? -39f, -360f, 360f),
+                        Pitch = Mathf.Clamp(camera?.Value<float?>("pitch") ?? 33f, 6f, 82f),
+                        DistanceScale = Mathf.Clamp(camera?.Value<float?>("distanceScale") ?? 1.08f, .1f, 10f),
+                        TransitionSeconds = Mathf.Clamp(camera?.Value<float?>("transitionSeconds") ?? .8f, 0f, 10f),
+                        RelativeToTarget = camera?.Value<bool?>("relativeToTarget") ?? false,
+                        HideNonTargetDevices = state?.Value<bool?>("hideNonTargetDevices") ?? false
+                    };
+                    if (targetOffset != null)
+                    {
+                        view.TargetOffset = new Vector3(
+                            targetOffset.Count > 0 ? targetOffset[0].Value<float>() : 0f,
+                            targetOffset.Count > 1 ? targetOffset[1].Value<float>() : 0f,
+                            targetOffset.Count > 2 ? targetOffset[2].Value<float>() : 0f);
+                    }
+                    foreach (var item in state?["show"] as JArray ?? new JArray()) view.ShowComponents.Add(item.ToString());
+                    foreach (var item in state?["hide"] as JArray ?? new JArray()) view.HideComponents.Add(item.ToString());
+                    _configuredViews[id] = view;
+                }
+            }
+            EnsureBuiltInViews();
+        }
+
+        public void ApplyTransientView(JObject token)
+        {
+            if (token == null) return;
+            var id = token.Value<string>("id");
+            if (string.IsNullOrWhiteSpace(id)) return;
+            var camera = token["camera"] as JObject;
+            var state = (token["componentState"] ?? token["components"]) as JObject;
+            var view = new ConfiguredView
+            {
+                Id = id,
+                Name = token.Value<string>("name") ?? id,
+                Mode = (token.Value<string>("mode") ?? "custom").ToLowerInvariant(),
+                TargetType = (token.Value<string>("targetType") ?? "factory").ToLowerInvariant(),
+                TargetId = token.Value<string>("targetId") ?? string.Empty,
+                ParentViewId = token.Value<string>("parentViewId") ?? string.Empty,
+                ReturnViewId = token.Value<string>("returnViewId") ?? string.Empty,
+                Yaw = Mathf.Clamp(camera?.Value<float?>("yaw") ?? -39f, -360f, 360f),
+                Pitch = Mathf.Clamp(camera?.Value<float?>("pitch") ?? 33f, 6f, 82f),
+                DistanceScale = Mathf.Clamp(camera?.Value<float?>("distanceScale") ?? 1.08f, .1f, 10f),
+                TransitionSeconds = Mathf.Clamp(camera?.Value<float?>("transitionSeconds") ?? .8f, 0f, 10f),
+                RelativeToTarget = camera?.Value<bool?>("relativeToTarget") ?? false,
+                HideNonTargetDevices = state?.Value<bool?>("hideNonTargetDevices") ?? false
+            };
+            var targetOffset = camera?["targetOffset"] as JArray;
+            if (targetOffset != null)
+            {
+                view.TargetOffset = new Vector3(
+                    targetOffset.Count > 0 ? targetOffset[0].Value<float>() : 0f,
+                    targetOffset.Count > 1 ? targetOffset[1].Value<float>() : 0f,
+                    targetOffset.Count > 2 ? targetOffset[2].Value<float>() : 0f);
+            }
+            foreach (var item in state?["show"] as JArray ?? new JArray()) view.ShowComponents.Add(item.ToString());
+            foreach (var item in state?["hide"] as JArray ?? new JArray()) view.HideComponents.Add(item.ToString());
+            _configuredViews[id] = view;
+        }
+
+        private void EnsureBuiltInViews()
+        {
+            if (!_configuredViews.ContainsKey("factory_overview"))
+                _configuredViews["factory_overview"] = new ConfiguredView { Id = "factory_overview", Name = "全厂总览", Mode = "factory", TargetType = "factory", Yaw = -39f, Pitch = 33f, DistanceScale = 1.08f };
+            if (!_configuredViews.ContainsKey("workshop_overview"))
+                _configuredViews["workshop_overview"] = new ConfiguredView { Id = "workshop_overview", Name = "车间视角", Mode = "workshop", TargetType = "workshop", ParentViewId = "factory_overview", ReturnViewId = "factory_overview", Yaw = -39f, Pitch = 36f, DistanceScale = 1.08f };
+            if (!_configuredViews.ContainsKey("line_overview"))
+                _configuredViews["line_overview"] = new ConfiguredView { Id = "line_overview", Name = "产线视角", Mode = "line", TargetType = "line", ParentViewId = "workshop_overview", ReturnViewId = "workshop_overview", Yaw = -39f, Pitch = 33f, DistanceScale = 1.08f };
+            if (!_configuredViews.ContainsKey("device_detail"))
+                _configuredViews["device_detail"] = new ConfiguredView { Id = "device_detail", Name = "设备详情", Mode = "device", TargetType = "device", ParentViewId = "line_overview", ReturnViewId = "line_overview", Yaw = 238f, Pitch = 19f, DistanceScale = 1.12f, RelativeToTarget = true };
+            if (!_configuredViews.ContainsKey(_defaultViewId)) _defaultViewId = "factory_overview";
+        }
+
+        private ConfiguredView ResolveView(string viewId, string mode = "")
+        {
+            if (!string.IsNullOrWhiteSpace(viewId) && _configuredViews.TryGetValue(viewId, out var exact)) return exact;
+            var normalized = (mode ?? string.Empty).ToLowerInvariant();
+            var match = _configuredViews.Values.FirstOrDefault(view => string.Equals(view.Mode, normalized, System.StringComparison.OrdinalIgnoreCase));
+            return match ?? (_configuredViews.TryGetValue(_defaultViewId, out var fallback) ? fallback : null);
+        }
+
+        public ConfiguredView GetConfiguredView(string viewId, string mode = "") => ResolveView(viewId, mode);
+
         public void SetWebOverlayActive(bool active)
         {
             _webOverlayActive = active;
@@ -273,28 +419,35 @@ namespace HeatTreatment.DigitalTwin.Runtime
             }
         }
 
-        public void FocusPreviewBounds(Bounds bounds)
+        public void FocusPreviewBounds(Bounds bounds, ConfiguredView view = null, ISet<string> targetDeviceIds = null)
         {
             _selected = null;
             _mode = DashboardMode.Overview;
             _uiBlend = 1f;
+            var configured = view ?? ResolveView(string.Empty, "factory");
             foreach (var entry in _devices.Values)
             {
-                if (entry.Root != null) entry.Root.SetActive(true);
+                var keepVisible = !(configured?.HideNonTargetDevices ?? false)
+                    || targetDeviceIds == null
+                    || targetDeviceIds.Contains(entry.Device?.Id ?? string.Empty);
+                if (entry.Root != null) entry.Root.SetActive(keepVisible);
             }
-            _orbit?.FocusBounds(bounds, -39f, 48f, 1.08f, false);
+            _activeViewId = configured?.Id ?? _defaultViewId;
+            _orbit?.SetTransitionDuration(configured?.TransitionSeconds ?? .8f);
+            _orbit?.SetTargetOffset(configured?.TargetOffset ?? Vector3.zero);
+            _orbit?.FocusBounds(bounds, configured?.Yaw ?? -39f, configured?.Pitch ?? 33f, configured?.DistanceScale ?? 1.08f, false);
         }
 
-        public void FocusPreviewDevice(string deviceId)
+        public void FocusPreviewDevice(string deviceId, ConfiguredView view = null)
         {
             if (string.IsNullOrWhiteSpace(deviceId)) return;
-            if (_devices.TryGetValue(deviceId, out var device)) ShowDetail(device);
+            if (_devices.TryGetValue(deviceId, out var device)) ShowDetail(device, view ?? ResolveView(string.Empty, "device"));
         }
 
         public void CompleteFactory(Bounds factoryBounds)
         {
             _factoryBounds = factoryBounds;
-            ShowOverview(true);
+            ShowOverview(true, ResolveView(_defaultViewId, "factory"));
             if (_diagnostics != null) _diagnostics.Visible = false;
         }
 
@@ -370,7 +523,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             );
             GUI.color = new Color(1f, 1f, 1f, Mathf.SmoothStep(0f, 1f, _uiBlend));
 
-            if (_dashboardConfig.ShowHeader) DrawHeader();
+            if (_dashboardConfig.ShowHeader && IsActiveViewComponentVisible("widget_navigation", "navigation")) DrawHeader();
             if (_mode == DashboardMode.Detail && _selected != null) DrawDetail();
             else DrawOverview();
 
@@ -449,9 +602,9 @@ namespace HeatTreatment.DigitalTwin.Runtime
 
         private void DrawOverview()
         {
-            if (_dashboardConfig.Overview.Left.Visible) DrawOverviewLeftPanel();
-            if (_dashboardConfig.Overview.Right.Visible) DrawOverviewDeviceList();
-            if (_dashboardConfig.ShowWorldLabels) DrawWorldLabels();
+            if (_dashboardConfig.Overview.Left.Visible && IsActiveViewComponentVisible("widget_metrics", "metrics")) DrawOverviewLeftPanel();
+            if (_dashboardConfig.Overview.Right.Visible && IsActiveViewComponentVisible("widget_line_overview_cards", "line_overview_cards")) DrawOverviewDeviceList();
+            if (_dashboardConfig.ShowWorldLabels && IsActiveViewComponentVisible("widget_device_label", "device_label")) DrawWorldLabels();
         }
 
         private void DrawOverviewLeftPanel()
@@ -574,7 +727,9 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private void DrawDetail()
         {
             var device = _selected;
-            if (GUI.Button(DetailBackRect(), "〈 返回总览", _buttonStyle)) ShowOverview(false);
+            if (IsActiveViewComponentVisible("widget_navigation", "navigation")
+                && GUI.Button(DetailBackRect(), "〈 返回上一级", _buttonStyle)) ReturnToParentView();
+            if (!IsActiveViewComponentVisible("widget_diagnostics", "diagnostics")) return;
             if (_dashboardConfig.Detail.Left.Visible) DrawDetailLeft(device);
             if (_dashboardConfig.Detail.Right.Visible) DrawDetailRight(device);
             if (_dashboardConfig.Detail.Trends.Visible) DrawDetailTrends(device);
@@ -736,27 +891,36 @@ namespace HeatTreatment.DigitalTwin.Runtime
             }
         }
 
-        private void ShowDetail(DeviceView device)
+        private void ShowDetail(DeviceView device, ConfiguredView configuredView = null)
         {
             if (device == null || device.Root == null) return;
             _selected = device;
             _mode = DashboardMode.Detail;
             _uiBlend = 0f;
             _pointScroll = Vector2.zero;
+            var hideOtherDevices = configuredView == null
+                || string.Equals(configuredView.Mode, "device", System.StringComparison.OrdinalIgnoreCase)
+                || configuredView.HideNonTargetDevices;
             foreach (var entry in _devices.Values)
             {
-                if (entry.Root != null) entry.Root.SetActive(entry == device);
+                if (entry.Root != null) entry.Root.SetActive(entry == device || !hideOtherDevices);
             }
             device.WorldBounds = CalculateBounds(device.Root);
             // Keep the same authored three-quarter view regardless of the device's
             // configured factory yaw. This prevents a correctly rotated device from
             // opening on its rear side in the detail view.
-            var detailYaw = Mathf.DeltaAngle(0f, device.Root.transform.eulerAngles.y + 238f);
-            _orbit?.FocusBounds(device.WorldBounds, detailYaw, 19f, 1.12f, false);
+            var view = configuredView ?? ResolveView(string.Empty, "device");
+            var detailYaw = view?.RelativeToTarget == true
+                ? Mathf.DeltaAngle(0f, device.Root.transform.eulerAngles.y + view.Yaw)
+                : (view?.Yaw ?? Mathf.DeltaAngle(0f, device.Root.transform.eulerAngles.y + 238f));
+            _activeViewId = view?.Id ?? "device_detail";
+            _orbit?.SetTransitionDuration(view?.TransitionSeconds ?? .55f);
+            _orbit?.SetTargetOffset(view?.TargetOffset ?? Vector3.zero);
+            _orbit?.FocusBounds(device.WorldBounds, detailYaw, view?.Pitch ?? 19f, view?.DistanceScale ?? 1.12f, false);
             ViewContextChanged?.Invoke("device", device.Device?.Id ?? string.Empty);
         }
 
-        private void ShowOverview(bool immediate)
+        private void ShowOverview(bool immediate, ConfiguredView configuredView = null)
         {
             _selected = null;
             _mode = DashboardMode.Overview;
@@ -765,8 +929,26 @@ namespace HeatTreatment.DigitalTwin.Runtime
             {
                 if (entry.Root != null) entry.Root.SetActive(true);
             }
-            _orbit?.FocusBounds(_factoryBounds, -39f, 33f, 1.08f, immediate);
+            var view = configuredView ?? ResolveView(string.Empty, "factory");
+            _activeViewId = view?.Id ?? _defaultViewId;
+            _orbit?.SetTransitionDuration(view?.TransitionSeconds ?? .8f);
+            _orbit?.SetTargetOffset(view?.TargetOffset ?? Vector3.zero);
+            _orbit?.FocusBounds(_factoryBounds, view?.Yaw ?? -39f, view?.Pitch ?? 33f, view?.DistanceScale ?? 1.08f, immediate);
             ViewContextChanged?.Invoke("factory", string.Empty);
+        }
+
+        private void ReturnToParentView()
+        {
+            var current = ResolveView(_activeViewId, _mode == DashboardMode.Detail ? "device" : "factory");
+            var parent = ResolveView(current?.ReturnViewId ?? current?.ParentViewId, "factory");
+            if (parent == null || string.Equals(parent.Mode, "factory", System.StringComparison.OrdinalIgnoreCase))
+            {
+                ShowOverview(false, parent);
+                return;
+            }
+            // Native GUI 只负责兜底交互；精确的车间/产线目标由 WebView2
+            // 覆盖层通过 native-preview(view) 发送，避免重复维护一套点击区域。
+            ShowOverview(false, parent);
         }
 
         private void SelectFromWorld(Vector3 screenPosition)

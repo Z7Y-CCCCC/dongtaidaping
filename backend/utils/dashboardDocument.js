@@ -1,5 +1,5 @@
-const SCHEMA_VERSION = 2;
-const SUPPORTED_SCHEMA_VERSIONS = new Set([1, 2]);
+const SCHEMA_VERSION = 3;
+const SUPPORTED_SCHEMA_VERSIONS = new Set([1, 2, 3]);
 const DEFAULT_CANVAS = Object.freeze({
     width: 1920,
     height: 1080,
@@ -14,9 +14,13 @@ const ALLOWED_WIDGET_TYPES = new Set([
     'diagnostics', 'line_overview_cards'
 ]);
 const UNITY_WIDGET_TYPES = new Set(['navigation', 'device_label', 'diagnostics', 'line_overview_cards']);
+const SYSTEM_VIEW_COMPONENT_IDS = new Set([
+    'widget_navigation', 'widget_device_label', 'widget_diagnostics', 'widget_line_overview_cards',
+    'navigation', 'device_label', 'diagnostics', 'line_overview_cards'
+]);
 const ALLOWED_EVENT_ACTIONS = new Set([
     'enter_device', 'focus_factory', 'focus_line', 'focus_workshop',
-    'play_voice', 'open_link', 'switch_scene', 'set_visibility', 'toggle_visibility'
+    'play_voice', 'open_link', 'switch_scene', 'switch_view', 'set_visibility', 'toggle_visibility'
 ]);
 const ALLOWED_EVENT_TRIGGERS = new Set(['click', 'doubleClick']);
 const FORBIDDEN_WRITE_KEYS = new Set([
@@ -168,6 +172,7 @@ function normalizeEvent(event) {
     const result = { trigger, action };
     for (const [key, max] of Object.entries({
         deviceId: 128, lineId: 128, workshopId: 128, sceneId: 128,
+        viewId: 128,
         url: 2048, audioUrl: 2048, text: 500,
         targetId: 128, targetType: 32, visibility: 16
     })) {
@@ -177,11 +182,74 @@ function normalizeEvent(event) {
     return result;
 }
 
+const DEFAULT_VIEW_DEFINITIONS = [
+    { id: 'factory_overview', name: '全厂总览', mode: 'factory', targetType: 'factory', parentViewId: '', camera: { yaw: -39, pitch: 33, distanceScale: 1.08, transitionSeconds: 0.8 } },
+    { id: 'workshop_overview', name: '车间视角', mode: 'workshop', targetType: 'workshop', parentViewId: 'factory_overview', camera: { yaw: -39, pitch: 36, distanceScale: 1.08, transitionSeconds: 0.7 } },
+    { id: 'line_overview', name: '产线视角', mode: 'line', targetType: 'line', parentViewId: 'workshop_overview', camera: { yaw: -39, pitch: 33, distanceScale: 1.08, transitionSeconds: 0.65 } },
+    { id: 'device_detail', name: '设备详情', mode: 'device', targetType: 'device', parentViewId: 'line_overview', camera: { yaw: 238, pitch: 19, distanceScale: 1.12, transitionSeconds: 0.55, relativeToTarget: true } }
+];
+
+function defaultDashboardViews() {
+    return clone(DEFAULT_VIEW_DEFINITIONS);
+}
+
+function normalizeDashboardView(source, index = 0) {
+    const input = objectValue(source, {});
+    const fallback = DEFAULT_VIEW_DEFINITIONS[index] || DEFAULT_VIEW_DEFINITIONS[0];
+    const camera = objectValue(input.camera, {});
+    const components = objectValue(input.componentState ?? input.components, {});
+    const allowedModes = new Set(['factory', 'workshop', 'line', 'device', 'custom']);
+    const mode = allowedModes.has(String(input.mode)) ? String(input.mode) : fallback.mode;
+    const parentValue = input.parentViewId ?? input.parent_view_id;
+    const returnValue = input.returnViewId ?? input.return_view_id;
+    return {
+        id: cleanId(input.id, fallback.id || `view_${index + 1}`),
+        name: shortText(input.name, fallback.name || `视角 ${index + 1}`, 128),
+        mode,
+        targetType: shortText(input.targetType, fallback.targetType || mode, 32),
+        targetId: shortText(input.targetId ?? input.target_id, '', 128),
+        parentViewId: parentValue !== undefined
+            ? shortText(parentValue, '', 128)
+            : shortText(fallback.parentViewId || '', '', 128),
+        returnViewId: returnValue !== undefined
+            ? shortText(returnValue, '', 128)
+            : shortText(parentValue !== undefined ? parentValue : fallback.parentViewId || '', '', 128),
+        camera: {
+            yaw: finiteNumber(camera.yaw, fallback.camera.yaw, -360, 360),
+            pitch: finiteNumber(camera.pitch, fallback.camera.pitch, -89, 89),
+            distanceScale: finiteNumber(camera.distanceScale, fallback.camera.distanceScale, 0.1, 10),
+            transitionSeconds: finiteNumber(camera.transitionSeconds, fallback.camera.transitionSeconds, 0, 10),
+            relativeToTarget: booleanValue(camera.relativeToTarget, fallback.camera.relativeToTarget || false),
+            targetOffset: Array.isArray(camera.targetOffset)
+                ? camera.targetOffset.slice(0, 3).map(value => finiteNumber(value, 0, -10000, 10000))
+                : [0, 0, 0]
+        },
+        componentState: {
+            show: arrayValue(components.show, []).map(value => cleanId(value, '')).filter(Boolean).slice(0, 500),
+            hide: arrayValue(components.hide, []).map(value => cleanId(value, '')).filter(Boolean).slice(0, 500),
+            hideNonTargetDevices: booleanValue(components.hideNonTargetDevices, false)
+        },
+        metadata: objectValue(input.metadata, {})
+    };
+}
+
+function normalizeDashboardViews(scene) {
+    const input = objectValue(scene, {});
+    const raw = Array.isArray(input.views) && input.views.length ? input.views : defaultDashboardViews();
+    const views = raw.slice(0, 50).map((view, index) => normalizeDashboardView(view, index));
+    const ids = new Set(views.map(view => view.id));
+    const defaultViewId = ids.has(String(input.defaultViewId || ''))
+        ? String(input.defaultViewId)
+        : (views[0]?.id || 'factory_overview');
+    return { views, defaultViewId };
+}
+
 function normalizeVisibility(value) {
     const source = objectValue(value, {});
-    const allowedModes = new Set(['factory', 'workshop', 'line', 'device']);
+    const allowedModes = new Set(['factory', 'workshop', 'line', 'device', 'custom']);
     return {
         viewModes: arrayValue(source.viewModes, []).map(item => shortText(item, '', 32)).filter(item => allowedModes.has(item)),
+        viewIds: arrayValue(source.viewIds, []).map(item => cleanId(item, '')).filter(Boolean).slice(0, 100),
         matchBoundDevice: booleanValue(source.matchBoundDevice, false),
         ruleMode: source.ruleMode === 'any' ? 'any' : 'all',
         rules: arrayValue(source.rules, []).slice(0, 20).map(rule => {
@@ -244,6 +312,7 @@ function createEmptyDocument(context = {}) {
     const scene = objectValue(context.scene, {});
     const legacyLayout = objectValue(scene.layout ?? scene.layout_json, {});
     const canvas = normalizeCanvas(context.canvas, legacyLayout);
+    const sceneViews = normalizeDashboardViews(scene);
     return {
         schemaVersion: SCHEMA_VERSION,
         projectId: shortText(context.projectId ?? project.id, 'project_default', 128),
@@ -262,7 +331,8 @@ function createEmptyDocument(context = {}) {
             type: shortText(scene.scene_type ?? scene.type, 'factory_overview', 64),
             layout: legacyLayout,
             camera: objectValue(scene.camera ?? scene.camera_json, {}),
-            theme: objectValue(scene.theme ?? scene.theme_json, {})
+            theme: objectValue(scene.theme ?? scene.theme_json, {}),
+            ...sceneViews
         },
         widgets: [],
         metadata: {
@@ -280,6 +350,7 @@ function normalizeDocument(input, context = {}) {
         : (Array.isArray(context.widgets) ? context.widgets : []);
     const sceneSource = objectValue(source.scene, base.scene);
     const canvas = normalizeCanvas(source.canvas, sceneSource.layout || base.scene.layout);
+    const sceneViews = normalizeDashboardViews(sceneSource);
     return {
         ...base,
         ...source,
@@ -297,7 +368,8 @@ function normalizeDocument(input, context = {}) {
             type: shortText(sceneSource.type ?? sceneSource.scene_type, base.scene.type, 64),
             layout: objectValue(sceneSource.layout, base.scene.layout),
             camera: objectValue(sceneSource.camera, base.scene.camera),
-            theme: objectValue(sceneSource.theme, base.scene.theme)
+            theme: objectValue(sceneSource.theme, base.scene.theme),
+            ...sceneViews
         },
         widgets: widgets.slice(0, 500).map((widget, index) => normalizeWidget(widget, canvas, index)),
         metadata: {
@@ -320,6 +392,32 @@ function validateDocument(document, options = {}) {
     if (!shortText(input.sceneId, '', 128)) errors.push('sceneId 不能为空');
     if (!Array.isArray(input.widgets)) errors.push('widgets 必须是数组');
     if (Array.isArray(input.widgets) && input.widgets.length > 500) errors.push('组件数量不能超过 500 个');
+
+    const scene = objectValue(input.scene, {});
+    const views = Array.isArray(scene.views) ? scene.views : [];
+    const requiresViews = Number(input.schemaVersion) >= 3;
+    if (requiresViews && !views.length) errors.push('至少需要配置一个视角');
+    if (views.length > 50) errors.push('视角数量不能超过 50 个');
+    const viewIds = new Set();
+    for (const [index, view] of views.entries()) {
+        const label = `第 ${index + 1} 个视角`;
+        if (!view?.id || !/^[a-zA-Z0-9_-]+$/.test(String(view.id))) errors.push(`${label} ID 不合法`);
+        if (viewIds.has(view?.id)) errors.push(`视角 ID 重复：${view.id}`);
+        viewIds.add(view?.id);
+        if (!view?.name) errors.push(`${label} 名称不能为空`);
+        const camera = objectValue(view?.camera, {});
+        if (!Number.isFinite(Number(camera.yaw)) || !Number.isFinite(Number(camera.pitch))) errors.push(`${label} 相机角度不合法`);
+        if (view?.parentViewId && !views.some(item => item?.id === view.parentViewId)) errors.push(`${label} 返回视角不存在：${view.parentViewId}`);
+        for (const target of [...(view?.componentState?.show || []), ...(view?.componentState?.hide || [])]) {
+            if (target && !String(target).startsWith('group:') && !idsForValidation(input.widgets).has(String(target))) {
+                // 允许未来的运行时系统组件 ID；普通组件仍检查拼写。
+                if (!String(target).startsWith('system:') && !SYSTEM_VIEW_COMPONENT_IDS.has(String(target))) {
+                    errors.push(`${label} 的组件状态目标不存在：${target}`);
+                }
+            }
+        }
+    }
+    if (scene.defaultViewId && !viewIds.has(scene.defaultViewId)) errors.push(`默认视角不存在：${scene.defaultViewId}`);
 
     const ids = new Set();
     const groupIds = new Set((input.widgets || []).map(widget => shortText(widget?.groupId, '', 128)).filter(Boolean));
@@ -347,8 +445,14 @@ function validateDocument(document, options = {}) {
             && (!widget.data.connectionId || !widget.data.table || (widget.data.valueMode !== 'count' && !widget.data.field))) {
             errors.push(`${label} 的数据库绑定必须选择连接、表和字段`);
         }
+        for (const viewId of widget?.visibility?.viewIds || []) {
+            if (viewIds.size && !viewIds.has(viewId)) errors.push(`${label} 指定的视角不存在：${viewId}`);
+        }
         for (const event of widget?.events || []) {
             if (!ALLOWED_EVENT_ACTIONS.has(event?.action)) errors.push(`${label} 包含不允许的点击动作`);
+            if (event?.action === 'switch_view' && (!event.viewId || !viewIds.has(event.viewId))) {
+                errors.push(`${label} 的视角切换事件目标不存在：${event.viewId || '(空)'}`);
+            }
             if (['set_visibility', 'toggle_visibility'].includes(event?.action)
                 && (!event.targetId || !['group', 'widget'].includes(event.targetType))) {
                 errors.push(`${label} 的显隐事件必须选择组件或分组目标`);
@@ -369,6 +473,10 @@ function validateDocument(document, options = {}) {
         throw error;
     }
     return errors;
+}
+
+function idsForValidation(widgets) {
+    return new Set((widgets || []).map(widget => shortText(widget?.id, '', 128)).filter(Boolean));
 }
 
 function inspectForbiddenWriteIntent(value, path, errors, seen = new Set()) {
@@ -466,6 +574,8 @@ function isCanonicalDocument(value) {
 module.exports = {
     SCHEMA_VERSION,
     DEFAULT_CANVAS,
+    defaultDashboardViews,
+    normalizeDashboardViews,
     ALLOWED_WIDGET_TYPES,
     ALLOWED_EVENT_ACTIONS,
     safeJsonParse,

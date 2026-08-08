@@ -299,6 +299,8 @@ function runtimePlatformPayload({ project, scene, document, release }) {
         published_release_id: release?.id || scene.published_release_id || null,
         layout: objectValue(publishedScene.layout, {}),
         camera: objectValue(publishedScene.camera, {}),
+        views: Array.isArray(publishedScene.views) ? publishedScene.views : [],
+        defaultViewId: publishedScene.defaultViewId || publishedScene.views?.[0]?.id || 'factory_overview',
         theme: { ...objectValue(publishedScene.theme, {}), ...objectValue(document.theme, {}) }
     } : null;
     return {

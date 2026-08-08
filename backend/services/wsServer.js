@@ -61,8 +61,14 @@ class WsServer {
                         }
                     } else if (data.type === 'dashboard_context' && ws.clientRole === 'unity') {
                         const source = data.payload && typeof data.payload === 'object' ? data.payload : {};
-                        const mode = ['factory', 'workshop', 'line', 'device'].includes(source.viewMode) ? source.viewMode : 'factory';
+                        const mode = ['factory', 'workshop', 'line', 'device', 'custom'].includes(source.viewMode) ? source.viewMode : 'factory';
                         this.dashboardContext = {
+                            viewId: String(source.viewId || '').slice(0, 128),
+                            // 新版 Unity 在模型/数据准备完成前明确发送 false；旧版客户端
+                            // 没有该字段时按已就绪兼容，避免透明层永久隐藏。
+                            sceneReady: Object.prototype.hasOwnProperty.call(source, 'sceneReady')
+                                ? source.sceneReady !== false
+                                : true,
                             viewMode: mode,
                             sceneId: String(source.sceneId || '').slice(0, 128),
                             workshopId: String(source.workshopId || '').slice(0, 128),

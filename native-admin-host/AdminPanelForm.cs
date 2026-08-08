@@ -85,8 +85,10 @@ internal sealed class AdminPanelForm : Form
         Shown += async (_, _) =>
         {
             _pipeTask = ListenForCommandsAsync(_pipeCancellation.Token);
+            // 先把宿主窗口嵌入 Unity 正确位置，再创建/导航 WebView2。
+            // 否则 WebView2 会以默认窗体尺寸短暂闪现成一块黑色矩形。
+            ApplyInitialPlacement();
             await InitializeWebViewAsync();
-            BeginInvoke(ApplyInitialPlacement);
         };
         FormClosed += (_, _) =>
         {
@@ -215,9 +217,15 @@ internal sealed class AdminPanelForm : Form
             _webView.CoreWebView2.NewWindowRequested += HandleNewWindow;
             _webView.CoreWebView2.DownloadStarting += HandleDownload;
             _webView.CoreWebView2.WebMessageReceived += HandleWebMessage;
-            _webView.CoreWebView2.NavigationCompleted += (_, _) => SendHostState();
+            _webView.CoreWebView2.NavigationCompleted += (_, _) =>
+            {
+                BeginInvoke(() =>
+                {
+                    _webView.Visible = _adminVisible && !_panelHidden;
+                    SendHostState();
+                });
+            };
             _webView.CoreWebView2.Navigate(_options.Url);
-            _webView.Visible = true;
             try
             {
                 _dashboardOverlay = new DashboardOverlayForm(_options);
@@ -1069,6 +1077,7 @@ internal sealed class AdminPanelForm : Form
     {
         if (IsDisposed) return;
         _panelHidden = false;
+        _webView.Visible = _adminVisible && _webView.CoreWebView2 != null;
         Show();
         NativeMethods.ShowWindow(Handle, NativeMethods.SwShow);
         if (focus)
@@ -1083,6 +1092,7 @@ internal sealed class AdminPanelForm : Form
     private void HidePanel()
     {
         _panelHidden = true;
+        _webView.Visible = false;
         NativeMethods.ShowWindow(Handle, NativeMethods.SwHide);
         Hide();
         SyncDashboardOverlay();

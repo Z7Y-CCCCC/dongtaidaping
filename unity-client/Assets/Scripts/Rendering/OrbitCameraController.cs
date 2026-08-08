@@ -19,10 +19,22 @@ namespace HeatTreatment.DigitalTwin.Rendering
         private float _distance = 48f;
         private float _desiredDistance = 48f;
         private Bounds _lastBounds = new Bounds(Vector3.zero, new Vector3(40f, 8f, 30f));
+        private float _transitionSeconds = 0.22f;
+        private Vector3 _targetOffset = Vector3.zero;
 
         public Vector3 Target => _target;
         public bool InteractionEnabled { get; set; } = true;
         public bool PointerInputBlocked { get; set; }
+
+        public void SetTransitionDuration(float seconds)
+        {
+            _transitionSeconds = Mathf.Clamp(seconds, 0f, 10f);
+        }
+
+        public void SetTargetOffset(Vector3 offset)
+        {
+            _targetOffset = offset;
+        }
 
         public void FrameBounds(Bounds bounds, bool immediate = false)
         {
@@ -37,7 +49,7 @@ namespace HeatTreatment.DigitalTwin.Rendering
             bool immediate = false)
         {
             _lastBounds = bounds;
-            _desiredTarget = bounds.center + Vector3.up * Mathf.Max(0.5f, bounds.extents.y * 0.08f);
+            _desiredTarget = bounds.center + Vector3.up * Mathf.Max(0.5f, bounds.extents.y * 0.08f) + _targetOffset;
             _desiredYaw = yaw;
             _desiredPitch = Mathf.Clamp(pitch, 6f, 82f);
             var camera = GetComponent<Camera>();
@@ -111,7 +123,8 @@ namespace HeatTreatment.DigitalTwin.Rendering
 
         private void LateUpdate()
         {
-            var blend = 1f - Mathf.Exp(-12f * Time.unscaledDeltaTime);
+            var response = _transitionSeconds <= 0.001f ? 1000f : 4.6f / _transitionSeconds;
+            var blend = 1f - Mathf.Exp(-response * Time.unscaledDeltaTime);
             _target = Vector3.Lerp(_target, _desiredTarget, blend);
             _yaw = Mathf.LerpAngle(_yaw, _desiredYaw, blend);
             _pitch = Mathf.Lerp(_pitch, _desiredPitch, blend);

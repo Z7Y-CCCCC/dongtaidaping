@@ -40,6 +40,8 @@ export function widgetRuntimeVisible(widget = {}, runtime = {}) {
 
   const visibility = widget.visibility || {}
   const context = runtime.context || {}
+  const viewId = String(context.viewId || '')
+  if (Array.isArray(visibility.viewIds) && visibility.viewIds.length && !visibility.viewIds.includes(viewId)) return false
   if (Array.isArray(visibility.viewModes) && visibility.viewModes.length
     && !visibility.viewModes.includes(context.viewMode || 'factory')) return false
   if (visibility.matchBoundDevice) {

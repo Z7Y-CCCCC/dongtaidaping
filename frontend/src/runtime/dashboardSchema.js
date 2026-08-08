@@ -1,4 +1,4 @@
-export const DASHBOARD_SCHEMA_VERSION = 2
+export const DASHBOARD_SCHEMA_VERSION = 3
 
 export const DEFAULT_DASHBOARD_CANVAS = Object.freeze({
   width: 1920,
@@ -10,6 +10,76 @@ export const DEFAULT_DASHBOARD_CANVAS = Object.freeze({
 })
 
 export const SYSTEM_WIDGET_TYPES = new Set(['navigation', 'device_label', 'diagnostics', 'line_overview_cards'])
+
+export const SYSTEM_WIDGET_LIBRARY = [
+  { type: 'navigation', label: '场景导航与返回', icon: '←', description: 'Unity 原生返回、视角层级和场景导航', preview: 'navigation' },
+  { type: 'device_label', label: '设备世界浮标', icon: '⌖', description: '跟随三维设备显示名称和状态', preview: 'label' },
+  { type: 'diagnostics', label: '运行诊断面板', icon: '◌', description: '连接、PLC 和模型加载状态', preview: 'diagnostics' },
+  { type: 'line_overview_cards', label: '产线设备概览', icon: '▤', description: '产线视角下的设备概览卡片', preview: 'line' }
+]
+
+export const DASHBOARD_VIEW_MODES = [
+  { id: 'factory', label: '全厂总览', description: '查看全部车间、产线和设备' },
+  { id: 'workshop', label: '车间视角', description: '聚焦一个车间及其产线' },
+  { id: 'line', label: '产线视角', description: '聚焦一条产线及设备' },
+  { id: 'device', label: '设备详情', description: '聚焦单台设备和详情组件' },
+  { id: 'custom', label: '自定义视角', description: '按工程师设置的目标和组件状态展示' }
+]
+
+const DEFAULT_VIEW_DEFINITIONS = [
+  { id: 'factory_overview', name: '全厂总览', mode: 'factory', targetType: 'factory', parentViewId: '', camera: { yaw: -39, pitch: 33, distanceScale: 1.08, transitionSeconds: .8 } },
+  { id: 'workshop_overview', name: '车间视角', mode: 'workshop', targetType: 'workshop', parentViewId: 'factory_overview', camera: { yaw: -39, pitch: 36, distanceScale: 1.08, transitionSeconds: .7 } },
+  { id: 'line_overview', name: '产线视角', mode: 'line', targetType: 'line', parentViewId: 'workshop_overview', camera: { yaw: -39, pitch: 33, distanceScale: 1.08, transitionSeconds: .65 } },
+  { id: 'device_detail', name: '设备详情', mode: 'device', targetType: 'device', parentViewId: 'line_overview', camera: { yaw: 238, pitch: 19, distanceScale: 1.12, transitionSeconds: .55, relativeToTarget: true } }
+]
+
+function normalizeDashboardView(source = {}, index = 0) {
+  const fallback = DEFAULT_VIEW_DEFINITIONS[index] || DEFAULT_VIEW_DEFINITIONS[0]
+  const camera = objectValue(source.camera, {})
+  const componentState = objectValue(source.componentState || source.components, {})
+  const allowedModes = new Set(DASHBOARD_VIEW_MODES.map(item => item.id))
+  const mode = allowedModes.has(String(source.mode)) ? String(source.mode) : fallback.mode
+  const parentValue = source.parentViewId ?? source.parent_view_id
+  const returnValue = source.returnViewId ?? source.return_view_id
+  return {
+    id: String(source.id || fallback.id || `view_${index + 1}`).replace(/[^a-zA-Z0-9_-]/g, '_'),
+    name: String(source.name || fallback.name || `视角 ${index + 1}`),
+    mode,
+    targetType: String(source.targetType || fallback.targetType || (mode === 'custom' ? 'factory' : mode)),
+    targetId: String(source.targetId || source.target_id || ''),
+    parentViewId: parentValue !== undefined ? String(parentValue) : String(fallback.parentViewId || ''),
+    returnViewId: returnValue !== undefined
+      ? String(returnValue)
+      : String(parentValue !== undefined ? parentValue : fallback.parentViewId || ''),
+    camera: {
+      yaw: numberValue(camera.yaw, fallback.camera.yaw, -360, 360),
+      pitch: numberValue(camera.pitch, fallback.camera.pitch, -89, 89),
+      distanceScale: numberValue(camera.distanceScale, fallback.camera.distanceScale, .1, 10),
+      transitionSeconds: numberValue(camera.transitionSeconds, fallback.camera.transitionSeconds, 0, 10),
+      relativeToTarget: camera.relativeToTarget ?? fallback.camera.relativeToTarget ?? false,
+      targetOffset: Array.isArray(camera.targetOffset) ? camera.targetOffset.slice(0, 3).map(item => numberValue(item, 0, -10000, 10000)) : [0, 0, 0]
+    },
+    componentState: {
+      show: stringArray(componentState.show),
+      hide: stringArray(componentState.hide),
+      hideNonTargetDevices: !!componentState.hideNonTargetDevices
+    },
+    metadata: deepClone(objectValue(source.metadata, {}))
+  }
+}
+
+export function createDefaultDashboardViews() {
+  return DEFAULT_VIEW_DEFINITIONS.map((view, index) => normalizeDashboardView(view, index))
+}
+
+export function normalizeDashboardViews(scene = {}) {
+  const source = objectValue(scene, {})
+  const raw = Array.isArray(source.views) && source.views.length ? source.views : createDefaultDashboardViews()
+  const views = raw.slice(0, 50).map((view, index) => normalizeDashboardView(view, index))
+  const ids = new Set(views.map(view => view.id))
+  const defaultViewId = ids.has(String(source.defaultViewId || '')) ? String(source.defaultViewId) : (views[0]?.id || 'factory_overview')
+  return { views, defaultViewId }
+}
 
 export const DASHBOARD_WIDGET_LIBRARY = [
   { type: 'text', label: '文本', icon: 'T', group: '基础', description: '标题、说明和动态文本' },
@@ -106,9 +176,10 @@ function stringArray(value) {
 
 function normalizeVisibility(source = {}) {
   const visibility = objectValue(source, {})
-  const allowedModes = new Set(['factory', 'workshop', 'line', 'device'])
+  const allowedModes = new Set(['factory', 'workshop', 'line', 'device', 'custom'])
   return {
     viewModes: stringArray(visibility.viewModes).filter(mode => allowedModes.has(mode)),
+    viewIds: stringArray(visibility.viewIds),
     matchBoundDevice: !!visibility.matchBoundDevice,
     ruleMode: visibility.ruleMode === 'any' ? 'any' : 'all',
     rules: Array.isArray(visibility.rules) ? deepClone(visibility.rules).slice(0, 20) : []
@@ -180,6 +251,8 @@ export function normalizeDashboardDocument(source = {}) {
   canvas.height = Math.round(numberValue(canvas.height, 1080, 180, 4320))
   canvas.gridSize = Math.round(numberValue(canvas.gridSize, 10, 1, 200))
   canvas.safeArea = Math.round(numberValue(canvas.safeArea, 24, 0, 400))
+  const rawScene = objectValue(source.scene, {})
+  const normalizedViews = normalizeDashboardViews(rawScene)
   return {
     schemaVersion: DASHBOARD_SCHEMA_VERSION,
     projectId: String(source.projectId || 'project_default'),
@@ -192,7 +265,10 @@ export function normalizeDashboardDocument(source = {}) {
       accentColor: '#42a5f5',
       ...deepClone(source.theme || {})
     },
-    scene: deepClone(source.scene || {}),
+    scene: {
+      ...deepClone(rawScene),
+      ...normalizedViews
+    },
     widgets: (source.widgets || []).map((widget, index) => normalizeDashboardWidget(widget, canvas, index)),
     metadata: deepClone(source.metadata || {})
   }
@@ -219,5 +295,17 @@ export function createDashboardWidget(type, index = 0, position = {}) {
 }
 
 export function widgetTypeLabel(type) {
-  return DASHBOARD_WIDGET_LIBRARY.find(item => item.type === type)?.label || type
+  return DASHBOARD_WIDGET_LIBRARY.find(item => item.type === type)?.label
+    || SYSTEM_WIDGET_LIBRARY.find(item => item.type === type)?.label
+    || type
+}
+
+export function systemWidgetDefinition(type) {
+  return SYSTEM_WIDGET_LIBRARY.find(item => item.type === type) || {
+    type,
+    label: 'Unity 运行组件',
+    icon: '◇',
+    description: '由 Unity 运行时管理的组件',
+    preview: 'unknown'
+  }
 }
