@@ -40,6 +40,7 @@ internal sealed class AdminPanelForm : Form
     private bool _parentMaximized;
     private bool _maximized;
     private bool _panelHidden;
+    private bool _castPresentationMode;
     private bool _dragging;
     private bool _draggingParentWindow;
     private bool _parentDragStarted;
@@ -455,6 +456,12 @@ internal sealed class AdminPanelForm : Form
         }
         RefreshParentWindowState();
         _dashboardOverlay?.UpdateParentBounds();
+        if (_castPresentationMode)
+        {
+            // 投屏展示模式下，后台宿主保持隐藏；只维护透明数据层的尺寸。
+            SyncDashboardOverlay();
+            return;
+        }
         if (!_attached)
         {
             _dashboardChrome?.UpdateParentBounds();
@@ -593,6 +600,8 @@ internal sealed class AdminPanelForm : Form
 
     private void ShowDashboard()
     {
+        _castPresentationMode = false;
+        _dashboardOverlay?.SetPresentationMode(false);
         _adminVisible = false;
         if (!_attached)
         {
@@ -605,8 +614,40 @@ internal sealed class AdminPanelForm : Form
         SendHostState();
     }
 
+    private void PrepareCastPresentation()
+    {
+        if (!TryResolveParentWindow()) return;
+        _castPresentationMode = true;
+        _adminVisible = false;
+        _panelHidden = true;
+        HideDetachedDashboardChrome();
+        _dashboardOverlay?.SetPresentationMode(true);
+        NativeMethods.ShowWindow(Handle, NativeMethods.SwHide);
+        Hide();
+        SyncDashboardOverlay();
+        SendHostState();
+    }
+
+    private void RestoreCastPresentation()
+    {
+        _castPresentationMode = false;
+        _dashboardOverlay?.SetPresentationMode(false);
+        if (TryResolveParentWindow())
+        {
+            // 投屏前固定切到了“实时大屏”页，恢复时继续留在这个页签。
+            ShowDashboard();
+        }
+        else
+        {
+            _panelHidden = false;
+            ShowPanel(false);
+        }
+    }
+
     private void ShowAdmin()
     {
+        _castPresentationMode = false;
+        _dashboardOverlay?.SetPresentationMode(false);
         _adminVisible = true;
         if (_attached)
         {
@@ -1438,6 +1479,8 @@ internal sealed class AdminPanelForm : Form
                         else if (command.Equals("maximize", StringComparison.OrdinalIgnoreCase)) ToggleMaximize();
                         else if (command.Equals("hide_to_tray", StringComparison.OrdinalIgnoreCase)) HideApplicationToTray();
                         else if (command.Equals("restore_dashboard", StringComparison.OrdinalIgnoreCase)) RestoreDashboardFromTray();
+                        else if (command.Equals("prepare_cast", StringComparison.OrdinalIgnoreCase)) PrepareCastPresentation();
+                        else if (command.Equals("restore_cast", StringComparison.OrdinalIgnoreCase)) RestoreCastPresentation();
                         else if (command.Equals("close", StringComparison.OrdinalIgnoreCase)) Close();
                     });
                 }
