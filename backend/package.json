@@ -7,6 +7,7 @@
     "start": "node server.js",
     "dev": "node server.js",
     "test:plc": "node scripts/plc-integration-test.cjs",
+    "test:plc-simulator-protocols": "node scripts/plc-simulator-protocol-integration-test.cjs",
     "test:recovery": "node scripts/power-recovery-test.cjs",
     "test:mysql-backup": "node scripts/mysql-backup-test.cjs",
     "test:production-readiness": "node scripts/production-readiness-test.cjs",

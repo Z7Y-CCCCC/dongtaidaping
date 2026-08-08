@@ -226,6 +226,7 @@ class PlcReader {
             conn: null,
             driver: null,
             timer: null,
+            connectTimer: null,
             retryTimer: null,
             reading: false,
             status: 'idle',
@@ -255,7 +256,18 @@ class PlcReader {
         if (!task.firstConnectAttemptAt) task.firstConnectAttemptAt = now;
         task.lastConnectAttemptAt = now;
         if (!task.outageStartedAt && !task.lastReadAt) task.outageStartedAt = now;
+        task.nextRetryAt = null;
         this._setTaskStatus(task, 'connecting', `正在连接 ${this._formatEndpoint(task.endpoint)}...`);
+        const connectTimeout = this._clampInteger(task.endpoint.timeout, 1000, 30000, 5000);
+        task.connectTimer = setTimeout(() => {
+            task.connectTimer = null;
+            if (this.stopped || generation !== task.connectionGeneration || task.status !== 'connecting') return;
+            this._handleTaskFailure(
+                task,
+                new Error(`${connectTimeout}ms 内未建立连接`),
+                '连接超时'
+            );
+        }, connectTimeout);
 
         if (task.endpoint.protocol === 'S7') {
             task.conn = new nodes7();
@@ -297,6 +309,10 @@ class PlcReader {
     }
 
     _markTaskConnected(task, message) {
+        if (task.connectTimer) {
+            clearTimeout(task.connectTimer);
+            task.connectTimer = null;
+        }
         task.lastConnectedAt = Date.now();
         task.retryCount = 0;
         task.firstConnectAttemptAt = null;
@@ -392,9 +408,10 @@ class PlcReader {
         task.lastError = message;
         task.nextRetryAt = Date.now() + retryInterval;
         this._setTaskStatus(task, 'retrying', `${message}，${Math.round(retryInterval / 1000)} 秒后重连`);
+        const retryGeneration = task.connectionGeneration;
         task.retryTimer = setTimeout(() => {
             task.retryTimer = null;
-            if (this.stopped) return;
+            if (this.stopped || retryGeneration !== task.connectionGeneration) return;
             this._connectTask(task);
         }, retryInterval);
     }
@@ -686,9 +703,22 @@ class PlcReader {
         if (this.statusHeartbeatTimer) return;
         this.statusHeartbeatTimer = setInterval(() => {
             if (this.stopped) return;
+            this._recoverOverdueRetries();
             this._refreshDeviceStatuses();
             this._notifyAggregateStatus(false);
         }, STATUS_BROADCAST_MIN_MS);
+    }
+
+    _recoverOverdueRetries(now = Date.now()) {
+        for (const task of this.tasks.values()) {
+            if (task.status !== 'retrying' || !task.nextRetryAt || now < task.nextRetryAt + 250) continue;
+            if (task.retryTimer) {
+                clearTimeout(task.retryTimer);
+                task.retryTimer = null;
+            }
+            console.warn(`[PlcReader] ${task.id} 重连定时器逾期，立即重新连接`);
+            this._connectTask(task);
+        }
     }
 
     _getTaskOutageStart(task) {
@@ -888,6 +918,10 @@ class PlcReader {
         if (task.timer) {
             clearInterval(task.timer);
             task.timer = null;
+        }
+        if (task.connectTimer) {
+            clearTimeout(task.connectTimer);
+            task.connectTimer = null;
         }
         if (task.retryTimer) {
             clearTimeout(task.retryTimer);

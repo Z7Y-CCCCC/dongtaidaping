@@ -12,6 +12,7 @@ const {
     buildOpcUaEndpoint
 } = require('../services/plcProtocolConfig');
 const { ModbusTcpDriver, OpcUaDriver, decodeModbusRegisters } = require('../services/plcProtocolDrivers');
+const PlcReader = require('../services/plcReader');
 const {
     BACKEND_DIR,
     createRunDirectory,
@@ -189,6 +190,60 @@ async function testOpcUaFailedSessionCleanup() {
     }, { opcuaModule: fakeOpcua });
     await assert.rejects(missingEndpoint.connect(), /服务器地址未配置/);
     assert.strictEqual(missingEndpoint.client, null);
+}
+
+function testOverdueRetryWatchdog() {
+    const reader = new PlcReader();
+    reader.stopped = false;
+    let reconnects = 0;
+    const retryTimer = setTimeout(() => {}, 60000);
+    const task = {
+        id: 'watchdog-test',
+        status: 'retrying',
+        nextRetryAt: Date.now() - 1000,
+        retryTimer
+    };
+    reader.tasks.set(task.id, task);
+    reader._connectTask = candidate => {
+        reconnects += 1;
+        candidate.status = 'connecting';
+        candidate.nextRetryAt = null;
+    };
+    reader._recoverOverdueRetries();
+    assert.strictEqual(reconnects, 1);
+    assert.strictEqual(task.retryTimer, null);
+}
+
+async function testConnectingTimeoutWatchdog() {
+    const reader = new PlcReader({
+        driverFactory() {
+            return {
+                connect: () => new Promise(() => {}),
+                disconnect: async () => {}
+            };
+        }
+    });
+    reader.stopped = false;
+    const endpoint = {
+        protocol: 'MODBUS_TCP',
+        ip: '127.0.0.1',
+        port: 65000,
+        timeout: 1000,
+        retryInterval: 1000,
+        maxRetries: 0,
+        options: { unitId: 1 }
+    };
+    const task = reader._getOrCreateTask('connecting-timeout-test', endpoint, 1000);
+    reader._connectTask(task);
+    const deadline = Date.now() + 5000;
+    while (task.status === 'connecting' && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    assert.strictEqual(task.status, 'retrying');
+    assert.match(task.lastError, /连接超时/);
+    assert.ok(Number.isFinite(task.nextRetryAt));
+    assert.ok(task.retryTimer);
+    reader.stop();
 }
 
 function createLegacyDatabase(filename) {
@@ -386,6 +441,8 @@ async function main() {
     await testModbus();
     await testOpcUaWithFakeClient();
     await testOpcUaFailedSessionCleanup();
+    testOverdueRetryWatchdog();
+    await testConnectingTimeoutWatchdog();
     await testProtocolApiAndMigration();
     console.log(JSON.stringify({ success: true, protocols: ['S7', 'MODBUS_TCP', 'OPC_UA'], modbusTcp: true, opcUa: true }, null, 2));
 }
