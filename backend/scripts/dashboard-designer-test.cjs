@@ -24,11 +24,16 @@ async function main() {
     const legacy = buildDocumentFromLegacy({
         project: { id: 'project_test' },
         scene: { id: 'scene_test', name: '测试', layout_json: JSON.stringify({ grid: { columns: 24, rows: 12 } }) },
-        widgets: [{ id: 'legacy_text', widget_type: 'text', title: '旧组件', x: 1, y: 2, w: 3, h: 4, config_json: '{}', binding_json: '{}' }]
+        widgets: [
+            { id: 'legacy_text', widget_type: 'text', title: '旧组件', x: 1, y: 2, w: 3, h: 4, config_json: '{}', binding_json: '{}' },
+            { id: 'legacy_runtime', widget_type: 'value', title: '旧运行指标', x: 4, y: 2, w: 3, h: 4, config_json: '{}', binding_json: '{"mode":"runtime","path":"metrics.current_output"}' }
+        ]
     });
     assert.equal(isCanonicalDocument(legacy), true);
     assert.equal(Math.round(legacy.widgets[0].frame.x), 80);
     assert.equal(Math.round(legacy.widgets[0].frame.y), 180);
+    assert.equal(legacy.widgets[1].data.mode, 'static', '旧系统运行指标没有迁移为静态数据');
+    assert.equal(legacy.widgets[1].data.path, '', '旧系统运行指标路径没有清理');
     validateDocument(legacy);
 
     const initial = await api('/api/platform/designer');

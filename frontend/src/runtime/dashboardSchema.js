@@ -196,6 +196,12 @@ export function normalizeDashboardWidget(source = {}, canvas = DEFAULT_DASHBOARD
   const hasCanonicalFrame = frame.width !== undefined || frame.height !== undefined
   const data = objectValue(source.data, objectValue(source.binding, {}))
   const requestedMode = String(data.mode || '')
+  const normalizedMode = requestedMode === 'plc' || requestedMode === 'database'
+    ? requestedMode
+    : 'static'
+  const resolvedDataMode = normalizedMode === 'static'
+    ? (data.connectionId || data.connection_id ? 'database' : (data.pointId || data.point_id ? 'plc' : 'static'))
+    : normalizedMode
   return {
     id: String(source.id || `widget_${type}_${index + 1}`).replace(/[^a-zA-Z0-9_-]/g, '_'),
     type,
@@ -215,11 +221,12 @@ export function normalizeDashboardWidget(source = {}, canvas = DEFAULT_DASHBOARD
     content: { ...deepClone(defaults.content || {}), ...deepClone(config) },
     style: { ...deepClone(defaults.style || {}), ...deepClone(source.style || source.config?.style || {}) },
     data: {
-      mode: ['static', 'runtime', 'plc', 'database'].includes(requestedMode) ? requestedMode : (data.connectionId || data.connection_id ? 'database' : (data.pointId || data.point_id ? 'plc' : (data.path || data.source ? 'runtime' : 'static'))),
+      // 旧版 runtime 指标没有真实数据来源，统一迁移为静态占位；真实数据只允许 PLC 或数据库只读绑定。
+      mode: resolvedDataMode,
       deviceId: String(data.deviceId || data.device_id || ''),
       pointId: String(data.pointId || data.point_id || ''),
-      path: String(data.path || ''),
-      source: String(data.source || ''),
+      path: resolvedDataMode === 'static' ? '' : String(data.path || ''),
+      source: resolvedDataMode === 'static' ? '' : String(data.source || ''),
       connectionId: String(data.connectionId || data.connection_id || ''),
       schema: String(data.schema || ''),
       table: String(data.table || ''),

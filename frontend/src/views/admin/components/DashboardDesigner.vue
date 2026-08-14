@@ -64,16 +64,6 @@ let viewportObserver = null
 let viewportFitFrame = 0
 let manualZoom = false
 
-const runtimePaths = [
-  { value: 'metrics.current_output', label: '今日产出' },
-  { value: 'metrics.progress_percent', label: '完成进度' },
-  { value: 'metrics.overall_oee', label: 'OEE' },
-  { value: 'metrics.energy_consumption', label: '能耗估算' },
-  { value: 'metrics.online_devices', label: '在线设备数' },
-  { value: 'events', label: '报警/事件列表' },
-  { value: 'trendPoints', label: '实时趋势序列' }
-]
-
 const backgroundColorPresets = [
   'transparent',
   'rgba(9, 22, 35, .35)',
@@ -467,18 +457,10 @@ function setZoom(value) {
   manualZoom = true
 }
 
-function getByPath(source, path) {
-  if (!path) return undefined
-  return String(path).split('.').reduce((current, key) => current?.[key], source)
-}
-
 function previewValueForWidget(widget) {
   const binding = widget.data || {}
   if (binding.mode === 'database') return databasePreviewValues[widget.id]?.value
   if (binding.mode === 'plc') return pointValues.value[binding.pointId]?.value
-  if (binding.mode === 'runtime') {
-    return getByPath({ metrics: mockMetrics, events: mockEvents.value, trendPoints: mockTrend.value, deviceStatusMap: mockDeviceStatus }, binding.path || binding.source)
-  }
   return widget.content?.value
 }
 
@@ -827,6 +809,10 @@ function changeBindingMode() {
   const widget = selectedWidget.value
   if (!widget) return
   widget.data.readOnly = true
+  if (widget.data.mode === 'static') {
+    widget.data.path = ''
+    widget.data.source = ''
+  }
   if (widget.data.mode !== 'plc') {
     widget.data.deviceId = ''
     widget.data.pointId = ''
@@ -1323,11 +1309,8 @@ onBeforeUnmount(() => {
 
             <section v-else-if="inspectorTab === 'data'" class="inspector-section">
               <div class="readonly-banner"><span>只读</span>所有外部数据源和 PLC 点位只用于展示，发布校验会拦截任何写入配置。</div>
-              <label>数据来源<select v-model="selectedWidget.data.mode" @change="changeBindingMode"><option value="static">静态 / 组件默认数据</option><option value="runtime">系统运行指标</option><option value="plc">PLC 只读点位</option><option value="database">数据库连接</option></select></label>
-              <template v-if="selectedWidget.data.mode === 'runtime'">
-                <label>运行指标<select v-model="selectedWidget.data.path" @change="recordProperty('绑定运行指标')"><option value="">请选择</option><option v-for="item in runtimePaths" :key="item.value" :value="item.value">{{ item.label }}</option></select></label>
-              </template>
-              <template v-else-if="selectedWidget.data.mode === 'plc'">
+              <label>数据来源<select v-model="selectedWidget.data.mode" @change="changeBindingMode"><option value="static">静态 / 组件默认数据</option><option value="plc">PLC 只读点位</option><option value="database">数据库连接</option></select></label>
+              <template v-if="selectedWidget.data.mode === 'plc'">
                 <label>设备<select v-model="selectedWidget.data.deviceId" @change="selectedWidget.data.pointId=''; recordProperty('选择设备')"><option value="">请选择设备</option><option v-for="device in devices" :key="device.id" :value="String(device.id)">{{ device.name }}（{{ device.id }}）</option></select></label>
                 <label>READ 点位<select v-model="selectedWidget.data.pointId" :disabled="!selectedWidget.data.deviceId" @change="bindSelectedPoint"><option value="">请选择只读点位</option><option v-for="point in selectedDevicePoints" :key="point.id" :value="String(point.id)">{{ point.label || point.name }} · {{ point.plc_tag || `DB${point.db_number}.${point.db_byte_offset}` }}</option></select></label>
                 <div class="binding-summary" v-if="selectedWidget.data.pointId"><span>路径</span><code>{{ selectedWidget.data.path }}</code><span>实时值</span><strong>{{ pointValues[selectedWidget.data.pointId]?.value ?? '--' }} {{ selectedWidget.data.unit }}</strong></div>

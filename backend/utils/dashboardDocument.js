@@ -132,12 +132,12 @@ function normalizeDataBinding(source, legacyBinding = {}) {
     const data = objectValue(source, {});
     const binding = objectValue(legacyBinding, {});
     let mode = shortText(data.mode, '', 32);
-    if (!['static', 'runtime', 'plc', 'database'].includes(mode)) {
+    if (!['static', 'plc', 'database'].includes(mode)) {
         mode = (data.connectionId || binding.connectionId || binding.connection_id)
             ? 'database'
             : (data.pointId || binding.pointId || binding.point_id)
             ? 'plc'
-            : ((data.path || binding.path || binding.source) ? 'runtime' : 'static');
+            : 'static';
     }
     return {
         ...binding,
@@ -145,8 +145,8 @@ function normalizeDataBinding(source, legacyBinding = {}) {
         mode,
         deviceId: shortText(data.deviceId ?? binding.deviceId ?? binding.device_id, '', 128),
         pointId: shortText(data.pointId ?? binding.pointId ?? binding.point_id, '', 128),
-        path: shortText(data.path ?? binding.path, '', 255),
-        source: shortText(data.source ?? binding.source, '', 128),
+        path: mode === 'static' ? '' : shortText(data.path ?? binding.path, '', 255),
+        source: mode === 'static' ? '' : shortText(data.source ?? binding.source, '', 128),
         connectionId: shortText(data.connectionId ?? binding.connectionId ?? binding.connection_id, '', 80),
         schema: shortText(data.schema ?? binding.schema, '', 255),
         table: shortText(data.table ?? binding.table, '', 255),
