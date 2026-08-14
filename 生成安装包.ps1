@@ -7,6 +7,7 @@ param(
     [string]$DatabaseName = 'dongtai_daping',
     [switch]$IncludeHistory,
     [switch]$RefreshDependencies,
+    [switch]$ForceUnityBuild,
     [switch]$NoPause
 )
 
@@ -189,6 +190,8 @@ Write-Host '热处理数字孪生大屏：安装包构建' -ForegroundColor Gree
 Write-Host "项目目录：$projectDirectory"
 Write-Host "软件版本：$version"
 Write-Host "Unity：$unityEditor"
+$unityBuildMode = if ($ForceUnityBuild) { '强制重新生成' } else { '源码未变化时复用缓存' }
+Write-Host "Unity 构建：$unityBuildMode"
 Write-Host "配置数据库：$DatabaseHost`:$DatabasePort/$DatabaseName"
 $historyText = if ($IncludeHistory) { '包含' } else { '不包含，仅交付现场配置' }
 Write-Host "运行历史：$historyText"
@@ -205,7 +208,8 @@ $environmentNames = @(
     'DESKTOP_MYSQL_USER',
     'DESKTOP_MYSQL_PASSWORD',
     'DESKTOP_MYSQL_DATABASE',
-    'DESKTOP_TEMPLATE_INCLUDE_HISTORY'
+    'DESKTOP_TEMPLATE_INCLUDE_HISTORY',
+    'DESKTOP_FORCE_UNITY_REBUILD'
 )
 $previousEnvironment = @{}
 foreach ($name in $environmentNames) {
@@ -220,6 +224,7 @@ try {
     $env:DESKTOP_MYSQL_PASSWORD = $DatabasePassword
     $env:DESKTOP_MYSQL_DATABASE = $DatabaseName
     $env:DESKTOP_TEMPLATE_INCLUDE_HISTORY = if ($IncludeHistory) { 'true' } else { 'false' }
+    $env:DESKTOP_FORCE_UNITY_REBUILD = if ($ForceUnityBuild) { 'true' } else { 'false' }
 
     $installerName = "热处理数字孪生大屏-安装包-$version-x64.exe"
     foreach ($oldOutput in @(

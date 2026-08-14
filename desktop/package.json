@@ -11,6 +11,7 @@
     "prepare:resources": "node scripts/prepare-resources.cjs && npm run prepare:ffmpeg && node scripts/generate-third-party-notices.cjs",
     "build:frontend": "npm --prefix ../frontend run build",
     "build:unity": "node scripts/build-unity-client.cjs",
+    "build:unity:force": "node scripts/build-unity-client.cjs --force",
     "build:admin-host": "node scripts/build-native-admin-host.cjs",
     "test:logs": "node scripts/log-manager-test.cjs",
     "test:supervisor": "node scripts/backend-supervisor-test.cjs",

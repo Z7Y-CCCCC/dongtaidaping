@@ -1,4 +1,5 @@
 const { spawnSync } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -10,6 +11,53 @@ const buildDirectory = path.join(unityProjectDir, 'Builds', 'Windows');
 const buildExecutable = path.join(buildDirectory, 'HeatTreatmentDigitalTwin.exe');
 const logDirectory = path.join(unityProjectDir, 'Logs');
 const logFile = path.join(logDirectory, 'desktop-package-build.log');
+const cacheFile = path.join(unityProjectDir, 'Library', 'DigitalTwinBuildCache', 'windows-client.json');
+const forceRebuild = process.argv.includes('--force')
+    || String(process.env.DESKTOP_FORCE_UNITY_REBUILD || '').toLowerCase() === 'true';
+const inputRoots = ['Assets', 'Packages', 'ProjectSettings'].map(name => path.join(unityProjectDir, name));
+const requiredOutputs = [
+    buildExecutable,
+    path.join(buildDirectory, 'UnityPlayer.dll'),
+    path.join(buildDirectory, 'HeatTreatmentDigitalTwin_Data'),
+    path.join(buildDirectory, 'HeatTreatmentDigitalTwin_Data', 'Managed', 'Assembly-CSharp.dll')
+];
+
+function walkFiles(directory, result = []) {
+    if (!fs.existsSync(directory)) return result;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const fullPath = path.join(directory, entry.name);
+        if (entry.isDirectory()) walkFiles(fullPath, result);
+        else if (entry.isFile()) result.push(fullPath);
+    }
+    return result;
+}
+
+function calculateInputFingerprint(editorVersion) {
+    const hash = crypto.createHash('sha256');
+    hash.update('digital-twin-unity-windows-v1\0');
+    hash.update(editorVersion);
+    const files = inputRoots.flatMap(root => walkFiles(root)).sort((left, right) => left.localeCompare(right));
+    for (const filename of files) {
+        hash.update(path.relative(unityProjectDir, filename).replace(/\\/g, '/'));
+        hash.update('\0');
+        hash.update(fs.readFileSync(filename));
+        hash.update('\0');
+    }
+    return { fingerprint: hash.digest('hex'), fileCount: files.length };
+}
+
+function readBuildCache() {
+    try { return JSON.parse(fs.readFileSync(cacheFile, 'utf8')); }
+    catch (error) { return null; }
+}
+
+function writeBuildCache(details) {
+    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+    fs.writeFileSync(cacheFile, JSON.stringify({
+        ...details,
+        builtAt: new Date().toISOString()
+    }, null, 2), 'utf8');
+}
 
 function readEditorVersion() {
     const text = fs.readFileSync(projectVersionFile, 'utf8');
@@ -46,6 +94,18 @@ function findEditor(version) {
 }
 
 const version = readEditorVersion();
+const input = calculateInputFingerprint(version);
+const cached = readBuildCache();
+const outputsReady = requiredOutputs.every(filename => fs.existsSync(filename));
+if (!forceRebuild && outputsReady && cached?.fingerprint === input.fingerprint) {
+    console.log(`Unity 源码、场景和设置未变化，复用现有 Windows 客户端（已检查 ${input.fileCount} 个文件）。`);
+    console.log('如需强制重建，请运行：npm run build:unity:force');
+    process.exit(0);
+}
+if (forceRebuild) console.log('已要求强制重建 Unity Windows 客户端。');
+else if (!outputsReady) console.log('Unity 构建产物不完整，将执行完整构建。');
+else if (!cached) console.log('尚无 Unity 构建缓存记录，将构建并建立缓存。');
+else console.log('检测到 Unity 源码、场景或设置发生变化，将执行增量构建。');
 const editor = findEditor(version);
 fs.mkdirSync(logDirectory, { recursive: true });
 
@@ -69,12 +129,14 @@ if (result.status !== 0) {
     throw new Error(`Unity Windows 构建失败（退出码 ${result.status}），请查看：${logFile}`);
 }
 
-for (const required of [
-    buildExecutable,
-    path.join(buildDirectory, 'UnityPlayer.dll'),
-    path.join(buildDirectory, 'HeatTreatmentDigitalTwin_Data')
-]) {
+for (const required of requiredOutputs) {
     if (!fs.existsSync(required)) throw new Error(`Unity 构建缺少产物：${required}`);
 }
+
+writeBuildCache({
+    fingerprint: input.fingerprint,
+    fileCount: input.fileCount,
+    editorVersion: version
+});
 
 console.log(`Unity Windows 客户端已生成：${buildExecutable}`);
