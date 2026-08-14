@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { adminApi } from '../../../config/factoryConfig.js'
 import WidgetRenderer from '../../../runtime/WidgetRenderer.vue'
 import { applyVisibilityAction, widgetRuntimeVisible } from '../../../runtime/dashboardRules.js'
+import ColorField from './ColorField.vue'
 import {
   DASHBOARD_WIDGET_LIBRARY,
   DASHBOARD_VIEW_MODES,
@@ -72,6 +73,19 @@ const runtimePaths = [
   { value: 'events', label: '报警/事件列表' },
   { value: 'trendPoints', label: '实时趋势序列' }
 ]
+
+const backgroundColorPresets = [
+  'transparent',
+  'rgba(9, 22, 35, .35)',
+  'rgba(9, 22, 35, .65)',
+  'rgba(9, 22, 35, .82)',
+  '#ffffff',
+  '#1d1d1f',
+  '#12344a',
+  '#183c50'
+]
+const textColorPresets = ['#ffffff', '#dbeeff', '#68d5ff', '#45df9b', '#ffc45f', '#ff625f', '#1d1d1f', '#6e6e73']
+const borderColorPresets = ['transparent', 'rgba(89, 178, 238, .18)', 'rgba(89, 178, 238, .35)', '#59b2ee', '#45df9b', '#ffc45f', '#ff625f', '#ffffff']
 
 const mockMetrics = reactive({
   current_output: 1260,
@@ -1285,10 +1299,19 @@ onBeforeUnmount(() => {
             </section>
 
             <section v-else-if="inspectorTab === 'style'" class="inspector-section">
-              <label>背景颜色<input v-model="selectedWidget.style.background" placeholder="rgba(...) 或 #RRGGBB" @change="recordProperty('修改样式')" /></label>
-              <label>文字颜色<input v-model="selectedWidget.style.color" @change="recordProperty('修改样式')" /></label>
-              <label v-if="['value','status'].includes(selectedWidget.type)">数值/开启颜色<input v-model="selectedWidget.style.valueColor" @change="recordProperty('修改样式')" /></label>
-              <label>边框颜色<input v-model="selectedWidget.style.borderColor" @change="recordProperty('修改样式')" /></label>
+              <ColorField v-model="selectedWidget.style.background" label="背景颜色" :presets="backgroundColorPresets" @commit="recordProperty('修改样式')" />
+              <ColorField v-model="selectedWidget.style.color" label="文字颜色" :presets="textColorPresets" @commit="recordProperty('修改样式')" />
+              <ColorField v-if="selectedWidget.type === 'value'" v-model="selectedWidget.style.valueColor" label="数值颜色" :presets="textColorPresets" @commit="recordProperty('修改样式')" />
+              <template v-if="selectedWidget.type === 'status'">
+                <ColorField v-model="selectedWidget.style.onColor" label="正常 / 开启颜色" :presets="textColorPresets" @commit="recordProperty('修改样式')" />
+                <ColorField v-model="selectedWidget.style.offColor" label="停止 / 关闭颜色" :presets="textColorPresets" @commit="recordProperty('修改样式')" />
+                <ColorField v-model="selectedWidget.style.alarmColor" label="报警颜色" :presets="textColorPresets" @commit="recordProperty('修改样式')" />
+              </template>
+              <template v-if="selectedWidget.type === 'trend'">
+                <ColorField v-model="selectedWidget.content.lineColor" label="曲线颜色" :presets="textColorPresets" @commit="recordProperty('修改样式')" />
+                <ColorField v-model="selectedWidget.content.areaColor" label="曲线填充颜色" :presets="borderColorPresets" @commit="recordProperty('修改样式')" />
+              </template>
+              <ColorField v-model="selectedWidget.style.borderColor" label="边框颜色" :presets="borderColorPresets" @commit="recordProperty('修改样式')" />
               <div class="property-grid two">
                 <label>圆角<input v-model.number="selectedWidget.style.borderRadius" type="number" min="0" max="80" @change="recordProperty('修改样式')" /></label>
                 <label>字号<input v-model.number="selectedWidget.style.fontSize" type="number" min="10" max="120" @change="recordProperty('修改样式')" /></label>
@@ -1351,8 +1374,8 @@ onBeforeUnmount(() => {
               <div class="section-action-heading"><div><strong>条件样式</strong><small>按实时值切换颜色或闪烁</small></div><button @click="addCondition">＋ 添加</button></div>
               <div v-for="(condition, index) in selectedWidget.conditions" :key="index" class="condition-card">
                 <div class="property-grid two"><label>判断<select v-model="condition.operator" @change="recordProperty()"><option value=">">大于</option><option value=">=">大于等于</option><option value="<">小于</option><option value="<=">小于等于</option><option value="==">等于</option><option value="!=">不等于</option><option value="truthy">为真</option><option value="falsy">为假</option></select></label><label>阈值<input v-model="condition.value" @change="recordProperty()" /></label></div>
-                <label>文字颜色<input v-model="condition.color" @change="recordProperty()" /></label>
-                <label>背景颜色<input v-model="condition.background" @change="recordProperty()" /></label>
+                <ColorField v-model="condition.color" label="文字颜色" :presets="textColorPresets" @commit="recordProperty('修改条件颜色')" />
+                <ColorField v-model="condition.background" label="背景颜色" :presets="backgroundColorPresets" @commit="recordProperty('修改条件颜色')" />
                 <label>效果<select v-model="condition.animation" @change="recordProperty()"><option value="none">无</option><option value="blink">闪烁</option><option value="pulse">脉冲</option></select></label>
                 <button class="danger-link" @click="removeCondition(index)">删除条件</button>
               </div>
@@ -1431,8 +1454,8 @@ onBeforeUnmount(() => {
             <label>大屏名称<input v-model="documentModel.name" @change="commitHistory('修改大屏名称')" /></label>
             <div class="property-grid two"><label>宽度<input v-model.number="canvas.width" type="number" min="320" max="7680" @change="commitHistory('修改画布')" /></label><label>高度<input v-model.number="canvas.height" type="number" min="180" max="4320" @change="commitHistory('修改画布')" /></label></div>
             <div class="property-grid two"><label>吸附网格<input v-model.number="canvas.gridSize" type="number" min="1" max="200" @change="commitHistory('修改画布')" /></label><label>安全边距<input v-model.number="canvas.safeArea" type="number" min="0" max="400" @change="commitHistory('修改画布')" /></label></div>
-            <label>背景<input v-model="canvas.background" @change="commitHistory('修改画布')" /></label>
-            <label>主题色<input v-model="documentModel.theme.accentColor" @change="commitHistory('修改主题')" /></label>
+            <ColorField v-model="canvas.background" label="画布背景" :presets="backgroundColorPresets" @commit="commitHistory('修改画布')" />
+            <ColorField v-model="documentModel.theme.accentColor" label="主题色" :presets="textColorPresets" @commit="commitHistory('修改主题')" />
           </div>
         </template>
       </aside>
