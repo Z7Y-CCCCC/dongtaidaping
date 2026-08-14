@@ -39,7 +39,12 @@ router.get('/runtime-values', async (req, res) => {
         const db = await getDb();
         const { project, scene } = await getProjectAndScene(db, String(req.query.scene_id || ''));
         const { document, release } = await loadPublishedDocument(db, project, scene);
-        const values = await readRuntimeBindings(document.widgets || []);
+        const values = await readRuntimeBindings(document.widgets || [], {
+            viewId: String(req.query.view_id || ''),
+            workshopId: String(req.query.workshop_id || ''),
+            lineId: String(req.query.line_id || ''),
+            deviceId: String(req.query.device_id || '')
+        });
         res.json({
             success: true,
             releaseId: release?.id || null,

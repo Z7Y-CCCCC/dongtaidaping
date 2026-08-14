@@ -90,7 +90,10 @@ async function validatePlcBindings(db, document) {
     validateDocument(document);
     const databaseConnectionIds = [...new Set(document.widgets
         .filter(widget => widget.data?.mode === 'database')
-        .map(widget => String(widget.data.connectionId || ''))
+        .flatMap(widget => (Array.isArray(widget.data.datasets) && widget.data.datasets.length
+            ? widget.data.datasets
+            : [widget.data]))
+        .map(binding => String(binding.connectionId || ''))
         .filter(Boolean))];
     for (const connectionId of databaseConnectionIds) resolveConnection(connectionId);
     const bindings = document.widgets

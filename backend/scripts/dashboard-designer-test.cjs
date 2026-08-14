@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const {
     buildDocumentFromLegacy,
+    normalizeDocument,
     validateDocument,
     isCanonicalDocument
 } = require('../utils/dashboardDocument');
@@ -35,6 +36,16 @@ async function main() {
     assert.equal(legacy.widgets[1].data.mode, 'static', '旧系统运行指标没有迁移为静态数据');
     assert.equal(legacy.widgets[1].data.path, '', '旧系统运行指标路径没有清理');
     validateDocument(legacy);
+
+    const staleReferenceDocument = clone(legacy);
+    staleReferenceDocument.scene.views[0].componentState.hide.push('widget_already_deleted');
+    staleReferenceDocument.widgets[0].events.push({
+        trigger: 'click', action: 'toggle_visibility', targetType: 'widget', targetId: 'widget_already_deleted'
+    });
+    const repairedDocument = normalizeDocument(staleReferenceDocument);
+    assert.equal(repairedDocument.scene.views[0].componentState.hide.includes('widget_already_deleted'), false, '旧视角残留组件引用没有清理');
+    assert.equal(repairedDocument.widgets[0].events.some(event => event.targetId === 'widget_already_deleted'), false, '旧事件残留组件引用没有清理');
+    validateDocument(repairedDocument);
 
     const initial = await api('/api/platform/designer');
     assert.equal(initial.response.ok, true, initial.body.error);

@@ -42,6 +42,8 @@ const databaseTables = ref([])
 const databaseColumns = ref([])
 const databaseMetadataLoading = ref(false)
 const databasePreviewValues = reactive({})
+const databaseTablesByDataset = reactive({})
+const databaseColumnsByDataset = reactive({})
 const previewContext = reactive({ viewId: 'factory_overview', viewMode: 'factory', workshopId: '', lineId: '', deviceId: '' })
 const previewGroupVisibility = reactive({})
 const previewWidgetVisibility = reactive({})
@@ -49,7 +51,6 @@ const pointValues = ref({})
 const history = ref([])
 const historyIndex = ref(-1)
 const lastSavedSnapshot = ref('')
-const publishDialogOpen = ref(false)
 const publishForm = reactive({ version: '', notes: '' })
 const releaseDialog = ref(null)
 const layersCollapsed = ref(false)
@@ -76,6 +77,13 @@ const backgroundColorPresets = [
 ]
 const textColorPresets = ['#ffffff', '#dbeeff', '#68d5ff', '#45df9b', '#ffc45f', '#ff625f', '#1d1d1f', '#6e6e73']
 const borderColorPresets = ['transparent', 'rgba(89, 178, 238, .18)', 'rgba(89, 178, 238, .35)', '#59b2ee', '#45df9b', '#ffc45f', '#ff625f', '#ffffff']
+const chartPalettes = [
+  { id: 'industrial', label: '工业蓝青', colors: ['#55c7ff', '#45df9b', '#ffc45f', '#ff6b78', '#8f9cff', '#64e0d2'] },
+  { id: 'vivid', label: '鲜明对比', colors: ['#3478f6', '#ff9f0a', '#30d158', '#ff453a', '#bf5af2', '#64d2ff'] },
+  { id: 'warm', label: '暖色生产', colors: ['#ffb340', '#ff7a45', '#ff5e68', '#ffd666', '#d89614', '#ff9c6e'] },
+  { id: 'cool', label: '冷色科技', colors: ['#00c7be', '#64d2ff', '#5e5ce6', '#32ade6', '#40c8e0', '#7d7aff'] },
+  { id: 'mono', label: '极简灰阶', colors: ['#f5f5f7', '#c7c7cc', '#8e8e93', '#636366', '#aeaeb2', '#d1d1d6'] }
+]
 
 const mockMetrics = reactive({
   current_output: 1260,
@@ -373,29 +381,6 @@ function updateViewTarget(view) {
   commitHistory('修改视角目标')
 }
 
-async function sendCurrentViewToUnity() {
-  const view = currentView.value
-  if (!view) return
-  try {
-    const mode = view.mode === 'custom' ? (view.targetType || 'factory') : view.mode
-    const result = await adminApi.sendNativePreview({
-      action: 'view',
-      source: 'dashboard_designer',
-      viewId: view.id,
-      view,
-      focus: {
-        mode,
-        deviceId: view.targetType === 'device' ? view.targetId : '',
-        lineId: view.targetType === 'line' ? view.targetId : '',
-        workshopId: view.targetType === 'workshop' ? view.targetId : ''
-      }
-    })
-    setStatus(result?.sent ? `已将“${view.name}”发送到 Unity` : 'Unity 当前未连接，已保存设计器预览', result?.sent ? 'success' : 'warning')
-  } catch (error) {
-    setStatus(error.message || '发送 Unity 预览失败', 'danger')
-  }
-}
-
 function toggleViewComponent(view, id, visible) {
   if (!view) return
   const state = view.componentState || (view.componentState = { show: [], hide: [], hideNonTargetDevices: false })
@@ -661,8 +646,32 @@ function deleteSelected() {
   const removable = new Set(selectedIds.value.filter(id => !findWidget(id)?.locked))
   if (!removable.size) return setStatus('锁定组件不能删除', 'warning')
   documentModel.value.widgets = documentModel.value.widgets.filter(widget => !removable.has(widget.id))
+  documentModel.value.scene.views.forEach(view => {
+    const state = view.componentState || (view.componentState = { show: [], hide: [], hideNonTargetDevices: false })
+    state.show = (state.show || []).filter(target => !removable.has(target))
+    state.hide = (state.hide || []).filter(target => !removable.has(target))
+  })
+  documentModel.value.widgets.forEach(widget => {
+    widget.events = (widget.events || []).filter(event => !(
+      ['set_visibility', 'toggle_visibility'].includes(event?.action)
+      && event.targetType === 'widget'
+      && removable.has(event.targetId)
+    ))
+  })
   selectedIds.value = []
   commitHistory('删除组件')
+}
+
+function applyChartPalette() {
+  const widget = selectedWidget.value
+  if (!widget || widget.type !== 'trend') return
+  const palette = chartPalettes.find(item => item.id === widget.content.chartPalette) || chartPalettes[0]
+  widget.content.lineColor = palette.colors[0]
+  ensureDatabaseDatasets(widget).forEach((dataset, index) => {
+    dataset.color = palette.colors[index % palette.colors.length]
+  })
+  widget.data.formulaColor = palette.colors[Math.min(widget.data.datasets.length, palette.colors.length - 1)]
+  recordProperty('应用图表配色')
 }
 
 function copySelected() {
@@ -769,6 +778,102 @@ async function loadDatabaseColumns(connectionId = selectedWidget.value?.data?.co
   }
 }
 
+function createDatabaseDataset(index = 0, widget = selectedWidget.value) {
+  const defaultList = ['trend', 'alarm_list', 'device_list', 'marquee'].includes(widget?.type)
+  return {
+    alias: String.fromCharCode(97 + Math.min(index, 25)),
+    label: `数据项 ${String.fromCharCode(65 + Math.min(index, 25))}`,
+    color: ['#55c7ff', '#45df9b', '#ffc45f', '#ff6b78'][index % 4],
+    connectionId: dataSources.value[0]?.id || '', schema: '', table: '', field: '', timeField: '', orderBy: '',
+    orderDirection: 'desc', valueMode: defaultList ? 'list' : 'latest', rowLimit: 50, refreshMs: 5000,
+    contextField: '', contextKey: ''
+  }
+}
+
+function ensureDatabaseDatasets(widget = selectedWidget.value) {
+  if (!widget?.data) return []
+  if (!Array.isArray(widget.data.datasets) || !widget.data.datasets.length) {
+    widget.data.datasets = [{
+      ...createDatabaseDataset(0, widget),
+      connectionId: widget.data.connectionId || dataSources.value[0]?.id || '',
+      schema: widget.data.schema || '', table: widget.data.table || '', field: widget.data.field || '',
+      timeField: widget.data.timeField || '', orderBy: widget.data.orderBy || widget.data.timeField || '',
+      orderDirection: widget.data.orderDirection || 'desc', valueMode: widget.data.valueMode || 'latest',
+      rowLimit: widget.data.rowLimit || 50, refreshMs: widget.data.refreshMs || 5000
+    }]
+  }
+  return widget.data.datasets
+}
+
+function datasetMetaKey(index, widget = selectedWidget.value) { return `${widget?.id || 'none'}:${index}` }
+function datasetTables(index) { return databaseTablesByDataset[datasetMetaKey(index)] || [] }
+function datasetColumns(index) { return databaseColumnsByDataset[datasetMetaKey(index)] || [] }
+
+async function loadDatasetTables(dataset, index) {
+  const key = datasetMetaKey(index)
+  databaseTablesByDataset[key] = []
+  databaseColumnsByDataset[key] = []
+  if (!dataset?.connectionId) return
+  databaseMetadataLoading.value = true
+  try {
+    const result = await adminApi.getDataSourceTables(dataset.connectionId)
+    databaseTablesByDataset[key] = result.tables || []
+  } catch (error) {
+    setStatus(`读取数据库表失败：${error.message || error}`, 'danger')
+  } finally { databaseMetadataLoading.value = false }
+}
+
+async function loadDatasetColumns(dataset, index) {
+  const key = datasetMetaKey(index)
+  databaseColumnsByDataset[key] = []
+  if (!dataset?.connectionId || !dataset.table) return
+  databaseMetadataLoading.value = true
+  try {
+    const result = await adminApi.getDataSourceColumns(dataset.connectionId, dataset.schema || '', dataset.table)
+    databaseColumnsByDataset[key] = result.columns || []
+  } catch (error) {
+    setStatus(`读取数据库字段失败：${error.message || error}`, 'danger')
+  } finally { databaseMetadataLoading.value = false }
+}
+
+async function changeDatasetConnection(dataset, index) {
+  Object.assign(dataset, { schema: '', table: '', field: '', timeField: '', orderBy: '', contextField: '' })
+  delete databasePreviewValues[selectedWidget.value?.id]
+  await loadDatasetTables(dataset, index)
+  recordProperty('选择数据库连接')
+}
+
+async function changeDatasetTable(dataset, index, value) {
+  const [schema = '', table = ''] = String(value || '').split('\u0001')
+  Object.assign(dataset, { schema, table, field: '', timeField: '', orderBy: '', contextField: '' })
+  delete databasePreviewValues[selectedWidget.value?.id]
+  await loadDatasetColumns(dataset, index)
+  recordProperty('选择数据库表')
+}
+
+function datasetTableKey(dataset) { return dataset?.table ? `${dataset.schema || ''}\u0001${dataset.table}` : '' }
+
+function addDatabaseDataset() {
+  const datasets = ensureDatabaseDatasets()
+  if (datasets.length >= 12) return setStatus('一个组件最多配置 12 个数据项', 'warning')
+  datasets.push(createDatabaseDataset(datasets.length))
+  commitHistory('添加数据项')
+}
+
+function removeDatabaseDataset(index) {
+  const datasets = ensureDatabaseDatasets()
+  if (datasets.length <= 1) return setStatus('至少保留一个数据项', 'warning')
+  datasets.splice(index, 1)
+  commitHistory('删除数据项')
+  previewDatabaseBinding()
+}
+
+function bindDatabaseToDevice() {
+  if (!selectedWidget.value) return
+  selectedWidget.value.visibility.matchBoundDevice = Boolean(selectedWidget.value.data.deviceId)
+  recordProperty('设置设备详情适用范围')
+}
+
 async function changeDatabaseConnection() {
   const widget = selectedWidget.value
   if (!widget) return
@@ -793,10 +898,14 @@ function databaseTableKey(data = selectedWidget.value?.data) {
 }
 
 async function previewDatabaseBinding(widget = selectedWidget.value, silent = false) {
-  if (!widget || widget.data?.mode !== 'database' || !widget.data.connectionId || !widget.data.table) return
-  if (widget.data.valueMode !== 'count' && !widget.data.field) return
+  if (!widget || widget.data?.mode !== 'database') return
+  const datasets = ensureDatabaseDatasets(widget)
+  if (!datasets.length || datasets.some(dataset => !dataset.connectionId || !dataset.table || (dataset.valueMode !== 'count' && !dataset.field))) {
+    if (!silent) setStatus('请先完整配置每个数据项的连接、表和字段', 'warning')
+    return
+  }
   try {
-    const result = await adminApi.previewDataSource(widget.data)
+    const result = await adminApi.previewDataSource({ ...widget.data, context: { ...previewContext } })
     databasePreviewValues[widget.id] = result.result || {}
     if (!silent) setStatus(`数据预览：${result.result?.value ?? '空值'}`, 'success')
   } catch (error) {
@@ -812,9 +921,10 @@ function changeBindingMode() {
   if (widget.data.mode === 'static') {
     widget.data.path = ''
     widget.data.source = ''
+    widget.data.deviceId = ''
+    widget.visibility.matchBoundDevice = false
   }
   if (widget.data.mode !== 'plc') {
-    widget.data.deviceId = ''
     widget.data.pointId = ''
   }
   if (widget.data.mode !== 'database') {
@@ -825,11 +935,11 @@ function changeBindingMode() {
     widget.data.timeField = ''
     widget.data.orderBy = ''
   } else {
-    widget.data.valueMode = ['trend', 'alarm_list', 'device_list', 'marquee'].includes(widget.type) ? 'list' : 'latest'
-    widget.data.rowLimit ||= 50
-    widget.data.refreshMs ||= 5000
-    if (!widget.data.connectionId) widget.data.connectionId = dataSources.value[0]?.id || ''
-    loadDatabaseTables(widget.data.connectionId)
+    const datasets = ensureDatabaseDatasets(widget)
+    if (['trend', 'alarm_list', 'device_list', 'marquee'].includes(widget.type)) {
+      datasets.forEach(dataset => { if (!dataset.table) dataset.valueMode = 'list' })
+    }
+    datasets.forEach((dataset, index) => loadDatasetTables(dataset, index))
   }
   commitHistory('修改数据源')
 }
@@ -973,12 +1083,6 @@ async function saveDraft() {
   }
 }
 
-function openPublishDialog() {
-  publishForm.version = ''
-  publishForm.notes = ''
-  publishDialogOpen.value = true
-}
-
 async function publishVersion() {
   if (publishing.value) return
   if (isDirty.value) {
@@ -989,9 +1093,8 @@ async function publishVersion() {
   try {
     const result = await adminApi.publishDashboard(documentModel.value.sceneId, publishForm.version, publishForm.notes)
     if (result?.error) throw new Error(result.error)
-    publishDialogOpen.value = false
-    setStatus(`版本 ${result.release.version} 已发布，Unity/WebView 正在切换`, 'success')
     await loadDesigner({ allowLocal: false })
+    setStatus(`版本 ${result.release.version} 已发布，Unity 与数据层已收到更新`, 'success')
     emit('reload')
   } catch (error) {
     setStatus(error.message || '发布失败', 'danger')
@@ -1054,10 +1157,13 @@ function handleKeydown(event) {
 }
 
 watch(documentModel, scheduleLocalPersist, { deep: true })
-watch(() => [selectedWidget.value?.id, selectedWidget.value?.data?.mode, selectedWidget.value?.data?.connectionId, selectedWidget.value?.data?.schema, selectedWidget.value?.data?.table], async ([id, mode, connectionId, schema, table]) => {
+watch(() => [selectedWidget.value?.id, selectedWidget.value?.data?.mode], async ([id, mode]) => {
   if (!id || mode !== 'database') return
-  if (connectionId) await loadDatabaseTables(connectionId)
-  if (connectionId && table) await loadDatabaseColumns(connectionId, schema, table)
+  const datasets = ensureDatabaseDatasets(selectedWidget.value)
+  await Promise.all(datasets.map(async (dataset, index) => {
+    if (dataset.connectionId) await loadDatasetTables(dataset, index)
+    if (dataset.connectionId && dataset.table) await loadDatasetColumns(dataset, index)
+  }))
   await previewDatabaseBinding(selectedWidget.value, true)
 })
 
@@ -1117,9 +1223,10 @@ onBeforeUnmount(() => {
         <select v-if="previewMode" :value="selectedViewId" title="模拟 Unity 当前视角" @change="selectView($event.target.value, { enterPreview: true })">
           <option v-for="view in views" :key="view.id" :value="view.id">{{ view.name }}</option>
         </select>
-        <button type="button" :class="{ active: previewMode }" @click="togglePreviewMode">{{ previewMode ? '退出预览' : '实时预览' }}</button>
+        <span class="toolbar-status" :class="status.tone" :title="status.text">{{ status.text }}</span>
+        <button type="button" :class="{ active: previewMode }" @click="togglePreviewMode">{{ previewMode ? '退出预览' : '预览' }}</button>
         <button type="button" class="save-button" :disabled="saving || !isDirty" @click="saveDraft">{{ saving ? '保存中...' : '保存草稿' }}</button>
-        <button type="button" class="publish-button" :disabled="publishing" @click="openPublishDialog">发布版本</button>
+        <button type="button" class="publish-button" :disabled="publishing || saving" @click="publishVersion">{{ publishing ? '发布中...' : '保存并发布' }}</button>
       </div>
     </header>
 
@@ -1266,8 +1373,18 @@ onBeforeUnmount(() => {
                 <label>最多显示<input v-model.number="selectedWidget.content.limit" type="number" min="1" max="100" @change="recordProperty()" /></label>
               </template>
               <template v-if="selectedWidget.type === 'trend'">
-                <label>曲线名称<input v-model="selectedWidget.content.seriesName" @change="recordProperty()" /></label>
+                <label>图表形式<select v-model="selectedWidget.content.chartType" @change="recordProperty('修改图表形式')"><option value="line">折线图</option><option value="area">面积图</option><option value="bar">柱状图</option><option value="stackedBar">堆叠柱状图</option><option value="scatter">散点图</option><option value="pie">饼图</option><option value="donut">环形图</option><option value="gauge">仪表盘</option></select></label>
+                <label>配色预设<select v-model="selectedWidget.content.chartPalette" @change="applyChartPalette"><option v-for="palette in chartPalettes" :key="palette.id" :value="palette.id">{{ palette.label }}</option></select></label>
+                <label>图表名称<input v-model="selectedWidget.content.seriesName" @change="recordProperty()" /></label>
                 <label>保留数据点<input v-model.number="selectedWidget.content.historyLength" type="number" min="8" max="600" @change="recordProperty()" /></label>
+                <label class="visibility-bound-device"><input v-model="selectedWidget.content.showLegend" type="checkbox" @change="recordProperty('修改图例')" /> 显示多数据项图例</label>
+                <label v-if="selectedWidget.content.showLegend">图例位置<select v-model="selectedWidget.content.legendPosition" @change="recordProperty('修改图例位置')"><option value="top">顶部</option><option value="bottom">底部</option><option value="right">右侧</option></select></label>
+                <div class="property-grid two"><label class="visibility-bound-device"><input v-model="selectedWidget.content.showAxis" type="checkbox" @change="recordProperty('修改坐标轴')" /> 显示坐标轴</label><label class="visibility-bound-device"><input v-model="selectedWidget.content.showDataLabel" type="checkbox" @change="recordProperty('修改数据标签')" /> 显示数据标签</label></div>
+                <template v-if="['line','area','scatter'].includes(selectedWidget.content.chartType)"><div class="property-grid two"><label class="visibility-bound-device"><input v-model="selectedWidget.content.smooth" type="checkbox" :disabled="selectedWidget.content.chartType === 'scatter'" @change="recordProperty('修改曲线')" /> 平滑曲线</label><label class="visibility-bound-device"><input v-model="selectedWidget.content.showSymbol" type="checkbox" @change="recordProperty('修改数据点')" /> 显示数据点</label></div><label>线宽<input v-model.number="selectedWidget.content.lineWidth" type="range" min="1" max="8" step="1" @change="recordProperty('修改线宽')" /><small class="field-hint">{{ selectedWidget.content.lineWidth || 2 }} px</small></label></template>
+                <label v-if="selectedWidget.content.chartType === 'area'">面积透明度<input v-model.number="selectedWidget.content.areaOpacity" type="range" min="0.05" max="0.9" step="0.05" @change="recordProperty('修改面积透明度')" /><small class="field-hint">{{ Math.round((selectedWidget.content.areaOpacity ?? .2) * 100) }}%</small></label>
+                <label v-if="['bar','stackedBar'].includes(selectedWidget.content.chartType)">柱体圆角<input v-model.number="selectedWidget.content.barRadius" type="range" min="0" max="20" step="1" @change="recordProperty('修改柱体圆角')" /><small class="field-hint">{{ selectedWidget.content.barRadius || 0 }} px</small></label>
+                <label v-if="selectedWidget.content.chartType === 'donut'">内环比例<input v-model.number="selectedWidget.content.donutRatio" type="range" min="20" max="75" step="1" @change="recordProperty('修改内环')" /><small class="field-hint">{{ selectedWidget.content.donutRatio || 48 }}%</small></label>
+                <div v-if="selectedWidget.content.chartType === 'gauge'" class="property-grid two"><label>最小值<input v-model.number="selectedWidget.content.min" type="number" @change="recordProperty()" /></label><label>最大值<input v-model.number="selectedWidget.content.max" type="number" @change="recordProperty()" /></label></div>
               </template>
               <template v-if="selectedWidget.type === 'marquee'">
                 <label>滚动周期（秒）<input v-model.number="selectedWidget.content.speed" type="number" min="5" max="180" @change="recordProperty()" /></label>
@@ -1316,20 +1433,27 @@ onBeforeUnmount(() => {
                 <div class="binding-summary" v-if="selectedWidget.data.pointId"><span>路径</span><code>{{ selectedWidget.data.path }}</code><span>实时值</span><strong>{{ pointValues[selectedWidget.data.pointId]?.value ?? '--' }} {{ selectedWidget.data.unit }}</strong></div>
               </template>
               <template v-else-if="selectedWidget.data.mode === 'database'">
-                <label>数据库连接<select v-model="selectedWidget.data.connectionId" @change="changeDatabaseConnection"><option value="">请选择连接</option><option v-for="source in dataSources" :key="source.id" :value="source.id">{{ source.name }} · {{ source.type }}</option></select></label>
-                <label>数据表<select :value="databaseTableKey()" :disabled="!selectedWidget.data.connectionId || databaseMetadataLoading" @change="changeDatabaseTable($event.target.value)"><option value="">{{ databaseMetadataLoading ? '正在读取...' : '请选择表' }}</option><option v-for="table in databaseTables" :key="`${table.schema}.${table.name}`" :value="`${table.schema || ''}\u0001${table.name}`">{{ table.schema ? `${table.schema}.` : '' }}{{ table.name }}</option></select></label>
-                <label v-if="selectedWidget.data.valueMode !== 'count'">显示字段<select v-model="selectedWidget.data.field" :disabled="!selectedWidget.data.table" @change="recordProperty('选择数据库字段'); previewDatabaseBinding()"><option value="">请选择字段</option><option v-for="column in databaseColumns" :key="column.name" :value="column.name">{{ column.name }} · {{ column.dataType }}</option></select></label>
-                <label>读取方式<select v-model="selectedWidget.data.valueMode" @change="recordProperty('修改数据库读取方式'); previewDatabaseBinding()"><option value="latest">最新一条</option><option value="first">第一条</option><option value="list">列表 / 趋势序列</option><option value="count">记录数量</option><option value="sum">合计</option><option value="avg">平均值</option><option value="min">最小值</option><option value="max">最大值</option></select></label>
-                <template v-if="['latest','first','list'].includes(selectedWidget.data.valueMode)">
-                  <label>排序 / 时间字段<select v-model="selectedWidget.data.orderBy" @change="selectedWidget.data.timeField = selectedWidget.data.orderBy; recordProperty('修改数据库排序'); previewDatabaseBinding()"><option value="">不指定</option><option v-for="column in databaseColumns" :key="`order-${column.name}`" :value="column.name">{{ column.name }}</option></select></label>
-                  <label>排序方向<select v-model="selectedWidget.data.orderDirection" @change="recordProperty('修改数据库排序'); previewDatabaseBinding()"><option value="desc">降序（新到旧）</option><option value="asc">升序（旧到新）</option></select></label>
-                </template>
-                <div class="property-grid two">
-                  <label v-if="selectedWidget.data.valueMode === 'list'">读取行数<input v-model.number="selectedWidget.data.rowLimit" type="number" min="1" max="500" @change="recordProperty('修改读取行数'); previewDatabaseBinding()" /></label>
-                  <label>刷新周期（秒）<input :value="Math.round(selectedWidget.data.refreshMs / 1000)" type="number" min="1" max="3600" @change="selectedWidget.data.refreshMs = Math.max(1000, Number($event.target.value || 5) * 1000); recordProperty('修改刷新周期')" /></label>
-                </div>
+                <div class="section-action-heading"><div><strong>数据项</strong><small>每项可来自不同数据库和表，别名用于下方公式</small></div><button type="button" @click="addDatabaseDataset">＋ 数据项</button></div>
+                <details v-for="(dataset, datasetIndex) in ensureDatabaseDatasets(selectedWidget)" :key="`${selectedWidget.id}-${datasetIndex}`" class="dataset-card" :open="datasetIndex === 0">
+                  <summary><i :style="{background:dataset.color}"></i><strong>{{ dataset.alias.toUpperCase() }} · {{ dataset.label }}</strong><span>{{ dataset.table || '未选择表' }}</span></summary>
+                  <div class="dataset-card-body">
+                    <div class="property-grid two"><label>公式别名<input v-model="dataset.alias" placeholder="a" @change="dataset.alias = dataset.alias.replace(/[^a-zA-Z0-9_]/g,'_').toLowerCase(); recordProperty('修改数据别名')" /></label><label>图例名称<input v-model="dataset.label" @change="recordProperty('修改数据名称')" /></label></div>
+                    <ColorField v-model="dataset.color" label="数据项颜色" :presets="textColorPresets" @commit="recordProperty('修改数据颜色')" />
+                    <label>数据库连接<select v-model="dataset.connectionId" @change="changeDatasetConnection(dataset, datasetIndex)"><option value="">请选择连接</option><option v-for="source in dataSources" :key="source.id" :value="source.id">{{ source.name }} · {{ source.type }}</option></select></label>
+                    <label>数据表<select :value="datasetTableKey(dataset)" :disabled="!dataset.connectionId || databaseMetadataLoading" @change="changeDatasetTable(dataset, datasetIndex, $event.target.value)"><option value="">{{ databaseMetadataLoading ? '正在读取...' : '请选择表' }}</option><option v-for="table in datasetTables(datasetIndex)" :key="`${table.schema}.${table.name}`" :value="`${table.schema || ''}\u0001${table.name}`">{{ table.schema ? `${table.schema}.` : '' }}{{ table.name }}</option></select></label>
+                    <label v-if="dataset.valueMode !== 'count'">数值字段<select v-model="dataset.field" :disabled="!dataset.table" @change="recordProperty('选择数据字段'); previewDatabaseBinding()"><option value="">请选择字段</option><option v-for="column in datasetColumns(datasetIndex)" :key="column.name" :value="column.name">{{ column.name }} · {{ column.dataType }}</option></select></label>
+                    <label>读取方式<select v-model="dataset.valueMode" @change="recordProperty('修改读取方式'); previewDatabaseBinding()"><option value="latest">最新一条</option><option value="first">第一条</option><option value="list">序列（图表 / 列表）</option><option value="count">记录数量</option><option value="sum">合计</option><option value="avg">平均值</option><option value="min">最小值</option><option value="max">最大值</option></select></label>
+                    <template v-if="['latest','first','list'].includes(dataset.valueMode)"><label>时间 / 排序字段<select v-model="dataset.orderBy" @change="dataset.timeField=dataset.orderBy; recordProperty('修改排序')"><option value="">不指定</option><option v-for="column in datasetColumns(datasetIndex)" :key="`order-${column.name}`" :value="column.name">{{ column.name }}</option></select></label><label>排序方向<select v-model="dataset.orderDirection" @change="recordProperty('修改排序')"><option value="desc">新到旧</option><option value="asc">旧到新</option></select></label></template>
+                    <div class="property-grid two"><label v-if="dataset.valueMode === 'list'">读取行数<input v-model.number="dataset.rowLimit" type="number" min="1" max="500" @change="recordProperty('修改读取行数')" /></label><label>刷新周期（秒）<input :value="Math.round(dataset.refreshMs/1000)" type="number" min="1" max="3600" @change="dataset.refreshMs=Math.max(1000,Number($event.target.value||5)*1000);recordProperty('修改刷新周期')" /></label></div>
+                    <div class="dataset-context"><label>按当前对象过滤<select v-model="dataset.contextKey" @change="recordProperty('修改上下文过滤')"><option value="">不过滤</option><option value="deviceId">当前设备 ID</option><option value="lineId">当前产线 ID</option><option value="workshopId">当前车间 ID</option><option value="viewId">当前视角 ID</option></select></label><label v-if="dataset.contextKey">表中对应字段<select v-model="dataset.contextField" @change="recordProperty('修改上下文字段')"><option value="">请选择</option><option v-for="column in datasetColumns(datasetIndex)" :key="`context-${column.name}`" :value="column.name">{{ column.name }}</option></select></label></div>
+                    <button v-if="ensureDatabaseDatasets(selectedWidget).length > 1" type="button" class="danger-link" @click="removeDatabaseDataset(datasetIndex)">删除这个数据项</button>
+                  </div>
+                </details>
+                <label>计算公式（可选）<input v-model="selectedWidget.data.formula" placeholder="例如：(a / b) * 100" @change="recordProperty('修改计算公式'); previewDatabaseBinding()" /><small class="field-hint">仅支持别名、数字、+ − × ÷ 和括号，不执行 SQL 或脚本。</small></label>
+                <div v-if="selectedWidget.data.formula" class="property-grid two"><label>计算结果名称<input v-model="selectedWidget.data.formulaLabel" @change="recordProperty()" /></label><ColorField v-model="selectedWidget.data.formulaColor" label="计算结果颜色" :presets="textColorPresets" @commit="recordProperty('修改计算颜色')" /></div>
+                <label>设备详情适用范围<select v-model="selectedWidget.data.deviceId" @change="bindDatabaseToDevice"><option value="">所有设备通用</option><option v-for="device in devices" :key="`db-${device.id}`" :value="String(device.id)">仅 {{ device.name }}（{{ device.id }}）</option></select><small class="field-hint">不同设备参数来自不同表时，复制组件后分别选择设备和表即可。</small></label>
                 <button type="button" class="inspector-preview-button" :disabled="databaseMetadataLoading" @click="previewDatabaseBinding()">刷新数据预览</button>
-                <div v-if="databasePreviewValues[selectedWidget.id]" class="binding-summary"><span>连接</span><code>{{ selectedDataSource?.name || selectedWidget.data.connectionId }}</code><span>预览值</span><strong>{{ databasePreviewValues[selectedWidget.id]?.value ?? '--' }} {{ selectedWidget.data.unit }}</strong><span>状态</span><strong>{{ databasePreviewValues[selectedWidget.id]?.error || '读取正常' }}</strong></div>
+                <div v-if="databasePreviewValues[selectedWidget.id]" class="binding-summary"><span>预览值</span><strong>{{ databasePreviewValues[selectedWidget.id]?.value ?? '--' }} {{ selectedWidget.data.unit }}</strong><span>数据项</span><code>{{ databasePreviewValues[selectedWidget.id]?.series?.map(item => `${item.label}: ${item.value ?? '--'}`).join(' · ') || '--' }}</code><span>状态</span><strong>{{ databasePreviewValues[selectedWidget.id]?.error || '读取正常' }}</strong></div>
               </template>
               <div class="property-grid two">
                 <label>单位<input v-model="selectedWidget.data.unit" @change="recordProperty('修改单位')" /></label>
@@ -1415,7 +1539,6 @@ onBeforeUnmount(() => {
               <div class="property-grid two"><label>水平角（°）<input v-model.number="currentView.camera.yaw" type="number" min="-360" max="360" step="1" @change="commitHistory('修改视角水平角')" /></label><label>俯仰角（°）<input v-model.number="currentView.camera.pitch" type="number" min="-89" max="89" step="1" @change="commitHistory('修改视角俯仰角')" /></label><label>距离比例<input v-model.number="currentView.camera.distanceScale" type="number" min=".1" max="10" step=".01" @change="commitHistory('修改视角距离')" /></label><label>过渡时间（秒）<input v-model.number="currentView.camera.transitionSeconds" type="number" min="0" max="10" step=".1" @change="commitHistory('修改视角过渡')" /></label></div>
               <div class="property-grid two"><label>目标偏移 X<input v-model.number="currentView.camera.targetOffset[0]" type="number" step=".1" @change="commitHistory('修改视角目标')" /></label><label>目标偏移 Y<input v-model.number="currentView.camera.targetOffset[1]" type="number" step=".1" @change="commitHistory('修改视角目标')" /></label><label>目标偏移 Z<input v-model.number="currentView.camera.targetOffset[2]" type="number" step=".1" @change="commitHistory('修改视角目标')" /></label></div>
               <label class="visibility-bound-device"><input v-model="currentView.camera.relativeToTarget" type="checkbox" @change="commitHistory('修改相机朝向参考')" /> 设备视角跟随设备朝向（适合不同设备旋转角度）</label>
-              <div class="view-inspector-actions"><button type="button" @click="selectView(currentView.id, { enterPreview: true })">在设计器预览</button><button type="button" @click="sendCurrentViewToUnity">发送到 Unity</button></div>
               <button type="button" class="view-delete-button" @click="removeView" :disabled="views.length <= 1">删除当前视角</button>
             </section>
             <section v-else-if="viewInspectorTab === 'components'" class="inspector-section">
@@ -1452,19 +1575,6 @@ onBeforeUnmount(() => {
     </footer>
 
     <Transition name="designer-dialog">
-      <div v-if="publishDialogOpen" class="designer-dialog-backdrop" @click.self="publishDialogOpen = false">
-        <form class="designer-dialog" @submit.prevent="publishVersion">
-          <div class="dialog-icon publish">↑</div>
-          <h3>发布大屏版本</h3>
-          <p>发布后 Unity 和透明数据层只读取这一份快照。</p>
-          <label>版本号（留空自动递增）<input v-model="publishForm.version" placeholder="例如 1.2.0" /></label>
-          <label>发布说明<textarea v-model="publishForm.notes" rows="3" placeholder="本次调整内容"></textarea></label>
-          <div><button type="button" @click="publishDialogOpen = false">取消</button><button class="primary" :disabled="publishing">{{ publishing ? '发布中...' : '确认发布' }}</button></div>
-        </form>
-      </div>
-    </Transition>
-
-    <Transition name="designer-dialog">
       <div v-if="releaseDialog" class="designer-dialog-backdrop" @click.self="releaseDialog = null">
         <div class="designer-dialog compact">
           <div class="dialog-icon restore">↶</div>
@@ -1487,6 +1597,7 @@ onBeforeUnmount(() => {
 .designer-toolbar button,.designer-toolbar select { height:32px; padding:0 10px; border:1px solid rgba(126,178,219,.18); border-radius:8px; color:#cfe2f1; background:rgba(12,28,43,.72); font-size:12px; cursor:pointer; transition:.15s ease; }
 .designer-toolbar button:hover:not(:disabled),.designer-toolbar button.active { color:#fff; border-color:rgba(84,188,255,.46); background:rgba(43,123,181,.28); }.designer-toolbar button:disabled{opacity:.34;cursor:not-allowed}.designer-toolbar .zoom-label{min-width:58px}.toolbar-divider{width:1px;height:20px;margin:0 3px;background:var(--line)}
 .canvas-tools { margin-left:auto; }.designer-toolbar-actions{margin-left:2px}.designer-toolbar .save-button{border-color:rgba(73,187,145,.28);color:#8ce6bf}.designer-toolbar .publish-button{border-color:rgba(66,165,245,.48);color:#fff;background:linear-gradient(135deg,#237abe,#155b91)}
+.toolbar-status{display:block;max-width:230px;overflow:hidden;padding:6px 9px;border:1px solid var(--line);border-radius:7px;color:#879bad;background:rgba(255,255,255,.04);font-size:9px;white-space:nowrap;text-overflow:ellipsis}.toolbar-status.success{color:#45c98f}.toolbar-status.warning{color:#ffc45f}.toolbar-status.danger{color:#ff6864}
 .designer-main { flex:1; min-width:1180px; min-height:0; display:grid; grid-template-columns:236px minmax(680px,1fr) 310px; overflow:hidden; }
 .designer-left-panel,.designer-right-panel { min-height:0; overflow:auto; background:linear-gradient(180deg,#0d1927,#0a1420); scrollbar-color:#29445e transparent; }.designer-left-panel{border-right:1px solid var(--line)}.designer-right-panel{border-left:1px solid var(--line)}
 .designer-panel-heading,.selected-widget-heading { display:flex; align-items:center; justify-content:space-between; gap:10px; min-height:54px; padding:10px 14px; border-bottom:1px solid var(--line); }.designer-panel-heading strong{font-size:13px}.designer-panel-heading small{color:var(--muted);font-size:10px}
@@ -1514,6 +1625,7 @@ onBeforeUnmount(() => {
 .layer-heading{font-size:12px}.layer-list>button{min-height:38px}.layer-list button{color:#515154;background:transparent}.layer-list button:hover{background:#f5f5f7}.layer-list button.active{color:#1d1d1f;background:#ededf0;border-color:#d7d7dc}.layer-type{color:#fff;background:#3a3a3c;font-size:11px}.layer-name{font-size:12px}.layer-list i{color:#6e6e73}.system-widget-list{border-color:#e5e5e7;color:#515154;background:#f8f8fa;font-size:11px}.system-widget-list summary{color:#515154}.system-widget-list small{color:#8e8e93;font-size:10px}
 .designer-canvas{background:#e9e9ec}.designer-canvas-scroll{box-sizing:border-box;width:100%;height:100%;overflow:auto;padding:12px 16px;overscroll-behavior:contain;scrollbar-color:#a9a9af #e1e1e4}.designer-canvas-spacer{position:relative;flex:0 0 auto;margin:0 auto;box-shadow:0 18px 46px rgba(0,0,0,.18)}.designer-canvas-stage{transform-origin:top left;border:1px solid rgba(0,0,0,.36)}
 .selected-widget-heading strong{font-size:14px}.selected-widget-heading button,.layer-actions button,.section-action-heading button{border-color:#d8d8dd;color:#3a3a3c;background:#fff;font-size:11px}.inspector-tabs button{height:34px;color:#8e8e93;font-size:12px}.inspector-tabs button.active{color:#fff;background:#1d1d1f}
+.dataset-card{overflow:hidden;border:1px solid #dedee3;border-radius:10px;background:#f8f8fa}.dataset-card summary{display:grid;grid-template-columns:9px minmax(0,1fr) auto;align-items:center;gap:7px;padding:10px;cursor:pointer;list-style:none}.dataset-card summary::-webkit-details-marker{display:none}.dataset-card summary i{width:8px;height:8px;border-radius:50%}.dataset-card summary strong{overflow:hidden;color:#1d1d1f;font-size:12px;white-space:nowrap;text-overflow:ellipsis}.dataset-card summary span{max-width:100px;overflow:hidden;color:#8e8e93;font-size:10px;white-space:nowrap;text-overflow:ellipsis}.dataset-card-body{display:grid;gap:10px;padding:10px;border-top:1px solid #e2e2e5;background:#fff}.dataset-context{display:grid;gap:8px;padding:9px;border:1px dashed #d8d8dd;border-radius:8px;background:#fafafa}.field-hint{display:block;color:#8e8e93;font-size:10px;line-height:1.45}.toolbar-status{border-color:#dedee3;color:#6e6e73;background:#f8f8fa;font-size:10px}.toolbar-status.success{color:#176b3a;background:#f3faf6}.toolbar-status.warning{color:#936112;background:#fff9ed}.toolbar-status.danger{color:#b42318;background:#fff5f4}
 .inspector-body{background:#fff}.inspector-section label{color:#515154;font-size:12px}.inspector-section input,.inspector-section select,.inspector-section textarea{min-height:36px;border-color:#d8d8dd;color:#1d1d1f;background:#fff;font-size:13px}.inspector-section input:focus,.inspector-section select:focus,.inspector-section textarea:focus{border-color:#86868b;box-shadow:0 0 0 3px rgba(0,0,0,.06)}
 .readonly-banner{border-color:#d8eadf;color:#176b3a;background:#f3faf6;font-size:11px}.readonly-banner span{color:#176b3a;background:#e1f3e8}.binding-summary{border-color:#e2e2e5;background:#f7f7f8;font-size:11px}.binding-summary span{color:#8e8e93}.binding-summary code{color:#1d1d1f}.binding-summary strong{color:#1d1d1f}.condition-card{border-color:#e2e2e5;background:#f8f8fa}.section-action-heading strong{color:#1d1d1f;font-size:12px}.section-action-heading small,.empty-inspector{color:#8e8e93;font-size:10px}.danger-link{color:#b42318!important;font-size:11px}
 .visibility-mode-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.visibility-mode-option{display:flex!important;grid-auto-flow:column;align-items:center;justify-content:center;gap:5px!important;min-height:36px;border:1px solid #dedee3;border-radius:8px;background:#f8f8fa;cursor:pointer}.visibility-mode-option input{width:auto!important;min-height:auto!important;padding:0!important;accent-color:#1d1d1f}.visibility-hint{margin:-3px 0 3px;color:#8e8e93;font-size:11px;line-height:1.5}.visibility-bound-device{display:flex!important;grid-auto-flow:column;align-items:center;justify-content:start;gap:7px!important;padding:9px;border:1px solid #e2e2e5;border-radius:8px;background:#f8f8fa}.visibility-bound-device input{width:auto!important;min-height:auto!important;accent-color:#1d1d1f}.inspector-preview-button{height:36px;border:1px solid #1d1d1f;border-radius:8px;color:#fff;background:#1d1d1f;font-size:12px;cursor:pointer}

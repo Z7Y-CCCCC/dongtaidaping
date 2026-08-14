@@ -69,8 +69,11 @@ function runtimeContextIsRoot() {
 
 function applyRuntimeContext(payload, { userNavigation = false } = {}) {
     if (!payload || typeof payload !== 'object') return
+    const previousDataContext = [runtimeContext.viewId, runtimeContext.workshopId, runtimeContext.lineId, runtimeContext.deviceId].join('|')
     Object.assign(runtimeContext, payload)
     if (!Object.prototype.hasOwnProperty.call(payload, 'sceneReady')) runtimeContext.sceneReady = true
+    const nextDataContext = [runtimeContext.viewId, runtimeContext.workshopId, runtimeContext.lineId, runtimeContext.deviceId].join('|')
+    if (previousDataContext !== nextDataContext) refreshDatabaseValues(true)
 
     if (runtimeContextIsRoot()) {
         childNavigationEntered.value = false
@@ -448,7 +451,13 @@ function handleHostMessage(event) {
 async function refreshDatabaseValues(force = false) {
     if (!force && !configuredWidgets.value.some(widget => widget.data?.mode === 'database')) return
     try {
-        const response = await fetch(`${API_BASE}/data-sources/runtime-values`)
+        const query = new URLSearchParams({
+            view_id: runtimeContext.viewId || '',
+            workshop_id: runtimeContext.workshopId || '',
+            line_id: runtimeContext.lineId || '',
+            device_id: runtimeContext.deviceId || ''
+        })
+        const response = await fetch(`${API_BASE}/data-sources/runtime-values?${query}`)
         if (!response.ok) return
         const payload = await response.json()
         const next = payload.values || {}

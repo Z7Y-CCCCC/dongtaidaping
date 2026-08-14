@@ -1,3 +1,5 @@
+const { evaluateVariableExpression } = require('./mathExpression');
+
 const SCHEMA_VERSION = 3;
 const SUPPORTED_SCHEMA_VERSIONS = new Set([1, 2, 3]);
 const DEFAULT_CANVAS = Object.freeze({
@@ -128,6 +130,32 @@ function normalizeFrame(source, canvas, legacyWidget = null) {
     };
 }
 
+function normalizeDatabaseDataset(source = {}, fallback = {}, index = 0) {
+    const data = objectValue(source, {});
+    const base = objectValue(fallback, {});
+    const aliasFallback = String.fromCharCode(97 + Math.min(index, 25));
+    const alias = shortText(data.alias, aliasFallback, 32).replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase() || aliasFallback;
+    return {
+        alias,
+        label: shortText(data.label, `数据项 ${alias.toUpperCase()}`, 100),
+        color: shortText(data.color, ['#55c7ff', '#45df9b', '#ffc45f', '#ff6b78'][index % 4], 64),
+        connectionId: shortText(data.connectionId ?? data.connection_id ?? base.connectionId ?? base.connection_id, '', 80),
+        schema: shortText(data.schema ?? base.schema, '', 255),
+        table: shortText(data.table ?? base.table, '', 255),
+        field: shortText(data.field ?? base.field, '', 255),
+        timeField: shortText(data.timeField ?? base.timeField, '', 255),
+        orderBy: shortText(data.orderBy ?? data.timeField ?? base.orderBy ?? base.timeField, '', 255),
+        orderDirection: String(data.orderDirection ?? base.orderDirection ?? 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc',
+        valueMode: ['latest', 'first', 'list', 'count', 'sum', 'avg', 'min', 'max'].includes(data.valueMode ?? base.valueMode)
+            ? (data.valueMode ?? base.valueMode)
+            : 'latest',
+        rowLimit: integer(data.rowLimit ?? base.rowLimit, 50, 1, 500),
+        refreshMs: integer(data.refreshMs ?? base.refreshMs, 5000, 1000, 3600000),
+        contextField: shortText(data.contextField, '', 255),
+        contextKey: ['deviceId', 'lineId', 'workshopId', 'viewId'].includes(data.contextKey) ? data.contextKey : ''
+    };
+}
+
 function normalizeDataBinding(source, legacyBinding = {}) {
     const data = objectValue(source, {});
     const binding = objectValue(legacyBinding, {});
@@ -139,6 +167,9 @@ function normalizeDataBinding(source, legacyBinding = {}) {
             ? 'plc'
             : 'static';
     }
+    const legacyDataset = normalizeDatabaseDataset(data, binding, 0);
+    const rawDatasets = Array.isArray(data.datasets) && data.datasets.length ? data.datasets : [legacyDataset];
+    const datasets = rawDatasets.slice(0, 12).map((item, index) => normalizeDatabaseDataset(item, legacyDataset, index));
     return {
         ...binding,
         ...data,
@@ -159,6 +190,10 @@ function normalizeDataBinding(source, legacyBinding = {}) {
             : 'latest',
         rowLimit: integer(data.rowLimit ?? binding.rowLimit, 50, 1, 500),
         refreshMs: integer(data.refreshMs ?? binding.refreshMs, 5000, 1000, 3600000),
+        datasets,
+        formula: shortText(data.formula, '', 256),
+        formulaLabel: shortText(data.formulaLabel, '计算结果', 100),
+        formulaColor: shortText(data.formulaColor, '#45df9b', 64),
         unit: shortText(data.unit ?? binding.unit, '', 32),
         decimals: integer(data.decimals ?? binding.decimals, 1, 0, 8),
         readOnly: true
@@ -307,6 +342,43 @@ function normalizeWidget(source, canvas, index = 0) {
     };
 }
 
+function viewComponentTargetExists(target, widgets) {
+    const id = shortText(target, '', 128);
+    if (!id) return false;
+    if (id.startsWith('system:') || SYSTEM_VIEW_COMPONENT_IDS.has(id)) return true;
+    if (id.startsWith('group:')) {
+        const groupId = id.slice('group:'.length);
+        return widgets.some(widget => widget.groupId === groupId);
+    }
+    return widgets.some(widget => widget.id === id);
+}
+
+function pruneDocumentReferences(widgets, sceneViews) {
+    const widgetIds = new Set(widgets.map(widget => widget.id));
+    const groupIds = new Set(widgets.map(widget => widget.groupId).filter(Boolean));
+    const cleanedWidgets = widgets.map(widget => ({
+        ...widget,
+        events: (widget.events || []).filter(event => {
+            if (!['set_visibility', 'toggle_visibility'].includes(event?.action)) return true;
+            if (event.targetType === 'widget') return widgetIds.has(event.targetId);
+            if (event.targetType === 'group') return groupIds.has(event.targetId);
+            return false;
+        })
+    }));
+    const cleanedViews = sceneViews.views.map(view => ({
+        ...view,
+        componentState: {
+            ...view.componentState,
+            show: (view.componentState?.show || []).filter(target => viewComponentTargetExists(target, cleanedWidgets)),
+            hide: (view.componentState?.hide || []).filter(target => viewComponentTargetExists(target, cleanedWidgets))
+        }
+    }));
+    return {
+        widgets: cleanedWidgets,
+        sceneViews: { ...sceneViews, views: cleanedViews }
+    };
+}
+
 function createEmptyDocument(context = {}) {
     const project = objectValue(context.project, {});
     const scene = objectValue(context.scene, {});
@@ -350,7 +422,9 @@ function normalizeDocument(input, context = {}) {
         : (Array.isArray(context.widgets) ? context.widgets : []);
     const sceneSource = objectValue(source.scene, base.scene);
     const canvas = normalizeCanvas(source.canvas, sceneSource.layout || base.scene.layout);
-    const sceneViews = normalizeDashboardViews(sceneSource);
+    const normalizedWidgets = widgets.slice(0, 500).map((widget, index) => normalizeWidget(widget, canvas, index));
+    const normalizedReferences = pruneDocumentReferences(normalizedWidgets, normalizeDashboardViews(sceneSource));
+    const sceneViews = normalizedReferences.sceneViews;
     return {
         ...base,
         ...source,
@@ -371,7 +445,7 @@ function normalizeDocument(input, context = {}) {
             theme: objectValue(sceneSource.theme, base.scene.theme),
             ...sceneViews
         },
-        widgets: widgets.slice(0, 500).map((widget, index) => normalizeWidget(widget, canvas, index)),
+        widgets: normalizedReferences.widgets,
         metadata: {
             ...objectValue(source.metadata, {}),
             updatedAt: new Date().toISOString(),
@@ -441,9 +515,28 @@ function validateDocument(document, options = {}) {
         if (widget?.data?.mode === 'plc' && (!widget.data.deviceId || !widget.data.pointId)) {
             errors.push(`${label} 的 PLC 绑定必须同时选择设备和只读点位`);
         }
-        if (widget?.data?.mode === 'database'
-            && (!widget.data.connectionId || !widget.data.table || (widget.data.valueMode !== 'count' && !widget.data.field))) {
-            errors.push(`${label} 的数据库绑定必须选择连接、表和字段`);
+        if (widget?.data?.mode === 'database') {
+            const datasets = Array.isArray(widget.data.datasets) && widget.data.datasets.length
+                ? widget.data.datasets
+                : [widget.data];
+            const aliases = new Set();
+            datasets.forEach((dataset, datasetIndex) => {
+                const datasetLabel = `${label}的第 ${datasetIndex + 1} 个数据项`;
+                if (!dataset.connectionId || !dataset.table || (dataset.valueMode !== 'count' && !dataset.field)) {
+                    errors.push(`${datasetLabel}必须选择连接、表和字段`);
+                }
+                if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(dataset.alias || '')) errors.push(`${datasetLabel}的公式别名不合法`);
+                if (aliases.has(dataset.alias)) errors.push(`${label}的数据项别名重复：${dataset.alias}`);
+                aliases.add(dataset.alias);
+                if (dataset.contextKey && !dataset.contextField) errors.push(`${datasetLabel}启用了上下文过滤，但未选择表字段`);
+            });
+            if (widget.data.formula) {
+                try {
+                    evaluateVariableExpression(widget.data.formula, Object.fromEntries([...aliases].map(alias => [alias, 1])), '数据 ');
+                } catch (error) {
+                    errors.push(`${label}的${error.message}`);
+                }
+            }
         }
         for (const viewId of widget?.visibility?.viewIds || []) {
             if (viewIds.size && !viewIds.has(viewId)) errors.push(`${label} 指定的视角不存在：${viewId}`);

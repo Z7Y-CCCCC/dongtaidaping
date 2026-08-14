@@ -10,6 +10,10 @@ export const DEFAULT_DASHBOARD_CANVAS = Object.freeze({
 })
 
 export const SYSTEM_WIDGET_TYPES = new Set(['navigation', 'device_label', 'diagnostics', 'line_overview_cards'])
+const SYSTEM_VIEW_COMPONENT_IDS = new Set([
+  'widget_navigation', 'widget_device_label', 'widget_diagnostics', 'widget_line_overview_cards',
+  'navigation', 'device_label', 'diagnostics', 'line_overview_cards'
+])
 
 export const SYSTEM_WIDGET_LIBRARY = [
   { type: 'navigation', label: '场景导航与返回', icon: '←', description: 'Unity 原生返回、视角层级和场景导航', preview: 'navigation' },
@@ -88,7 +92,7 @@ export const DASHBOARD_WIDGET_LIBRARY = [
   { type: 'image', label: '图片', icon: '▧', group: '基础', description: '现场图片、Logo 和图标' },
   { type: 'container', label: '容器', icon: '□', group: '布局', description: '透明卡片和区域分组' },
   { type: 'metrics', label: '指标组', icon: '▦', group: '数据', description: '多指标与环形图' },
-  { type: 'trend', label: '趋势图', icon: '⌁', group: '数据', description: '实时/历史数据曲线' },
+  { type: 'trend', label: '通用图表', icon: '⌁', group: '数据', description: '折线、面积、柱状、饼图、环图和仪表盘' },
   { type: 'alarm_list', label: '报警表', icon: '!', group: '数据', description: '只读报警与事件履历' },
   { type: 'device_list', label: '设备列表', icon: '☷', group: '数据', description: '设备在线、运行和报警状态' },
   { type: 'marquee', label: '滚动消息', icon: '↔', group: '数据', description: '实时日志和报警滚动条' }
@@ -116,7 +120,13 @@ const TYPE_DEFAULTS = {
   trend: {
     size: [520, 300],
     title: '实时趋势',
-    content: { seriesName: '实时值', lineColor: '#55c7ff', areaColor: 'rgba(85,199,255,.18)', historyLength: 60 },
+    content: {
+      seriesName: '实时值', chartType: 'line', chartPalette: 'industrial',
+      lineColor: '#55c7ff', areaColor: 'rgba(85,199,255,.18)', historyLength: 60,
+      showLegend: true, legendPosition: 'top', showAxis: true, showDataLabel: false,
+      smooth: true, showSymbol: false, lineWidth: 2, areaOpacity: .2,
+      barRadius: 4, donutRatio: 48
+    },
     style: { background: 'rgba(10, 24, 38, .82)', color: '#eef7ff', borderColor: 'rgba(89, 178, 238, .28)', borderRadius: 14 }
   },
   alarm_list: {
@@ -174,6 +184,30 @@ function stringArray(value) {
   return Array.isArray(value) ? value.map(item => String(item || '').trim()).filter(Boolean) : []
 }
 
+function normalizeDatabaseDataset(source = {}, fallback = {}, index = 0) {
+  const data = objectValue(source, {})
+  const base = objectValue(fallback, {})
+  const aliasFallback = String.fromCharCode(97 + Math.min(index, 25))
+  const alias = String(data.alias || aliasFallback).replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase().slice(0, 32) || aliasFallback
+  return {
+    alias,
+    label: String(data.label || `数据项 ${alias.toUpperCase()}`).slice(0, 100),
+    color: String(data.color || ['#55c7ff', '#45df9b', '#ffc45f', '#ff6b78'][index % 4]).slice(0, 64),
+    connectionId: String(data.connectionId || data.connection_id || base.connectionId || base.connection_id || ''),
+    schema: String(data.schema || base.schema || ''),
+    table: String(data.table || base.table || ''),
+    field: String(data.field || base.field || ''),
+    timeField: String(data.timeField || base.timeField || ''),
+    orderBy: String(data.orderBy || data.timeField || base.orderBy || base.timeField || ''),
+    orderDirection: String(data.orderDirection || base.orderDirection || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc',
+    valueMode: ['latest', 'first', 'list', 'count', 'sum', 'avg', 'min', 'max'].includes(data.valueMode || base.valueMode) ? (data.valueMode || base.valueMode) : 'latest',
+    rowLimit: Math.round(numberValue(data.rowLimit ?? base.rowLimit, 50, 1, 500)),
+    refreshMs: Math.round(numberValue(data.refreshMs ?? base.refreshMs, 5000, 1000, 3600000)),
+    contextField: String(data.contextField || ''),
+    contextKey: ['deviceId', 'lineId', 'workshopId', 'viewId'].includes(data.contextKey) ? data.contextKey : ''
+  }
+}
+
 function normalizeVisibility(source = {}) {
   const visibility = objectValue(source, {})
   const allowedModes = new Set(['factory', 'workshop', 'line', 'device', 'custom'])
@@ -202,6 +236,10 @@ export function normalizeDashboardWidget(source = {}, canvas = DEFAULT_DASHBOARD
   const resolvedDataMode = normalizedMode === 'static'
     ? (data.connectionId || data.connection_id ? 'database' : (data.pointId || data.point_id ? 'plc' : 'static'))
     : normalizedMode
+  const legacyDataset = normalizeDatabaseDataset(data, data, 0)
+  const datasets = (Array.isArray(data.datasets) && data.datasets.length ? data.datasets : [legacyDataset])
+    .slice(0, 12)
+    .map((item, datasetIndex) => normalizeDatabaseDataset(item, legacyDataset, datasetIndex))
   return {
     id: String(source.id || `widget_${type}_${index + 1}`).replace(/[^a-zA-Z0-9_-]/g, '_'),
     type,
@@ -237,6 +275,10 @@ export function normalizeDashboardWidget(source = {}, canvas = DEFAULT_DASHBOARD
       valueMode: ['latest', 'first', 'list', 'count', 'sum', 'avg', 'min', 'max'].includes(data.valueMode) ? data.valueMode : 'latest',
       rowLimit: Math.round(numberValue(data.rowLimit, 50, 1, 500)),
       refreshMs: Math.round(numberValue(data.refreshMs, 5000, 1000, 3600000)),
+      datasets,
+      formula: String(data.formula || '').slice(0, 256),
+      formulaLabel: String(data.formulaLabel || '计算结果').slice(0, 100),
+      formulaColor: String(data.formulaColor || '#45df9b').slice(0, 64),
       unit: String(data.unit || ''),
       decimals: Math.round(numberValue(data.decimals, 1, 0, 8)),
       readOnly: true
@@ -259,7 +301,33 @@ export function normalizeDashboardDocument(source = {}) {
   canvas.gridSize = Math.round(numberValue(canvas.gridSize, 10, 1, 200))
   canvas.safeArea = Math.round(numberValue(canvas.safeArea, 24, 0, 400))
   const rawScene = objectValue(source.scene, {})
+  const widgets = (source.widgets || []).map((widget, index) => normalizeDashboardWidget(widget, canvas, index))
+  const widgetIds = new Set(widgets.map(widget => widget.id))
+  const groupIds = new Set(widgets.map(widget => widget.groupId).filter(Boolean))
+  const targetExists = target => {
+    const id = String(target || '')
+    if (!id) return false
+    if (id.startsWith('system:') || SYSTEM_VIEW_COMPONENT_IDS.has(id)) return true
+    if (id.startsWith('group:')) return groupIds.has(id.slice('group:'.length))
+    return widgetIds.has(id)
+  }
+  widgets.forEach(widget => {
+    widget.events = (widget.events || []).filter(event => {
+      if (!['set_visibility', 'toggle_visibility'].includes(event?.action)) return true
+      if (event.targetType === 'widget') return widgetIds.has(event.targetId)
+      if (event.targetType === 'group') return groupIds.has(event.targetId)
+      return false
+    })
+  })
   const normalizedViews = normalizeDashboardViews(rawScene)
+  normalizedViews.views = normalizedViews.views.map(view => ({
+    ...view,
+    componentState: {
+      ...view.componentState,
+      show: (view.componentState?.show || []).filter(targetExists),
+      hide: (view.componentState?.hide || []).filter(targetExists)
+    }
+  }))
   return {
     schemaVersion: DASHBOARD_SCHEMA_VERSION,
     projectId: String(source.projectId || 'project_default'),
@@ -276,7 +344,7 @@ export function normalizeDashboardDocument(source = {}) {
       ...deepClone(rawScene),
       ...normalizedViews
     },
-    widgets: (source.widgets || []).map((widget, index) => normalizeDashboardWidget(widget, canvas, index)),
+    widgets,
     metadata: deepClone(source.metadata || {})
   }
 }

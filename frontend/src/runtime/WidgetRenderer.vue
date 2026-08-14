@@ -195,6 +195,26 @@ const trendRows = computed(() => {
   return props.trendPoints
 })
 
+const chartSeries = computed(() => {
+  const recordSeries = databaseRecord.value?.series
+  if (dataBinding.value.mode === 'database' && Array.isArray(recordSeries) && recordSeries.length) {
+    return recordSeries.map((series, index) => ({
+      id: series.id || `series_${index + 1}`,
+      name: series.label || series.id || `数据项 ${index + 1}`,
+      color: series.color || ['#55c7ff', '#45df9b', '#ffc45f', '#ff6b78'][index % 4],
+      value: series.value,
+      rows: Array.isArray(series.rows) ? series.rows : []
+    }))
+  }
+  return [{
+    id: 'value',
+    name: content.value.seriesName || widgetTitle.value || '趋势',
+    color: content.value.lineColor || '#55c7ff',
+    value: boundValue.value,
+    rows: trendRows.value
+  }]
+})
+
 const textLines = computed(() => {
   const rawText = Array.isArray(content.value.lines) ? content.value.lines.join('\n') : (content.value.text || content.value.label || '')
   const fallback = rawText || widgetTitle.value || '文本组件'
@@ -232,19 +252,64 @@ function renderChart() {
   if (type.value === 'trend') {
     const timeField = content.value.timeField || 'time'
     const valueField = content.value.valueField || 'value'
-    const lineColor = content.value.lineColor || '#55c7ff'
-    chart.setOption({
+    const chartType = content.value.chartType || 'line'
+    const sourceSeries = chartSeries.value
+    const legendPosition = content.value.legendPosition || 'top'
+    const legend = {
+      show: content.value.showLegend !== false && sourceSeries.length > 1,
+      orient: legendPosition === 'right' ? 'vertical' : 'horizontal',
+      top: legendPosition === 'bottom' ? undefined : (legendPosition === 'right' ? 'middle' : 0),
+      bottom: legendPosition === 'bottom' ? 0 : undefined,
+      right: legendPosition === 'right' ? 0 : undefined,
+      textStyle: { color: '#9fb5c6', fontSize: 10 }
+    }
+    const common = {
       animation: !props.preview,
-      tooltip: { trigger: 'axis', backgroundColor: 'rgba(8,20,32,.94)', borderColor: 'rgba(86,181,238,.3)', textStyle: { color: '#fff' } },
-      grid: { left: 45, right: 18, bottom: 28, top: 24 },
-      xAxis: { type: 'category', boundaryGap: false, data: trendRows.value.map(point => point[timeField]), axisLine: { lineStyle: { color: 'rgba(180,215,238,.18)' } }, axisLabel: { color: '#8fa6b8' } },
-      yAxis: { type: 'value', axisLabel: { color: '#8fa6b8' }, splitLine: { lineStyle: { color: 'rgba(180,215,238,.08)' } } },
-      series: [{
-        name: content.value.seriesName || widgetTitle.value || '趋势', type: 'line', smooth: true, showSymbol: false,
-        lineStyle: { color: lineColor, width: 2 },
-        areaStyle: { color: content.value.areaColor || 'rgba(85,199,255,.16)' },
-        data: trendRows.value.map(point => point[valueField])
-      }]
+      color: sourceSeries.map(series => series.color),
+      tooltip: { trigger: ['pie', 'donut', 'gauge'].includes(chartType) ? 'item' : 'axis', backgroundColor: 'rgba(8,20,32,.94)', borderColor: 'rgba(86,181,238,.3)', textStyle: { color: '#fff' } },
+      legend
+    }
+    if (chartType === 'pie' || chartType === 'donut') {
+      chart.setOption({ ...common, series: [{
+        type: 'pie', radius: chartType === 'donut' ? [`${Number(content.value.donutRatio ?? 48)}%`, '76%'] : ['0%', '76%'], center: ['50%', '55%'],
+        label: { show: content.value.showDataLabel !== false, color: '#dcebf6', formatter: '{b}\n{c}' },
+        itemStyle: { borderColor: 'rgba(8,20,32,.8)', borderWidth: 2 },
+        data: sourceSeries.map(series => ({ name: series.name, value: Number(series.value) || 0, itemStyle: { color: series.color } }))
+      }] }, true)
+      return
+    }
+    if (chartType === 'gauge') {
+      const minimum = Number(content.value.min ?? 0)
+      const maximum = Number(content.value.max ?? 100)
+      chart.setOption({ ...common, series: [{
+        type: 'gauge', min: minimum, max: maximum, radius: '88%', center: ['50%', '58%'],
+        progress: { show: true, width: 13 }, axisLine: { lineStyle: { width: 13 } }, axisTick: { show: false }, splitLine: { length: 8 },
+        axisLabel: { color: '#829bae', distance: 18, fontSize: 9 }, pointer: { width: 4 },
+        detail: { color: '#eef7ff', fontSize: 18, offsetCenter: [0, '64%'], formatter: `{value}${dataBinding.value.unit || ''}` },
+        data: [{ value: Number(boundValue.value) || 0, name: content.value.seriesName || widgetTitle.value }]
+      }] }, true)
+      return
+    }
+    const rowsForAxis = sourceSeries.find(series => series.rows.length)?.rows || []
+    const isBar = ['bar', 'stackedBar'].includes(chartType)
+    chart.setOption({
+      ...common,
+      grid: { left: content.value.showAxis === false ? 12 : 45, right: legendPosition === 'right' && legend.show ? 90 : 18, bottom: legendPosition === 'bottom' && legend.show ? 34 : 28, top: legendPosition === 'top' && legend.show ? 30 : 18 },
+      xAxis: { show: content.value.showAxis !== false, type: 'category', boundaryGap: isBar, data: rowsForAxis.map(point => point[timeField]), axisLine: { lineStyle: { color: 'rgba(180,215,238,.18)' } }, axisLabel: { color: '#8fa6b8' } },
+      yAxis: { show: content.value.showAxis !== false, type: 'value', axisLabel: { color: '#8fa6b8' }, splitLine: { lineStyle: { color: 'rgba(180,215,238,.08)' } } },
+      series: sourceSeries.map(series => ({
+        name: series.name,
+        type: isBar ? 'bar' : (chartType === 'scatter' ? 'scatter' : 'line'),
+        stack: chartType === 'stackedBar' ? 'total' : undefined,
+        smooth: !isBar && chartType !== 'scatter' && content.value.smooth !== false,
+        showSymbol: chartType === 'scatter' || content.value.showSymbol === true,
+        symbolSize: chartType === 'scatter' ? 8 : 5,
+        lineStyle: { color: series.color, width: Number(content.value.lineWidth || 2) },
+        itemStyle: { color: series.color, borderRadius: isBar ? Number(content.value.barRadius ?? 4) : 0 },
+        label: { show: content.value.showDataLabel === true, color: '#dcebf6', position: isBar ? 'top' : 'top' },
+        areaStyle: chartType === 'area' ? { color: series.color, opacity: Number(content.value.areaOpacity ?? .2) } : undefined,
+        data: series.rows.map(point => point[valueField])
+      }))
     }, true)
     return
   }
@@ -276,7 +341,7 @@ watch(boundValue, value => {
   localTrend.value = [...localTrend.value, { time: now, value: number }].slice(-Math.max(8, Number(content.value.historyLength || 60)))
 })
 
-watch(() => [props.widget, props.metrics, props.trendPoints, props.events, localTrend.value], () => nextTick(renderChart), { deep: true })
+watch(() => [props.widget, props.metrics, props.trendPoints, props.events, props.databaseValues, localTrend.value], () => nextTick(renderChart), { deep: true })
 
 onMounted(() => { nextTick(renderChart); window.addEventListener('resize', resizeChart) })
 onUnmounted(() => { window.removeEventListener('resize', resizeChart); disposeChart() })

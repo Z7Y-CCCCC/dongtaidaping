@@ -7,6 +7,18 @@ async function main() {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'heat-treatment-data-source-'));
     const database = path.join(root, 'external.db');
     fs.copyFileSync(source, database);
+    const Database = require('better-sqlite3');
+    const seed = new Database(database);
+    seed.exec(`CREATE TABLE designer_metrics (
+        device_id TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        actual REAL NOT NULL,
+        target REAL NOT NULL
+    )`);
+    seed.prepare('INSERT INTO designer_metrics(device_id, recorded_at, actual, target) VALUES (?, ?, ?, ?)').run('Device_01', '2026-08-15 10:00:00', 40, 50);
+    seed.prepare('INSERT INTO designer_metrics(device_id, recorded_at, actual, target) VALUES (?, ?, ?, ?)').run('Device_01', '2026-08-15 10:05:00', 80, 100);
+    seed.prepare('INSERT INTO designer_metrics(device_id, recorded_at, actual, target) VALUES (?, ?, ?, ?)').run('Device_02', '2026-08-15 10:05:00', 10, 100);
+    seed.close();
     process.env.APP_DATA_DIR = root;
 
     const service = require('../services/dataSources');
@@ -36,6 +48,24 @@ async function main() {
         mode: 'database', connectionId: connection.id, schema: settingsTable.schema,
         table: settingsTable.name, field: field.name, valueMode: 'latest'
     } }]);
+    const multiSource = {
+        mode: 'database',
+        formula: '(a / b) * 100',
+        formulaLabel: '完成率',
+        datasets: [
+            { alias: 'a', label: '实际值', connectionId: connection.id, table: 'designer_metrics', field: 'actual', timeField: 'recorded_at', orderBy: 'recorded_at', valueMode: 'list', rowLimit: 10, contextKey: 'deviceId', contextField: 'device_id' },
+            { alias: 'b', label: '目标值', connectionId: connection.id, table: 'designer_metrics', field: 'target', timeField: 'recorded_at', orderBy: 'recorded_at', valueMode: 'list', rowLimit: 10, contextKey: 'deviceId', contextField: 'device_id' }
+        ],
+        context: { deviceId: 'Device_01' }
+    };
+    const multiPreview = await service.previewBinding(multiSource);
+    if (multiPreview.value !== 80 || multiPreview.rows.length !== 2 || multiPreview.series.length !== 3) {
+        throw new Error(`多数据项公式或设备过滤失效：${JSON.stringify(multiPreview)}`);
+    }
+    const multiRuntime = await service.readRuntimeBindings([{ id: 'widget_multi', data: multiSource }], { deviceId: 'Device_02' });
+    if (multiRuntime.widget_multi?.value !== 10 || multiRuntime.widget_multi?.series?.length !== 3) {
+        throw new Error(`运行时设备上下文过滤失效：${JSON.stringify(multiRuntime.widget_multi)}`);
+    }
     const configuredBackupRules = service.saveBackupConfig({
         startupEnabled: false,
         scheduledEnabled: true,
@@ -78,6 +108,8 @@ async function main() {
         columns: columns.length,
         preview: preview.value,
         runtimeQuality: runtime.widget_test?.quality,
+        multiDatasetFormula: multiPreview.value,
+        deviceContextFormula: multiRuntime.widget_multi?.value,
         backup: backup.filename,
         shutdownBackup: shutdownBackups[0],
         configurableTriggers: true

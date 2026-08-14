@@ -8,6 +8,7 @@ const {
     loadDatabaseConfig
 } = require('../db/database');
 const { createMysqlDump, resolveMysqlTools } = require('./mysqlBackup');
+const { evaluateVariableExpression } = require('../utils/mathExpression');
 
 const DATA_DIR = process.env.APP_DATA_DIR
     ? path.resolve(process.env.APP_DATA_DIR)
@@ -440,11 +441,36 @@ function normalizeBinding(source = {}) {
         orderDirection: String(source.orderDirection || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc',
         valueMode,
         rowLimit: finiteInteger(source.rowLimit, 50, 1, 500),
-        refreshMs: finiteInteger(source.refreshMs, 5000, 1000, 3600000)
+        refreshMs: finiteInteger(source.refreshMs, 5000, 1000, 3600000),
+        alias: safeId(source.alias, 'a').toLowerCase(),
+        label: shortText(source.label, source.alias || '数据项', 100),
+        color: shortText(source.color, '#55c7ff', 64),
+        contextField: shortText(source.contextField, '', 255),
+        contextKey: ['deviceId', 'lineId', 'workshopId', 'viewId'].includes(source.contextKey) ? source.contextKey : ''
     };
 }
 
-function bindingSelectSql(handle, binding) {
+function normalizeCompositeBinding(source = {}) {
+    const raw = Array.isArray(source.datasets) && source.datasets.length ? source.datasets : [source];
+    const usedAliases = new Set();
+    const datasets = raw.slice(0, 12).map((item, index) => {
+        const binding = normalizeBinding({ ...source, ...item, alias: item.alias || String.fromCharCode(97 + index) });
+        let alias = binding.alias || `data_${index + 1}`;
+        if (!/^[a-z_][a-z0-9_]*$/i.test(alias)) alias = `data_${index + 1}`;
+        while (usedAliases.has(alias)) alias = `${alias}_${index + 1}`;
+        usedAliases.add(alias);
+        return { ...binding, alias };
+    });
+    return {
+        datasets,
+        formula: shortText(source.formula, '', 256),
+        formulaLabel: shortText(source.formulaLabel, '计算结果', 100),
+        formulaColor: shortText(source.formulaColor, '#45df9b', 64),
+        refreshMs: datasets.reduce((minimum, item) => Math.min(minimum, item.refreshMs), 3600000)
+    };
+}
+
+function bindingSelectSql(handle, binding, context = {}) {
     if (!binding.connectionId || !binding.table) throw new Error('数据库绑定缺少连接或表');
     if (binding.valueMode !== 'count' && !binding.field) throw new Error('数据库绑定缺少字段');
     const type = handle.type;
@@ -453,17 +479,25 @@ function bindingSelectSql(handle, binding) {
     const order = binding.orderBy
         ? ` ORDER BY ${quoteIdentifier(binding.orderBy, type)} ${binding.orderDirection.toUpperCase()}`
         : '';
+    const contextValue = binding.contextKey ? context?.[binding.contextKey] : '';
+    const params = [];
+    let where = '';
+    if (binding.contextField && contextValue !== undefined && contextValue !== null && String(contextValue) !== '') {
+        params.push(contextValue);
+        const placeholder = type === 'postgres' ? '$1' : (type === 'sqlserver' ? '@p1' : '?');
+        where = ` WHERE ${quoteIdentifier(binding.contextField, type)} = ${placeholder}`;
+    }
     if (['count', 'sum', 'avg', 'min', 'max'].includes(binding.valueMode)) {
         const expression = binding.valueMode === 'count'
             ? 'COUNT(*)'
             : `${binding.valueMode.toUpperCase()}(${field})`;
-        return `SELECT ${expression} AS value FROM ${table}`;
+        return { sql: `SELECT ${expression} AS value FROM ${table}${where}`, params };
     }
     const aliases = [`${field} AS value`];
     if (binding.timeField && binding.timeField !== binding.field) aliases.push(`${quoteIdentifier(binding.timeField, type)} AS time`);
     const limit = binding.valueMode === 'list' ? binding.rowLimit : 1;
-    if (type === 'sqlserver') return `SELECT TOP ${limit} ${aliases.join(', ')} FROM ${table}${order}`;
-    return `SELECT ${aliases.join(', ')} FROM ${table}${order} LIMIT ${limit}`;
+    if (type === 'sqlserver') return { sql: `SELECT TOP ${limit} ${aliases.join(', ')} FROM ${table}${where}${order}`, params };
+    return { sql: `SELECT ${aliases.join(', ')} FROM ${table}${where}${order} LIMIT ${limit}`, params };
 }
 
 function normalizeDatabaseRows(rows) {
@@ -476,10 +510,10 @@ function normalizeDatabaseRows(rows) {
     }));
 }
 
-async function queryBindingWithHandle(handle, source) {
+async function queryBindingWithHandle(handle, source, context = {}) {
     const binding = normalizeBinding(source);
-    const sql = bindingSelectSql(handle, binding);
-    const rows = normalizeDatabaseRows(await executeRows(handle, sql));
+    const query = bindingSelectSql(handle, binding, context);
+    const rows = normalizeDatabaseRows(await executeRows(handle, query.sql, query.params));
     const list = binding.valueMode === 'list' ? rows : [];
     return {
         value: binding.valueMode === 'list' ? (rows[0]?.value ?? null) : (rows[0]?.value ?? null),
@@ -490,59 +524,121 @@ async function queryBindingWithHandle(handle, source) {
     };
 }
 
+function compositeRows(composite, results) {
+    if (!composite.formula) return results[0]?.rows || [];
+    const length = Math.max(0, ...results.map(result => result.rows.length));
+    return Array.from({ length }, (_, index) => {
+        const variables = {};
+        let time = index + 1;
+        results.forEach(result => {
+            const row = result.rows[index];
+            variables[result.binding.alias] = row?.value ?? result.value;
+            if (row?.time !== undefined && time === index + 1) time = row.time;
+        });
+        return { time, value: evaluateVariableExpression(composite.formula, variables, '数据 ') };
+    });
+}
+
+function composeBindingResult(composite, results) {
+    const variables = Object.fromEntries(results.map(result => [result.binding.alias, result.value]));
+    const formulaValue = composite.formula
+        ? evaluateVariableExpression(composite.formula, variables, '数据 ')
+        : results[0]?.value;
+    const rows = compositeRows(composite, results);
+    const series = results.map(result => ({
+        id: result.binding.alias,
+        label: result.binding.label,
+        color: result.binding.color,
+        value: result.value,
+        rows: result.rows
+    }));
+    if (composite.formula) {
+        series.push({ id: '__formula', label: composite.formulaLabel, color: composite.formulaColor, value: formulaValue, rows });
+    }
+    return {
+        value: formulaValue ?? null,
+        rows,
+        series,
+        variables,
+        formula: composite.formula,
+        quality: 'good',
+        fetchedAt: new Date().toISOString(),
+        binding: composite
+    };
+}
+
+async function queryCompositeBinding(source = {}, context = {}) {
+    const composite = normalizeCompositeBinding(source);
+    if (!composite.datasets.length) throw new Error('请至少添加一个数据项');
+    const results = await Promise.all(composite.datasets.map(binding => {
+        const connection = resolveConnection(binding.connectionId);
+        return withConnection(connection, handle => queryBindingWithHandle(handle, binding, context));
+    }));
+    return composeBindingResult(composite, results);
+}
+
 async function previewBinding(source = {}) {
-    const binding = normalizeBinding(source);
-    const connection = resolveConnection(binding.connectionId);
-    return withConnection(connection, handle => queryBindingWithHandle(handle, binding));
+    return queryCompositeBinding(source, source.context || {});
 }
 
 function cacheKey(binding) {
     return JSON.stringify(binding);
 }
 
-async function readRuntimeBindings(widgets = []) {
+async function readRuntimeBindings(widgets = [], context = {}) {
     const targets = widgets
         .filter(widget => widget?.data?.mode === 'database')
         .slice(0, 100)
-        .map(widget => ({ widgetId: String(widget.id), binding: normalizeBinding(widget.data) }));
+        .map(widget => ({ widgetId: String(widget.id), binding: normalizeCompositeBinding(widget.data) }));
     const values = {};
-    const pendingByConnection = new Map();
     const now = Date.now();
-
-    for (const target of targets) {
-        const key = cacheKey(target.binding);
+    const pending = [];
+    targets.forEach(target => {
+        const key = cacheKey({ binding: target.binding, context });
         const cached = runtimeCache.get(key);
         if (cached && cached.expiresAt > now) {
             values[target.widgetId] = cached.value;
-            continue;
+            return;
         }
-        if (!pendingByConnection.has(target.binding.connectionId)) pendingByConnection.set(target.binding.connectionId, []);
-        pendingByConnection.get(target.binding.connectionId).push(target);
-    }
+        pending.push({ ...target, key, results: new Array(target.binding.datasets.length), error: null });
+    });
 
-    await Promise.all([...pendingByConnection.entries()].map(async ([connectionId, targetsForConnection]) => {
+    const jobsByConnection = new Map();
+    pending.forEach(target => target.binding.datasets.forEach((binding, index) => {
+        if (!jobsByConnection.has(binding.connectionId)) jobsByConnection.set(binding.connectionId, []);
+        jobsByConnection.get(binding.connectionId).push({ target, binding, index });
+    }));
+
+    await Promise.all([...jobsByConnection.entries()].map(async ([connectionId, jobs]) => {
         try {
             const connection = resolveConnection(connectionId);
             await withConnection(connection, async handle => {
-                for (const target of targetsForConnection) {
+                for (const job of jobs) {
                     try {
-                        const result = await queryBindingWithHandle(handle, target.binding);
-                        values[target.widgetId] = result;
-                        runtimeCache.set(cacheKey(target.binding), {
-                            value: result,
-                            expiresAt: Date.now() + target.binding.refreshMs
-                        });
+                        job.target.results[job.index] = await queryBindingWithHandle(handle, job.binding, context);
                     } catch (error) {
-                        values[target.widgetId] = { value: null, rows: [], quality: 'bad', error: error.message, fetchedAt: new Date().toISOString() };
+                        job.target.error ||= error;
                     }
                 }
             });
         } catch (error) {
-            targetsForConnection.forEach(target => {
-                values[target.widgetId] = { value: null, rows: [], quality: 'bad', error: error.message, fetchedAt: new Date().toISOString() };
-            });
+            jobs.forEach(job => { job.target.error ||= error; });
         }
     }));
+
+    pending.forEach(target => {
+        try {
+            if (target.error) throw target.error;
+            const result = composeBindingResult(target.binding, target.results);
+            values[target.widgetId] = result;
+            runtimeCache.set(target.key, {
+                value: result,
+                expiresAt: Date.now() + target.binding.refreshMs
+            });
+        } catch (error) {
+            values[target.widgetId] = { value: null, rows: [], series: [], quality: 'bad', error: error.message, fetchedAt: new Date().toISOString() };
+        }
+    });
     return values;
 }
 
