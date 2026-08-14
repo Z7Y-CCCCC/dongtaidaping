@@ -45,6 +45,8 @@ let backendRestartAttempts = 0;
 let backendHealthFailures = 0;
 let backendRestartInProgress = false;
 let applicationShutdownForceTimer = null;
+let applicationReadyForInteraction = false;
+let pendingNativeAdminRequest = false;
 const BACKEND_RESTART_DELAYS_MS = [1000, 3000, 10000];
 const BACKEND_RESTART_RESET_MS = 60 * 1000;
 
@@ -68,6 +70,73 @@ function copyMissingDirectoryContents(source, destination) {
     });
 }
 
+function backendDependenciesReady(directory) {
+    return Boolean(directory) && [
+        path.join(directory, 'express', 'package.json'),
+        path.join(directory, 'better-sqlite3', 'package.json'),
+        path.join(directory, 'ws', 'package.json')
+    ].every(filename => fs.existsSync(filename));
+}
+
+function ensureBackendDependencies() {
+    const tarFile = resourcePath('backend-dependencies.tar');
+    const uncompressedDir = resourcePath('backend-dependencies');
+
+    if (!fs.existsSync(tarFile) && backendDependenciesReady(uncompressedDir)) {
+        return uncompressedDir;
+    }
+    if (!fs.existsSync(tarFile)) {
+        throw new Error('安装资源不完整：缺少 backend-dependencies.tar');
+    }
+
+    const root = app.getPath('userData');
+    const targetDir = path.join(root, 'backend-dependencies');
+    const stagingDir = path.join(root, `backend-dependencies.preparing-${process.pid}`);
+    const markerFile = path.join(targetDir, '.prepared');
+
+    let needsExtract = true;
+    if (fs.existsSync(markerFile)) {
+        try {
+            const preparedTime = new Date(fs.readFileSync(markerFile, 'utf8').trim()).getTime();
+            if (fs.existsSync(tarFile)) {
+                const tarStat = fs.statSync(tarFile);
+                if (preparedTime >= tarStat.mtime.getTime()) {
+                    needsExtract = !backendDependenciesReady(targetDir);
+                }
+            } else {
+                needsExtract = false;
+            }
+        } catch (e) {
+            needsExtract = true;
+        }
+    }
+
+    if (needsExtract) {
+        try {
+            const { execFileSync } = require('child_process');
+            fs.rmSync(stagingDir, { recursive: true, force: true });
+            ensureDirectory(stagingDir);
+            execFileSync('tar', ['-xf', tarFile, '-C', stagingDir], { windowsHide: true });
+            if (!backendDependenciesReady(stagingDir)) {
+                throw new Error('依赖包解压完成，但关键模块不完整');
+            }
+            fs.rmSync(targetDir, { recursive: true, force: true });
+            fs.renameSync(stagingDir, targetDir);
+            fs.writeFileSync(markerFile, new Date().toISOString(), 'utf8');
+        } catch (error) {
+            fs.rmSync(stagingDir, { recursive: true, force: true });
+            if (!backendDependenciesReady(targetDir)) {
+                throw new Error(`首次启动资源准备失败：${error.message}`);
+            }
+        }
+    }
+
+    if (!backendDependenciesReady(targetDir)) {
+        throw new Error('首次启动资源准备失败：后端依赖目录不完整');
+    }
+    return targetDir;
+}
+
 function initializeWritableData() {
     const root = app.getPath('userData');
     const dataDir = ensureDirectory(path.join(root, 'data'));
@@ -76,6 +145,7 @@ function initializeWritableData() {
     const databaseFile = path.join(dataDir, 'factory.db');
     const databaseConfigFile = path.join(dataDir, 'database-config.json');
     const templateRoot = resourcePath('templates');
+    const dependenciesDir = ensureBackendDependencies();
 
     if (!fs.existsSync(databaseFile)) {
         fs.copyFileSync(path.join(templateRoot, 'factory-template.db'), databaseFile);
@@ -97,7 +167,7 @@ function initializeWritableData() {
         }, null, 2), 'utf8');
     }
 
-    return { dataDir, uploadsDir, logsDir };
+    return { dataDir, uploadsDir, logsDir, dependenciesDir };
 }
 
 function configureAutoStart(enabled) {
@@ -511,7 +581,19 @@ function nativeAdminHostExecutable() {
 
 function launchNativeAdminHost(showAdmin) {
     const executable = nativeAdminHostExecutable();
-    if (!nativeProcess || nativeProcess.killed || !applicationOrigin || !fs.existsSync(executable)) {
+    const nativeRunning = nativeProcess
+        && nativeProcess.exitCode === null
+        && nativeProcess.signalCode === null
+        && !nativeProcess.killed;
+    if (!applicationOrigin || !nativeRunning) {
+        if (!applicationReadyForInteraction) {
+            if (showAdmin) pendingNativeAdminRequest = true;
+            return;
+        }
+        showAdminWindow();
+        return;
+    }
+    if (!fs.existsSync(executable)) {
         showAdminWindow();
         return;
     }
@@ -720,7 +802,7 @@ async function startBackend(port, writable) {
             DESKTOP_CONTROL_TOKEN: desktopControlToken || '',
             FFMPEG_PATH: resourcePath('ffmpeg', 'ffmpeg.exe'),
             CAST_WINDOW_TITLE: process.env.CAST_WINDOW_TITLE || 'Heat Treatment Digital Twin',
-            NODE_PATH: resourcePath('backend-dependencies')
+            NODE_PATH: writable.dependenciesDir || resourcePath('backend-dependencies')
         },
         stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -880,6 +962,7 @@ function createMainWindow(origin, showInitially = false) {
     }
     const adminUrl = `${origin}/admin`;
     mainWindow = new BrowserWindow({
+        title: APP_NAME,
         width: 1600,
         height: 960,
         minWidth: 1180,
@@ -977,9 +1060,15 @@ async function launchApplication() {
     } catch (error) {
         logDesktopError('native-client-start', error);
         dialog.showErrorBox(APP_NAME, `原生大屏启动失败：${error.message}`);
+        applicationReadyForInteraction = true;
+        pendingNativeAdminRequest = false;
         showAdminWindow();
     }
-    if (process.argv.includes('--admin')) showNativeAdminPanel();
+    applicationReadyForInteraction = true;
+    if (nativeProcess && (process.argv.includes('--admin') || pendingNativeAdminRequest)) {
+        pendingNativeAdminRequest = false;
+        setTimeout(showNativeAdminPanel, 600).unref?.();
+    }
     const smokeCrashBackendAfterMs = Number(process.env.DESKTOP_SMOKE_CRASH_BACKEND_AFTER_MS || 0);
     if (Number.isFinite(smokeCrashBackendAfterMs) && smokeCrashBackendAfterMs > 0) {
         setTimeout(() => {

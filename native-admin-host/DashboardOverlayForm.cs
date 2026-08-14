@@ -421,7 +421,15 @@ internal sealed class DashboardOverlayForm : Form
         {
             _interactionRegion?.Dispose();
             _interactionRegion = null;
-            _webView.Dispose();
+            try { Controls.Remove(_webView); } catch { /* best-effort detach */ }
+            try
+            {
+                _webView.Dispose();
+            }
+            catch (Exception exception)
+            {
+                WriteOverlayError("透明数据层 WebView2 已提前关闭", exception);
+            }
         }
         base.Dispose(disposing);
     }

@@ -1,3 +1,4 @@
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -6,7 +7,7 @@ const projectDir = path.resolve(desktopDir, '..');
 const resourcesDir = path.join(desktopDir, 'resources');
 const runtimeDir = path.join(resourcesDir, 'runtime');
 const templatesDir = path.join(resourcesDir, 'templates');
-const backendDependenciesDir = path.join(resourcesDir, 'backend-dependencies');
+const backendDependenciesTar = path.join(resourcesDir, 'backend-dependencies.tar');
 const nativeClientSourceDir = path.join(projectDir, 'unity-client', 'Builds', 'Windows');
 const nativeClientOutputDir = path.join(resourcesDir, 'native-client');
 const explicitSourceDb = String(process.env.DESKTOP_TEMPLATE_SOURCE_DB || '').trim();
@@ -209,7 +210,10 @@ async function main() {
 
     const databaseSource = await prepareDatabaseTemplate();
     fs.copyFileSync(nodeBinary, path.join(runtimeDir, 'node.exe'));
-    fs.cpSync(path.join(projectDir, 'backend', 'node_modules'), backendDependenciesDir, { recursive: true });
+    execFileSync('tar', ['-cf', backendDependenciesTar, '-C', path.join(projectDir, 'backend', 'node_modules'), '.'], { windowsHide: true });
+    if (!fs.existsSync(backendDependenciesTar) || fs.statSync(backendDependenciesTar).size < 1024 * 1024) {
+        throw new Error(`后端依赖包生成失败或文件异常：${backendDependenciesTar}`);
+    }
     fs.cpSync(nativeClientSourceDir, nativeClientOutputDir, {
         recursive: true,
         filter: source => !path.basename(source).includes('BurstDebugInformation_DoNotShip')
@@ -225,7 +229,7 @@ async function main() {
     }
     console.log(`已准备上传资源：${fs.existsSync(sourceUploads) ? sourceUploads : '无'}`);
     console.log(`已准备 Node.js 运行时：${nodeBinary}`);
-    console.log(`已准备后端运行依赖：${backendDependenciesDir}`);
+    console.log(`已准备后端运行依赖包：${backendDependenciesTar}`);
     console.log(`已准备 Unity 原生客户端：${nativeClientOutputDir}`);
 }
 

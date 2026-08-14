@@ -54,6 +54,8 @@ internal sealed class AdminPanelForm : Form
     private IntPtr _parentHandle;
     private readonly DateTime? _parentProcessStartTimeUtc;
     private bool _waitingForParentWindow;
+    private bool _closing;
+    private bool _webViewDisposeAttempted;
     private Task? _pipeTask;
 
     public AdminPanelForm(HostOptions options)
@@ -210,7 +212,9 @@ internal sealed class AdminPanelForm : Form
                 ? _options.FixedRuntimeFolder
                 : null;
             var environment = await CoreWebView2Environment.CreateAsync(fixedRuntime, userData);
+            if (_closing || IsDisposed) return;
             await _webView.EnsureCoreWebView2Async(environment);
+            if (_closing || IsDisposed) return;
             _webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
             _webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
             _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
@@ -221,7 +225,10 @@ internal sealed class AdminPanelForm : Form
             {
                 BeginInvoke(() =>
                 {
-                    _webView.Visible = _adminVisible && !_panelHidden;
+                    if (_closing || IsDisposed) return;
+                    // 大屏模式只显示这个 WebView 的顶部 46px，承载“实时大屏 / 后台管理”页签。
+                    // 不能按 _adminVisible 隐藏，否则只会剩下一条深色空白底。
+                    _webView.Visible = !_panelHidden;
                     SendHostState();
                 });
             };
@@ -230,6 +237,12 @@ internal sealed class AdminPanelForm : Form
             {
                 _dashboardOverlay = new DashboardOverlayForm(_options);
                 await _dashboardOverlay.InitializeAsync(environment);
+                if (_closing || IsDisposed)
+                {
+                    _dashboardOverlay.Dispose();
+                    _dashboardOverlay = null;
+                    return;
+                }
             }
             catch (Exception overlayException)
             {
@@ -385,11 +398,20 @@ internal sealed class AdminPanelForm : Form
         else
         {
             _attached = false;
-            _adminVisible = true;
             _waitingForParentWindow = _options.ParentProcessId > 0;
             _parentTimer.Interval = 500;
-            Bounds = _defaultDetachedBounds;
-            ShowPanel();
+            if (_waitingForParentWindow)
+            {
+                // Unity 首次启动时 HWND 可能晚几秒出现。此时保持隐藏，避免先闪出一个
+                // 独立后台窗口，随后又嵌入 Unity，造成“同时出现两个窗口”的错觉。
+                Hide();
+            }
+            else
+            {
+                _adminVisible = true;
+                Bounds = _defaultDetachedBounds;
+                ShowPanel();
+            }
         }
         if (_options.ParentProcessId > 0) _parentTimer.Start();
     }
@@ -440,9 +462,10 @@ internal sealed class AdminPanelForm : Form
 
     private void MaintainParentWindow()
     {
+        if (_closing || IsDisposed) return;
         if (!IsParentProcessRunning())
         {
-            Close();
+            RequestCloseAfterParentExit();
             return;
         }
         if (!TryResolveParentWindow())
@@ -1075,9 +1098,9 @@ internal sealed class AdminPanelForm : Form
 
     private void ShowPanel(bool focus = true)
     {
-        if (IsDisposed) return;
+        if (_closing || IsDisposed) return;
         _panelHidden = false;
-        _webView.Visible = _adminVisible && _webView.CoreWebView2 != null;
+        _webView.Visible = _webView.CoreWebView2 != null;
         Show();
         NativeMethods.ShowWindow(Handle, NativeMethods.SwShow);
         if (focus)
@@ -1096,6 +1119,24 @@ internal sealed class AdminPanelForm : Form
         NativeMethods.ShowWindow(Handle, NativeMethods.SwHide);
         Hide();
         SyncDashboardOverlay();
+    }
+
+    private void RequestCloseAfterParentExit()
+    {
+        if (_closing || IsDisposed) return;
+        _closing = true;
+        _parentTimer.Stop();
+        try
+        {
+            BeginInvoke(() =>
+            {
+                if (!IsDisposed) Close();
+            });
+        }
+        catch
+        {
+            Application.ExitThread();
+        }
     }
 
     private void BeginDrag(object? sender, MouseEventArgs e)
@@ -1622,10 +1663,45 @@ internal sealed class AdminPanelForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        _closing = true;
         _parentTimer.Stop();
         _pipeCancellation.Cancel();
-        if (_dashboardChrome != null && !_dashboardChrome.IsDisposed) _dashboardChrome.Close();
-        if (_dashboardOverlay != null && !_dashboardOverlay.IsDisposed) _dashboardOverlay.Close();
+        try
+        {
+            if (_dashboardChrome != null && !_dashboardChrome.IsDisposed) _dashboardChrome.Close();
+        }
+        catch (Exception exception)
+        {
+            WriteHostError("顶部栏窗口关闭失败", exception);
+        }
+        try
+        {
+            if (_dashboardOverlay != null && !_dashboardOverlay.IsDisposed) _dashboardOverlay.Close();
+        }
+        catch (Exception exception)
+        {
+            WriteHostError("透明数据层关闭失败", exception);
+        }
         base.OnFormClosing(e);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && !_webViewDisposeAttempted)
+        {
+            _webViewDisposeAttempted = true;
+            try { Controls.Remove(_webView); } catch { /* best-effort detach */ }
+            try
+            {
+                _webView.Dispose();
+            }
+            catch (Exception exception)
+            {
+                // WebView2 may already have torn down its controller when Unity exits.
+                // The host must still terminate cleanly instead of leaving an orphan process.
+                WriteHostError("后台 WebView2 关闭失败（已安全忽略）", exception);
+            }
+        }
+        base.Dispose(disposing);
     }
 }

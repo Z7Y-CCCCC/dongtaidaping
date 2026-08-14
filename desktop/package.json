@@ -64,11 +64,8 @@
         ]
       },
       {
-        "from": "resources/backend-dependencies",
-        "to": "backend-dependencies",
-        "filter": [
-          "**/*"
-        ]
+        "from": "resources/backend-dependencies.tar",
+        "to": "backend-dependencies.tar"
       },
       {
         "from": "resources/native-client",
@@ -109,7 +106,7 @@
           ]
         }
       ],
-      "icon": "assets/icon.png",
+      "icon": "assets/icon.ico",
       "artifactName": "热处理数字孪生大屏-安装包-${version}-${arch}.${ext}"
     },
     "nsis": {

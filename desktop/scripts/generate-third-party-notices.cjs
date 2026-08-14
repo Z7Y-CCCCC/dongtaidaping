@@ -50,6 +50,19 @@ function readPackageMetadata(name, info) {
         license = 'MIT';
     }
 
+    if (!license && !licenseFile.text) {
+        const readmePath = ['README.md', 'readme.md', 'README', 'Readme.md']
+            .map(f => path.join(packageDirectory, f))
+            .find(f => fs.existsSync(f));
+        if (readmePath) {
+            const readmeText = fs.readFileSync(readmePath, 'utf8');
+            if (/\bMIT\s+licen[cs]e\b/i.test(readmeText)) license = 'MIT';
+            else if (/\bBSD\b/i.test(readmeText) && /licen[cs]e/i.test(readmeText)) license = 'BSD';
+            else if (/\bApache\b/i.test(readmeText) && /licen[cs]e/i.test(readmeText)) license = 'Apache-2.0';
+            else if (/\bISC\b/i.test(readmeText) && /licen[cs]e/i.test(readmeText)) license = 'ISC';
+        }
+    }
+
     return {
         name: manifest.name || name,
         version: manifest.version || info.version,

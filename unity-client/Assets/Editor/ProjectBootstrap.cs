@@ -23,6 +23,7 @@ namespace HeatTreatment.DigitalTwin.Editor
         private const string RendererPath = SettingsDirectory + "/DigitalTwinRenderer.asset";
         private const string PipelinePath = SettingsDirectory + "/DigitalTwinPipeline.asset";
         private const string ScenePath = ScenesDirectory + "/Factory.unity";
+        private const string ApplicationIconPath = "Assets/Branding/AppIcon.png";
 
         static ProjectBootstrap()
         {
@@ -265,6 +266,21 @@ namespace HeatTreatment.DigitalTwin.Editor
             PlayerSettings.resizableWindow = true;
             PlayerSettings.runInBackground = true;
             PlayerSettings.usePlayerLog = true;
+            var applicationIcon = AssetDatabase.LoadAssetAtPath<Texture2D>(ApplicationIconPath);
+            if (applicationIcon != null)
+            {
+                var iconSizes = PlayerSettings.GetIconSizesForTargetGroup(BuildTargetGroup.Standalone);
+                var applicationIcons = new Texture2D[iconSizes.Length];
+                for (var index = 0; index < applicationIcons.Length; index++)
+                {
+                    applicationIcons[index] = applicationIcon;
+                }
+                PlayerSettings.SetIconsForTargetGroup(BuildTargetGroup.Standalone, applicationIcons);
+            }
+            else
+            {
+                Debug.LogWarning($"[Digital Twin] Application icon not found: {ApplicationIconPath}");
+            }
             PlayerSettings.SetScriptingBackend(BuildTargetGroup.Standalone, ScriptingImplementation.Mono2x);
             PlayerSettings.SetGraphicsAPIs(BuildTarget.StandaloneWindows64, new[] { GraphicsDeviceType.Direct3D11 });
         }
