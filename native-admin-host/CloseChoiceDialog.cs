@@ -23,7 +23,7 @@ internal sealed class CloseChoiceDialog : Form
         MinimizeBox = false;
         MaximizeBox = false;
         ControlBox = false;
-        ClientSize = new Size(520, 300);
+        ClientSize = new Size(260, 150);
         MinimumSize = ClientSize;
         MaximumSize = ClientSize;
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -36,13 +36,13 @@ internal sealed class CloseChoiceDialog : Form
         var header = new ChromeHeader
         {
             Dock = DockStyle.Top,
-            Height = 42,
-            Padding = new Padding(16, 0, 6, 0)
+            Height = 32,
+            Padding = new Padding(10, 0, 4, 0)
         };
         var title = new Label
         {
             Dock = DockStyle.Left,
-            Width = 260,
+            Width = 190,
             Text = "热处理数字孪生大屏",
             TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = Color.FromArgb(23, 43, 63),
@@ -52,7 +52,7 @@ internal sealed class CloseChoiceDialog : Form
         var closeButton = new ChromeCloseButton
         {
             Dock = DockStyle.Right,
-            Width = 38,
+            Width = 32,
             AccessibleName = "关闭弹窗"
         };
         closeButton.Click += (_, _) => CancelAndClose();
@@ -64,28 +64,28 @@ internal sealed class CloseChoiceDialog : Form
         var content = new Panel
         {
             Dock = DockStyle.Fill,
-            Padding = new Padding(22, 16, 22, 14),
+            Padding = new Padding(10, 6, 10, 8),
             BackColor = Color.FromArgb(248, 250, 252)
         };
 
         var hero = new Panel
         {
             Dock = DockStyle.Top,
-            Height = 52,
+            Height = 24,
             BackColor = Color.Transparent
         };
         var info = new InfoGlyph
         {
-            Location = new Point(0, 5),
-            Size = new Size(32, 32)
+            Location = new Point(0, 2),
+            Size = new Size(20, 20)
         };
         var heading = new Label
         {
-            Location = new Point(46, 2),
-            Size = new Size(420, 38),
+            Location = new Point(28, 0),
+            Size = new Size(200, 22),
             Text = "请选择关闭方式",
             ForeColor = Color.FromArgb(16, 42, 67),
-            Font = new Font("Microsoft YaHei UI", 13f, FontStyle.Bold),
+            Font = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
             BackColor = Color.Transparent
         };
@@ -97,7 +97,7 @@ internal sealed class CloseChoiceDialog : Form
             Dock = DockStyle.Fill,
             ColumnCount = 1,
             RowCount = 2,
-            Padding = new Padding(0, 2, 0, 7),
+            Padding = Padding.Empty,
             BackColor = Color.Transparent
         };
         options.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
@@ -112,7 +112,7 @@ internal sealed class CloseChoiceDialog : Form
         )
         {
             Dock = DockStyle.Fill,
-            Margin = new Padding(0, 0, 0, 6),
+            Margin = new Padding(0, 0, 0, 2),
             AccessibleName = "最小化到系统托盘（推荐）"
         };
         var exitCard = new ChoiceCard(
@@ -123,7 +123,7 @@ internal sealed class CloseChoiceDialog : Form
         )
         {
             Dock = DockStyle.Fill,
-            Margin = new Padding(0, 6, 0, 0),
+            Margin = new Padding(0, 2, 0, 0),
             AccessibleName = "完全退出程序"
         };
         _minimizeCard.Click += (_, _) => Complete(CloseChoice.MinimizeToTray);
@@ -131,24 +131,7 @@ internal sealed class CloseChoiceDialog : Form
         options.Controls.Add(_minimizeCard, 0, 0);
         options.Controls.Add(exitCard, 0, 1);
 
-        var footer = new Panel
-        {
-            Dock = DockStyle.Bottom,
-            Height = 34,
-            BackColor = Color.Transparent
-        };
-        var cancelButton = new RoundedActionButton
-        {
-            Dock = DockStyle.Right,
-            Width = 78,
-            Text = "取消",
-            AccessibleName = "取消关闭软件"
-        };
-        cancelButton.Click += (_, _) => CancelAndClose();
-        footer.Controls.Add(cancelButton);
-
         content.Controls.Add(options);
-        content.Controls.Add(footer);
         content.Controls.Add(hero);
         Controls.Add(content);
         Controls.Add(header);
@@ -359,7 +342,7 @@ internal sealed class CloseChoiceDialog : Form
             using var circle = new SolidBrush(Color.FromArgb(21, 112, 239));
             e.Graphics.FillEllipse(halo, 0, 0, Width, Height);
             e.Graphics.FillEllipse(circle, 6, 6, Width - 12, Height - 12);
-            using var font = new Font("Segoe UI", 13f, FontStyle.Bold);
+            using var font = new Font("Segoe UI", 9f, FontStyle.Bold);
             TextRenderer.DrawText(
                 e.Graphics,
                 "i",
@@ -453,7 +436,8 @@ internal sealed class CloseChoiceDialog : Form
             e.Graphics.FillPath(fill, path);
             e.Graphics.DrawPath(border, path);
 
-            var iconBounds = new Rectangle(15, Math.Max(8, Height / 2 - 14), 28, 28);
+            var iconSize = Math.Clamp(Height - 12, 18, 24);
+            var iconBounds = new Rectangle(10, Math.Max(4, (Height - iconSize) / 2), iconSize, iconSize);
             using var iconFill = new SolidBrush(_danger ? Color.FromArgb(255, 235, 232) : Color.FromArgb(21, 112, 239));
             e.Graphics.FillEllipse(iconFill, iconBounds);
             using var iconPen = new Pen(_danger ? Color.FromArgb(217, 45, 32) : Color.White, 1.7f)
@@ -473,9 +457,9 @@ internal sealed class CloseChoiceDialog : Form
                 e.Graphics.DrawLine(iconPen, iconBounds.Left + 14, iconBounds.Top + 20, iconBounds.Left + 20, iconBounds.Top + 14);
             }
 
-            var titleX = 55;
+            var titleX = 42;
             var hasDescription = !string.IsNullOrWhiteSpace(_description);
-            var titleY = hasDescription ? 13 : Math.Max(8, (Height - 22) / 2);
+            var titleY = hasDescription ? 8 : Math.Max(5, (Height - 22) / 2);
             TextRenderer.DrawText(
                 e.Graphics,
                 _title,
@@ -487,7 +471,7 @@ internal sealed class CloseChoiceDialog : Form
             if (_recommended)
             {
                 var titleWidth = TextRenderer.MeasureText(_title, _titleFont, Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width;
-                var badge = new Rectangle(titleX + titleWidth + 11, titleY - 1, 45, 22);
+                var badge = new Rectangle(titleX + titleWidth + 6, titleY, 36, 19);
                 using var badgePath = RoundedPath(badge, 9);
                 using var badgeFill = new SolidBrush(Color.FromArgb(220, 235, 255));
                 e.Graphics.FillPath(badgeFill, badgePath);
@@ -513,7 +497,7 @@ internal sealed class CloseChoiceDialog : Form
                 );
             }
 
-            var chevronX = Width - 25;
+            var chevronX = Width - 15;
             var chevronY = Height / 2;
             using var chevron = new Pen(_danger ? Color.FromArgb(217, 45, 32) : Color.FromArgb(21, 112, 239), 1.8f)
             {
