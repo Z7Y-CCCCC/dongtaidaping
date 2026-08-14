@@ -717,6 +717,9 @@ export function useSystemSettings({
     const dataSourceBackupBusy = ref(false)
     const dataSourceBackupConfig = reactive({
         autoEnabled: true,
+        startupEnabled: true,
+        scheduledEnabled: true,
+        shutdownEnabled: true,
         intervalHours: 6,
         retention: 10,
         selectedConnectionIds: ['primary']

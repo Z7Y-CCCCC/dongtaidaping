@@ -36,11 +36,40 @@ async function main() {
         mode: 'database', connectionId: connection.id, schema: settingsTable.schema,
         table: settingsTable.name, field: field.name, valueMode: 'latest'
     } }]);
-    service.saveBackupConfig({ autoEnabled: false, selectedConnectionIds: [connection.id], intervalHours: 6, retention: 2 });
+    const configuredBackupRules = service.saveBackupConfig({
+        startupEnabled: false,
+        scheduledEnabled: true,
+        shutdownEnabled: true,
+        selectedConnectionIds: [connection.id],
+        intervalHours: 6,
+        retention: 3
+    });
+    if (configuredBackupRules.startupEnabled !== false
+        || configuredBackupRules.scheduledEnabled !== true
+        || configuredBackupRules.shutdownEnabled !== true) {
+        throw new Error('独立备份触发规则未正确保存');
+    }
     const backup = await service.createConnectionBackup(connection.id, 'test');
     const backupPath = path.join(root, 'data-source-backups', connection.id, backup.filename);
     if (!fs.existsSync(backupPath) || fs.statSync(backupPath).size < 32) throw new Error('外部数据库压缩备份未生成');
-    await service.stopDataSourceMaintenance();
+    await service.stopDataSourceMaintenance({ backup: true, reason: 'shutdown' });
+    const backupDirectory = path.dirname(backupPath);
+    const shutdownBackups = fs.readdirSync(backupDirectory).filter(filename => filename.includes('-shutdown.'));
+    if (shutdownBackups.length !== 1) throw new Error('启用正常退出备份后未生成 shutdown 备份');
+
+    service.saveBackupConfig({
+        startupEnabled: false,
+        scheduledEnabled: false,
+        shutdownEnabled: false,
+        selectedConnectionIds: [connection.id],
+        intervalHours: 6,
+        retention: 3
+    });
+    const countBeforeDisabledShutdown = fs.readdirSync(backupDirectory).length;
+    await service.stopDataSourceMaintenance({ backup: true, reason: 'shutdown-disabled-check' });
+    if (fs.readdirSync(backupDirectory).length !== countBeforeDisabledShutdown) {
+        throw new Error('关闭正常退出备份后仍生成了备份');
+    }
 
     console.log(JSON.stringify({
         success: true,
@@ -49,7 +78,9 @@ async function main() {
         columns: columns.length,
         preview: preview.value,
         runtimeQuality: runtime.widget_test?.quality,
-        backup: backup.filename
+        backup: backup.filename,
+        shutdownBackup: shutdownBackups[0],
+        configurableTriggers: true
     }, null, 2));
     fs.rmSync(root, { recursive: true, force: true });
 }

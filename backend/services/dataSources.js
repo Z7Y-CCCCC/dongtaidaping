@@ -18,6 +18,9 @@ const PRIMARY_ID = 'primary';
 const MASKED_PASSWORD = '******';
 const DEFAULT_BACKUP_CONFIG = Object.freeze({
     autoEnabled: true,
+    startupEnabled: true,
+    scheduledEnabled: true,
+    shutdownEnabled: true,
     intervalHours: 6,
     retention: 10,
     selectedConnectionIds: [PRIMARY_ID]
@@ -120,8 +123,22 @@ function normalizeBackupConfig(source = {}) {
     const selected = Array.isArray(source.selectedConnectionIds)
         ? source.selectedConnectionIds.map(item => safeId(item)).filter(Boolean)
         : DEFAULT_BACKUP_CONFIG.selectedConnectionIds;
+    const legacyAutoEnabled = source.autoEnabled !== false;
+    const startupEnabled = source.startupEnabled === undefined
+        ? legacyAutoEnabled
+        : source.startupEnabled !== false;
+    const scheduledEnabled = source.scheduledEnabled === undefined
+        ? legacyAutoEnabled
+        : source.scheduledEnabled !== false;
+    const shutdownEnabled = source.shutdownEnabled === undefined
+        ? DEFAULT_BACKUP_CONFIG.shutdownEnabled
+        : source.shutdownEnabled !== false;
     return {
-        autoEnabled: source.autoEnabled !== false,
+        // 保留 autoEnabled 兼容旧安装包和旧整站备份；新界面使用三个独立触发开关。
+        autoEnabled: startupEnabled || scheduledEnabled,
+        startupEnabled,
+        scheduledEnabled,
+        shutdownEnabled,
         intervalHours: finiteInteger(source.intervalHours, DEFAULT_BACKUP_CONFIG.intervalHours, 1, 168),
         retention: finiteInteger(source.retention, DEFAULT_BACKUP_CONFIG.retention, 1, 100),
         selectedConnectionIds: [...new Set(selected)]
@@ -709,7 +726,7 @@ function restartMaintenanceTimer() {
     if (maintenanceTimer) clearInterval(maintenanceTimer);
     maintenanceTimer = null;
     const backup = loadStoredConfig().backup;
-    if (!backup.autoEnabled) return;
+    if (!backup.scheduledEnabled) return;
     maintenanceTimer = setInterval(() => {
         runSelectedBackups('scheduled').catch(error => console.error('[DataSources] 定时备份失败:', error.message));
     }, backup.intervalHours * 60 * 60 * 1000);
@@ -719,7 +736,7 @@ function restartMaintenanceTimer() {
 function startDataSourceMaintenance() {
     restartMaintenanceTimer();
     const backup = loadStoredConfig().backup;
-    if (backup.autoEnabled) {
+    if (backup.startupEnabled) {
         setImmediate(() => runSelectedBackups('startup').catch(error => console.error('[DataSources] 启动备份失败:', error.message)));
     }
     return getBackupStatus();
@@ -731,10 +748,15 @@ function reloadDataSourceConfiguration() {
     return listDataSources();
 }
 
-async function stopDataSourceMaintenance() {
+async function stopDataSourceMaintenance(options = {}) {
     if (maintenanceTimer) clearInterval(maintenanceTimer);
     maintenanceTimer = null;
     if (backupPromise) await backupPromise;
+    const backup = loadStoredConfig().backup;
+    if (options.backup === true && backup.shutdownEnabled) {
+        return runSelectedBackups(options.reason || 'shutdown');
+    }
+    return [];
 }
 
 function getBackupStatus() {

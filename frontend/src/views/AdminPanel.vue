@@ -8240,15 +8240,47 @@ const mainTabs = [
                                 <div class="database-backup-header">
                                     <div>
                                         <strong>数据库自动压缩备份（仅防断电或数据库损坏）</strong>
-                                        <p>可同时选择主业务库和保存的外部数据库连接；外部库只读导出，主库保留时间在下方单独设置。</p>
+                                        <p>先选择需要保护的数据库，再分别决定软件启动、持续运行和正常退出时是否生成备份；默认全部开启。</p>
                                     </div>
                                     <button type="button" class="btn" :disabled="dataSourceBackupBusy" @click="runSelectedDatabaseBackups()">立即备份已选</button>
                                 </div>
+                                <div class="database-backup-trigger-grid">
+                                    <label class="database-backup-trigger-card" :class="{ active: dataSourceBackupConfig.startupEnabled }">
+                                        <input v-model="dataSourceBackupConfig.startupEnabled" type="checkbox" />
+                                        <span class="database-backup-trigger-index">01</span>
+                                        <span class="database-backup-trigger-copy">
+                                            <strong>软件启动</strong>
+                                            <small>每次启动完成后立即生成 startup 备份</small>
+                                        </span>
+                                        <span class="database-backup-trigger-switch" aria-hidden="true"><i></i></span>
+                                    </label>
+                                    <label class="database-backup-trigger-card" :class="{ active: dataSourceBackupConfig.scheduledEnabled }">
+                                        <input v-model="dataSourceBackupConfig.scheduledEnabled" type="checkbox" />
+                                        <span class="database-backup-trigger-index">02</span>
+                                        <span class="database-backup-trigger-copy">
+                                            <strong>持续运行</strong>
+                                            <small>软件不退出时，按下方间隔自动生成 scheduled 备份</small>
+                                        </span>
+                                        <span class="database-backup-trigger-switch" aria-hidden="true"><i></i></span>
+                                    </label>
+                                    <label class="database-backup-trigger-card" :class="{ active: dataSourceBackupConfig.shutdownEnabled }">
+                                        <input v-model="dataSourceBackupConfig.shutdownEnabled" type="checkbox" />
+                                        <span class="database-backup-trigger-index">03</span>
+                                        <span class="database-backup-trigger-copy">
+                                            <strong>正常退出</strong>
+                                            <small>完全退出程序前生成 shutdown 备份；最小化到托盘不会触发</small>
+                                        </span>
+                                        <span class="database-backup-trigger-switch" aria-hidden="true"><i></i></span>
+                                    </label>
+                                </div>
                                 <div class="database-auto-backup-controls">
-                                    <label class="checkbox-line"><input v-model="dataSourceBackupConfig.autoEnabled" type="checkbox" /> 启用自动备份</label>
-                                    <label>间隔（小时）<input v-model.number="dataSourceBackupConfig.intervalHours" type="number" min="1" max="168" class="input input-small" /></label>
+                                    <label>持续运行备份间隔（小时）<input v-model.number="dataSourceBackupConfig.intervalHours" type="number" min="1" max="168" class="input input-small" :disabled="!dataSourceBackupConfig.scheduledEnabled" /></label>
                                     <label>外部连接保留份数<input v-model.number="dataSourceBackupConfig.retention" type="number" min="1" max="100" class="input input-small" /></label>
-                                    <button type="button" class="btn btn-small" :disabled="dataSourceBackupBusy" @click="saveDataSourceBackupConfiguration">保存自动备份</button>
+                                    <button type="button" class="btn btn-small" :disabled="dataSourceBackupBusy" @click="saveDataSourceBackupConfiguration">保存备份规则</button>
+                                </div>
+                                <div class="database-backup-protection-note">
+                                    <span>按需保护</span>
+                                    <div><strong>手动备份、整站导出、恢复前安全备份</strong><small>这些操作由用户主动发起；恢复前回滚备份始终保留，避免恢复失败后无法撤回。</small></div>
                                 </div>
                                 <div class="database-backup-source-grid">
                                     <label v-for="connection in dataSourceConnections" :key="`backup-${connection.id}`" class="database-backup-source-option">
@@ -8263,7 +8295,7 @@ const mainTabs = [
                                 <div class="database-backup-header">
                                     <div>
                                         <strong>主业务数据库备份与恢复</strong>
-                                        <p>{{ databaseBackupStatus.type === 'mysql' ? '使用一致性 mysqldump 并 gzip 压缩。' : '使用 SQLite 一致性文件备份。' }}退出程序前仍会额外生成一份安全备份。</p>
+                                        <p>{{ databaseBackupStatus.type === 'mysql' ? '使用一致性 mysqldump 并 gzip 压缩。' : '使用 SQLite 一致性文件备份。' }}启动、持续运行和正常退出规则由上方分别控制。</p>
                                     </div>
                                     <button @click="runSelectedDatabaseBackups('primary')" class="btn" :disabled="databaseBackupBusy || dataSourceBackupBusy">立即备份主库</button>
                                 </div>
@@ -12350,9 +12382,30 @@ button:enabled:active {
 .external-data-source-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
 .external-data-source-actions span { color: #515154; font-size: 12px; }
 .database-auto-backup-panel { padding: 18px; background: #f7f7f8; border: 1px solid #e2e2e5; border-radius: 10px; }
+.database-backup-trigger-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; margin-top: 16px; }
+.database-backup-trigger-card { position: relative; display: grid; grid-template-columns: 34px minmax(0,1fr) 38px; align-items: center; gap: 10px; min-width: 0; min-height: 82px; padding: 12px; color: #515154; background: #fff; border: 1px solid #dedee3; border-radius: 12px; cursor: pointer; transition: border-color 160ms ease,background-color 160ms ease,box-shadow 160ms ease,transform 160ms ease; }
+.database-backup-trigger-card:hover { border-color: #b8b8bd; box-shadow: 0 7px 20px #0000000d; transform: translateY(-1px); }
+.database-backup-trigger-card.active { color: #1d1d1f; background: #fff; border-color: #a8a8ad; box-shadow: inset 0 0 0 1px #00000008,0 8px 22px #0000000b; }
+.database-backup-trigger-card > input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.database-backup-trigger-index { display: grid; place-items: center; width: 34px; height: 34px; color: #8e8e93; background: #f2f2f4; border-radius: 9px; font-size: 10px; font-weight: 700; font-variant-numeric: tabular-nums; transition: color 160ms ease,background-color 160ms ease; }
+.database-backup-trigger-card.active .database-backup-trigger-index { color: #fff; background: #1d1d1f; }
+.database-backup-trigger-copy { min-width: 0; }
+.database-backup-trigger-copy strong,.database-backup-trigger-copy small { display: block; }
+.database-backup-trigger-copy strong { color: inherit; font-size: 12px; }
+.database-backup-trigger-copy small { margin-top: 4px; color: #86868b; font-size: 10px; line-height: 1.45; }
+.database-backup-trigger-switch { position: relative; width: 36px; height: 22px; background: #d1d1d6; border-radius: 999px; box-shadow: inset 0 0 0 1px #0000000a; transition: background-color 160ms ease; }
+.database-backup-trigger-switch i { position: absolute; left: 3px; top: 3px; width: 16px; height: 16px; background: #fff; border-radius: 50%; box-shadow: 0 1px 3px #0003; transition: transform 160ms ease; }
+.database-backup-trigger-card.active .database-backup-trigger-switch { background: #1d1d1f; }
+.database-backup-trigger-card.active .database-backup-trigger-switch i { transform: translateX(14px); }
 .database-auto-backup-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-top: 14px; }
 .database-auto-backup-controls > label:not(.checkbox-line) { display: flex; flex-direction: column; gap: 5px; color: #515154; font-size: 12px; }
 .database-auto-backup-controls .input-small { width: 100px; }
+.database-auto-backup-controls input:disabled { color: #a1a1a6; background: #ececef; cursor: not-allowed; }
+.database-backup-protection-note { display: grid; grid-template-columns: auto minmax(0,1fr); align-items: center; gap: 11px; margin-top: 14px; padding: 11px 12px; background: #fff; border: 1px solid #e5e5e7; border-radius: 10px; }
+.database-backup-protection-note > span { padding: 5px 8px; color: #fff; background: #1d1d1f; border-radius: 999px; font-size: 9px; font-weight: 700; white-space: nowrap; }
+.database-backup-protection-note strong,.database-backup-protection-note small { display: block; }
+.database-backup-protection-note strong { color: #353537; font-size: 11px; }
+.database-backup-protection-note small { margin-top: 3px; color: #86868b; font-size: 10px; line-height: 1.45; }
 .database-backup-source-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; margin-top: 14px; }
 .database-backup-source-option { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 10px 12px; background: #fff; border: 1px solid #e5e5e7; border-radius: 8px; cursor: pointer; }
 .database-backup-source-option input { accent-color: #1d1d1f; }
@@ -12552,6 +12605,7 @@ button:enabled:active {
 }
 
 @media (max-width: 900px) {
+    .database-backup-trigger-grid { grid-template-columns: 1fr; }
     .database-retention-heading { grid-template-columns: auto minmax(0,1fr); }
     .database-retention-heading > em { grid-column: 2; justify-self: start; }
     .database-retention-controls { grid-template-columns: 1fr; }

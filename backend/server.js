@@ -608,12 +608,15 @@ async function startServer() {
         try { await screenCast.close(); } catch (e) { /* ignore */ }
         try { await lanDisplay.stop(); } catch (e) { /* ignore */ }
         try { stopSiteBackupMaintenance(); } catch (e) { /* ignore */ }
-        try { await stopDataSourceMaintenance(); } catch (e) { /* ignore */ }
+        try { await stopDataSourceMaintenance({ backup: true, reason: 'shutdown' }); } catch (e) {
+            console.error('[Shutdown] 退出备份失败:', e.message);
+        }
         try { wsServer.close(); } catch (e) { /* ignore */ }
         if (global.wsServer === wsServer) global.wsServer = null;
         httpServer.close();
         try {
-            await stopDatabaseMaintenance({ backup: true, reason: 'shutdown' });
+            // 正常退出备份已由 dataSources 按用户勾选的数据库和触发规则统一执行，避免主库重复备份。
+            await stopDatabaseMaintenance({ backup: false, reason: 'shutdown' });
             await closeDb();
             clearTimeout(forceExit);
             process.exit(0);
