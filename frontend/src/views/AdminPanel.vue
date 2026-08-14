@@ -1203,8 +1203,18 @@ const models = ref([])
 const modelPreviewRef = ref(null)
 const modelFileInputRef = ref(null)
 const selectedModelFile = ref(null)
-const selectedPreviewModelId = ref('')
-const modelPreviewMode = ref('asset')
+const MODEL_LIBRARY_STEPS = [
+    { key: 'library', label: '模型资产', description: '选择已有模型并查看交付状态' },
+    { key: 'import', label: '导入模型', description: '上传 GLB / GLTF 并填写基础信息' },
+    { key: 'optimization', label: '优化与验收', description: '优化材质、规范并发布模型' },
+    { key: 'bindings', label: '部位绑定', description: '把模型节点绑定到实时点位' }
+]
+const modelLibraryStep = ref(
+    MODEL_LIBRARY_STEPS.some(step => step.key === storedAdminUiState.modelLibraryStep)
+        ? storedAdminUiState.modelLibraryStep
+        : 'library'
+)
+const selectedPreviewModelId = ref(storedAdminUiState.selectedPreviewModelId || '')
 const modelPreviewStatus = ref('选择模型文件后在这里预览')
 const modelUploading = ref(false)
 const isModelPreviewActive = ref(false)
@@ -1469,6 +1479,19 @@ function countUnresolvedModelBindings() {
 
 const activePreviewModel = computed(() => getActivePreviewModel())
 const canEditModelBindings = computed(() => !!activePreviewModel.value?.file_path && !activePreviewModel.value?.is_builtin)
+
+function modelLibraryStepRequiresModel(step) {
+    return step === 'optimization' || step === 'bindings'
+}
+
+async function selectModelLibraryStep(step) {
+    if (!MODEL_LIBRARY_STEPS.some(item => item.key === step)) return
+    if (modelLibraryStepRequiresModel(step) && !activePreviewModel.value) return
+    modelLibraryStep.value = step
+    await nextTick()
+    await renderSelectedModelPreview()
+}
+
 const modelOptimizationEstimate = computed(() => {
     if (modelOptimization.mode === 'off') return '已关闭：模型将按原始节点逐个渲染'
     const meshes = Math.max(0, Number(modelPreviewStats.meshCount) || 0)
@@ -1612,6 +1635,16 @@ const modelReleaseHistory = computed(() => {
 
 async function loadModels() {
     models.value = await adminApi.getModels()
+    if (selectedPreviewModelId.value && !getActivePreviewModel()) {
+        selectedPreviewModelId.value = ''
+        modelPreviewModel = null
+        if (modelLibraryStepRequiresModel(modelLibraryStep.value)) modelLibraryStep.value = 'library'
+    }
+    const selected = getActivePreviewModel()
+    if (selected && !modelPreviewModel) {
+        modelPreviewModel = selected
+        loadModelBindingState(selected)
+    }
 }
 
 function makeModelIdFromFileName(fileName) {
@@ -2381,12 +2414,6 @@ async function renderSelectedModelPreview() {
     })
 }
 
-async function setModelPreviewMode(mode) {
-    if (modelPreviewMode.value === mode) return
-    modelPreviewMode.value = mode
-    await renderSelectedModelPreview()
-}
-
 function parseModelMetadata(model) {
     if (!model?.metadata) return {}
     if (typeof model.metadata === 'object') return { ...model.metadata }
@@ -2877,9 +2904,9 @@ function resetModelImportForm(file) {
 async function selectModelFile(event) {
     const file = event.target.files[0]
     if (!file) return
+    modelLibraryStep.value = 'import'
     selectedPreviewModelId.value = ''
     modelPreviewModel = null
-    modelPreviewMode.value = 'asset'
     modelPartBindings.value = []
     modelBindingStatus.value = '待上传模型可先预览节点，上传入库后再保存部位绑定'
     resetModelBindingForm()
@@ -2931,9 +2958,13 @@ async function uploadModel() {
         const result = await adminApi.uploadModel(fd)
         if (result?.error) return alert(result.error, { title: '上传模型失败', type: 'danger' })
         if (!result?.success) return alert('上传模型失败：后端没有返回成功状态', { title: '上传模型失败', type: 'danger' })
-        await loadModels()
+        const uploadedId = modelImportForm.id
         const uploadedName = modelImportForm.name
         clearSelectedModelFile()
+        await loadModels()
+        const uploadedModel = models.value.find(model => model.id === uploadedId)
+        if (uploadedModel) await previewExistingModel(uploadedModel)
+        await selectModelLibraryStep('optimization')
         modelPreviewStatus.value = `已上传：${uploadedName}`
         await alert(`模型「${uploadedName}」已上传`, { title: '上传成功', type: 'success' })
     } finally {
@@ -2973,6 +3004,7 @@ async function deleteModel(id) {
             Object.assign(modelAssetSpec, { ...defaultModelAssetSpec })
             resetModelBindingForm()
             disposeModelPreview({ revokeObjectUrl: true })
+            if (modelLibraryStepRequiresModel(modelLibraryStep.value)) modelLibraryStep.value = 'library'
         }
 
         await loadModels()
@@ -4203,6 +4235,9 @@ watch(activeTab, async (tab) => {
         scheduleNativeScenePreview({ source: 'spatial', includeLayout: true })
     }
     if (tab === 'models') {
+        if (modelLibraryStepRequiresModel(modelLibraryStep.value) && !activePreviewModel.value) {
+            modelLibraryStep.value = 'library'
+        }
         await nextTick()
         await renderSelectedModelPreview()
     } else {
@@ -4239,6 +4274,8 @@ watch([
     selectedWorkshopEditorId,
     workshopManagementStep,
     workshopMapSelectedLineId,
+    modelLibraryStep,
+    selectedPreviewModelId,
     selectedWidgetPreviewId,
     isLinePlannerEditorCollapsed,
     isLineDevicePoolCollapsed,
@@ -4260,6 +4297,8 @@ watch([
         selectedWorkshopEditorId: selectedWorkshopEditorId.value,
         workshopManagementStep: workshopManagementStep.value,
         workshopMapSelectedLineId: workshopMapSelectedLineId.value,
+        modelLibraryStep: modelLibraryStep.value,
+        selectedPreviewModelId: selectedPreviewModelId.value,
         selectedWidgetPreviewId: selectedWidgetPreviewId.value,
         isLinePlannerEditorCollapsed: isLinePlannerEditorCollapsed.value,
         isLineDevicePoolCollapsed: isLineDevicePoolCollapsed.value,
@@ -6788,10 +6827,37 @@ const mainTabs = [
                 <!-- ======== 模型库 ======== -->
                 <div v-if="activeTab === 'models'" class="tab-content">
                     <h2>3D 模型库</h2>
-                    <p class="desc">上传 <code>.glb</code> 格式的 3D 模型文件。设备可选择使用上传的自定义模型或内置默认模型。</p>
+                    <p class="desc">按资产选择、导入、优化验收和部位绑定的顺序管理模型；切换步骤时当前模型和未保存表单会继续保留。</p>
+
+                    <div class="secondary-page-nav-shell model-step-nav-shell">
+                        <nav class="secondary-page-nav" aria-label="模型库操作步骤">
+                            <button
+                                v-for="(step, index) in MODEL_LIBRARY_STEPS"
+                                :key="step.key"
+                                type="button"
+                                class="secondary-page-nav-item"
+                                :class="{ active: modelLibraryStep === step.key }"
+                                :disabled="modelLibraryStepRequiresModel(step.key) && !activePreviewModel"
+                                :aria-current="modelLibraryStep === step.key ? 'step' : undefined"
+                                @click="selectModelLibraryStep(step.key)"
+                            >
+                                <span class="secondary-page-number">{{ String(index + 1).padStart(2, '0') }}</span>
+                                <span class="secondary-page-copy">
+                                    <strong>{{ step.label }}</strong>
+                                    <small>{{ step.description }}</small>
+                                </span>
+                                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7.5 4.75 5.25 5.25-5.25 5.25" /></svg>
+                            </button>
+                        </nav>
+                    </div>
 
                     <div class="model-library-layout">
                         <section class="model-library-main">
+                            <section v-show="modelLibraryStep === 'import'" class="model-library-step-panel">
+                                <div class="model-step-heading">
+                                    <div><h3>导入新模型</h3><p>支持 GLB / GLTF。选择文件后可先在右侧检查模型，再决定是否上传入库。</p></div>
+                                    <span>可选步骤</span>
+                                </div>
                             <div class="upload-area">
                                 <label class="btn btn-primary" style="cursor:pointer">
                                     📂 选择 .glb/.gltf 文件
@@ -6812,7 +6878,13 @@ const mainTabs = [
                                     <button class="btn" type="button" @click="clearSelectedModelFile" :disabled="modelUploading">取消</button>
                                 </div>
                             </div>
+                            </section>
 
+                            <section v-show="modelLibraryStep === 'library'" class="model-library-step-panel">
+                                <div class="model-step-heading">
+                                    <div><h3>已有模型资产</h3><p>先选择需要查看或配置的模型，再进入优化验收或部位绑定。</p></div>
+                                    <span>{{ models.length }} 个模型</span>
+                                </div>
                             <table class="data-table model-table">
                                 <thead>
                                     <tr><th>ID</th><th>名称</th><th>交付状态</th><th>绑定数</th><th>文件路径</th><th>操作</th></tr>
@@ -6836,8 +6908,14 @@ const mainTabs = [
                                     </tr>
                                 </tbody>
                             </table>
+                                <div v-if="activePreviewModel" class="model-selection-actions">
+                                    <div><span>当前模型</span><strong>{{ activePreviewModel.name || activePreviewModel.id }}</strong></div>
+                                    <button class="btn" type="button" @click="selectModelLibraryStep('optimization')">优化与验收</button>
+                                    <button class="btn btn-primary" type="button" @click="selectModelLibraryStep('bindings')">部位绑定</button>
+                                </div>
+                            </section>
 
-                            <section class="model-asset-governance" v-if="activePreviewModel">
+                            <section v-if="activePreviewModel" v-show="modelLibraryStep === 'optimization'" class="model-asset-governance model-library-step-panel">
                                 <div class="model-binding-header">
                                     <div>
                                         <h3>模型资产规范</h3>
@@ -6971,7 +7049,7 @@ const mainTabs = [
                                 </template>
                             </section>
 
-                            <section class="model-binding-editor" v-if="activePreviewModel">
+                            <section v-if="activePreviewModel" v-show="modelLibraryStep === 'bindings'" class="model-binding-editor model-library-step-panel">
                                 <div class="model-binding-header">
                                     <div>
                                         <h3>部位与点位绑定</h3>
@@ -7081,18 +7159,7 @@ const mainTabs = [
                                     <strong>模型预览</strong>
                                     <span>{{ selectedModelFile ? '待上传模型' : selectedPreviewModelId || '未选择' }}</span>
                                 </div>
-                                <div class="model-preview-mode-toggle" aria-label="模型预览模式">
-                                    <button
-                                        type="button"
-                                        :class="{ active: modelPreviewMode === 'asset' }"
-                                        @click="setModelPreviewMode('asset')"
-                                    >模型预览</button>
-                                    <button
-                                        type="button"
-                                        :class="{ active: modelPreviewMode === 'bindings' }"
-                                        @click="setModelPreviewMode('bindings')"
-                                    >部位绑定</button>
-                                </div>
+                                <span class="model-preview-mode-badge">{{ modelLibraryStep === 'bindings' ? '绑定预览' : '模型预览' }}</span>
                             </div>
                             <div ref="modelPreviewRef" class="model-preview-stage">
                                 <div v-if="!isModelPreviewActive" class="model-preview-empty">选择文件或点击模型列表</div>
@@ -11620,6 +11687,17 @@ button:enabled:active {
 .model-library-main {
     min-width: 0;
 }
+.model-step-nav-shell .secondary-page-nav-item:disabled { color: #a1a1a6; background: rgba(248, 248, 250, .72); border-color: rgba(0, 0, 0, .035); box-shadow: none; cursor: not-allowed; opacity: .62; transform: none; }
+.model-step-nav-shell .secondary-page-nav-item:disabled:hover { color: #a1a1a6; background: rgba(248, 248, 250, .72); border-color: rgba(0, 0, 0, .035); box-shadow: none; transform: none; }
+.model-library-step-panel { animation: secondary-page-in 180ms cubic-bezier(.22, 1, .36, 1); }
+.model-step-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid rgba(0, 0, 0, .07); }
+.model-step-heading h3 { margin: 0; color: #1d1d1f; font-size: 17px; }
+.model-step-heading p { margin: 5px 0 0; color: #6e6e73; font-size: 12px; line-height: 1.55; }
+.model-step-heading > span { flex: 0 0 auto; padding: 5px 9px; color: #6e6e73; background: #f2f2f4; border-radius: 999px; font-size: 10px; }
+.model-selection-actions { display: flex; align-items: center; justify-content: flex-end; gap: 9px; margin-top: 14px; padding: 12px; background: #f7f7f9; border: 1px solid rgba(0, 0, 0, .055); border-radius: 10px; }
+.model-selection-actions > div { display: flex; min-width: 0; margin-right: auto; flex-direction: column; gap: 2px; }
+.model-selection-actions span { color: #86868b; font-size: 10px; }
+.model-selection-actions strong { overflow: hidden; color: #1d1d1f; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .model-library-layout .upload-area {
     display: flex;
     align-items: center;
@@ -11704,6 +11782,8 @@ button:enabled:active {
     border-radius: 12px;
     background: #ffffff;
 }
+.model-asset-governance.model-library-step-panel,
+.model-binding-editor.model-library-step-panel { margin-top: 0; }
 .model-governance-actions {
     display: flex;
     gap: 10px;
@@ -12030,30 +12110,7 @@ button:enabled:active {
     white-space: nowrap;
     text-overflow: ellipsis;
 }
-.model-preview-mode-toggle {
-    flex: 0 0 auto;
-    display: inline-flex;
-    align-items: center;
-    padding: 3px;
-    border-radius: 8px;
-    background: #f0f2f4;
-    border: 1px solid rgba(0, 0, 0, 0.08);
-}
-.model-preview-mode-toggle button {
-    min-width: 68px;
-    height: 28px;
-    border: 0;
-    border-radius: 6px;
-    background: transparent;
-    color: #515154;
-    font-size: 12px;
-    cursor: pointer;
-}
-.model-preview-mode-toggle button.active {
-    color: #1d1d1f;
-    background: #ffffff;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
-}
+.model-preview-mode-badge { flex: 0 0 auto; padding: 6px 9px; color: #515154; background: #f0f2f4; border: 1px solid rgba(0, 0, 0, .07); border-radius: 8px; font-size: 11px; font-weight: 600; }
 .model-preview-stage {
     position: relative;
     height: 360px;
