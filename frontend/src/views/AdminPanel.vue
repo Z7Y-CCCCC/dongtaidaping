@@ -82,6 +82,13 @@ function requestUnityHostAction(action) {
     postUnityHostMessage({ type: 'host_action', action })
 }
 
+function handleUnityChromeDoubleClick(event) {
+    if (event.button !== 0) return
+    if (event.target?.closest?.('.unity-browser-tab, .unity-window-actions')) return
+    unityHostDragActive = false
+    requestUnityHostAction('maximize')
+}
+
 function beginUnityHostDrag(event, target = 'admin') {
     if (event.button !== 0) return
     if (!unityHostState.attached) {
@@ -5268,6 +5275,7 @@ const mainTabs = [
             @pointerup="endUnityHostDrag"
             @pointercancel="endUnityHostDrag"
             @lostpointercapture="endUnityHostDrag"
+            @dblclick="handleUnityChromeDoubleClick"
         >
             <div
                 class="unity-tab-strip"
@@ -8318,6 +8326,7 @@ const mainTabs = [
     display: flex;
     align-items: center;
     align-self: flex-start;
+    margin-top: -6px;
     margin-left: 8px;
 }
 .unity-window-action {

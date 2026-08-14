@@ -22,6 +22,7 @@ internal static class NativeMethods
     internal const long WsExToolWindow = 0x00000080L;
 
     internal const uint SwHide = 0;
+    internal const uint SwMaximize = 3;
     internal const uint SwShow = 5;
     internal const uint SwMinimize = 6;
     internal const uint SwRestore = 9;
@@ -108,6 +109,9 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern bool IsIconic(IntPtr handle);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool IsZoomed(IntPtr handle);
 
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern bool SetWindowPos(

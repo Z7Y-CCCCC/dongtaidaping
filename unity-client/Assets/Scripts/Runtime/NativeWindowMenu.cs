@@ -32,6 +32,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private const uint MonitorDefaultToNearest = 0x00000002;
         private const uint SwpFrameChanged = 0x0020;
         private const uint SwpShowWindow = 0x0040;
+        private const int SwMaximize = 3;
         private const int DwmWindowCornerPreference = 33;
         private const int DwmWindowCornerDoNotRound = 1;
         private const int DwmWindowCornerRound = 2;
@@ -81,6 +82,12 @@ namespace HeatTreatment.DigitalTwin.Runtime
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool GetWindowRect(IntPtr window, out NativeRect rect);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool IsZoomed(IntPtr window);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool ShowWindow(IntPtr window, int command);
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool SetWindowPos(
@@ -147,6 +154,19 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 if (_installed) break;
                 yield return null;
             }
+            // Unity may restore its serialized window size a few frames after the
+            // native borderless style is installed. Retry briefly during startup
+            // so the standard Windows maximized state wins reliably.
+            if (_installed && _maximizeOnStart)
+            {
+                var maximizeDeadline = Time.realtimeSinceStartup + 3f;
+                while (Time.realtimeSinceStartup < maximizeDeadline && !IsZoomed(_windowHandle))
+                {
+                    ShowWindow(_windowHandle, SwMaximize);
+                    yield return new WaitForSecondsRealtime(0.15f);
+                }
+                RefreshWindowCorners(true);
+            }
 #else
             yield break;
 #endif
@@ -189,23 +209,19 @@ namespace HeatTreatment.DigitalTwin.Runtime
             SetMenu(_windowHandle, IntPtr.Zero);
             DrawMenuBar(_windowHandle);
 
-            var target = originalBounds;
-            if (_maximizeOnStart)
-            {
-                var monitor = MonitorFromWindow(_windowHandle, MonitorDefaultToNearest);
-                var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
-                if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info)) target = info.WorkArea;
-            }
-
+            // Commit the new borderless/thick-frame style before maximizing.
+            // Windows can then compensate its invisible resize border so the
+            // client area reaches every edge of the monitor work area.
             SetWindowPos(
                 _windowHandle,
                 HwndTop,
-                target.Left,
-                target.Top,
-                Math.Max(1, target.Width),
-                Math.Max(1, target.Height),
+                originalBounds.Left,
+                originalBounds.Top,
+                Math.Max(1, originalBounds.Width),
+                Math.Max(1, originalBounds.Height),
                 SwpFrameChanged | SwpShowWindow
             );
+            if (_maximizeOnStart) ShowWindow(_windowHandle, SwMaximize);
             _installed = true;
             RefreshWindowCorners(true);
             Debug.Log("[NativeWindowMenu] Borderless application shell installed; F10 opens the admin tab.");
@@ -214,16 +230,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private void RefreshWindowCorners(bool force)
         {
             if (_windowHandle == IntPtr.Zero || !GetWindowRect(_windowHandle, out var bounds)) return;
-            var monitor = MonitorFromWindow(_windowHandle, MonitorDefaultToNearest);
-            var maximized = false;
-            var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
-            if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info))
-            {
-                maximized = Math.Abs(bounds.Left - info.WorkArea.Left) <= 2
-                    && Math.Abs(bounds.Top - info.WorkArea.Top) <= 2
-                    && Math.Abs(bounds.Right - info.WorkArea.Right) <= 2
-                    && Math.Abs(bounds.Bottom - info.WorkArea.Bottom) <= 2;
-            }
+            var maximized = IsZoomed(_windowHandle);
 
             if (!force
                 && bounds.Width == _lastCornerWidth

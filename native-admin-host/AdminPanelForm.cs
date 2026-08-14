@@ -520,8 +520,7 @@ internal sealed class AdminPanelForm : Form
         if (!NativeMethods.GetWindowRect(_parentHandle, out var rect)) return;
         var current = rect.ToRectangle();
         if (current.Width <= 0 || current.Height <= 0) return;
-        var workingArea = Screen.FromHandle(_parentHandle).WorkingArea;
-        var maximized = RectanglesNearlyEqual(current, workingArea);
+        var maximized = NativeMethods.IsZoomed(_parentHandle);
         if (!maximized) _parentRestoreBounds = current;
         if (_parentMaximized == maximized) return;
         _parentMaximized = maximized;
@@ -577,16 +576,8 @@ internal sealed class AdminPanelForm : Form
         if (!NativeMethods.GetWindowRect(_parentHandle, out var rect)) return;
         var current = rect.ToRectangle();
         var workingArea = Screen.FromHandle(_parentHandle).WorkingArea;
-        _parentMaximized = RectanglesNearlyEqual(current, workingArea);
+        _parentMaximized = NativeMethods.IsZoomed(_parentHandle);
         _parentRestoreBounds = _parentMaximized ? GetDefaultParentRestoreBounds(workingArea) : current;
-    }
-
-    private static bool RectanglesNearlyEqual(Rectangle left, Rectangle right)
-    {
-        return Math.Abs(left.Left - right.Left) <= 3
-            && Math.Abs(left.Top - right.Top) <= 3
-            && Math.Abs(left.Width - right.Width) <= 6
-            && Math.Abs(left.Height - right.Height) <= 6;
     }
 
     private static Rectangle GetDefaultParentRestoreBounds(Rectangle workingArea)
@@ -605,34 +596,29 @@ internal sealed class AdminPanelForm : Form
     {
         if (!TryResolveParentWindow()) return;
         var workingArea = Screen.FromHandle(_parentHandle).WorkingArea;
-        if (!_parentMaximized)
+        var maximized = NativeMethods.IsZoomed(_parentHandle);
+        if (!maximized)
         {
             if (NativeMethods.GetWindowRect(_parentHandle, out var rect)) _parentRestoreBounds = rect.ToRectangle();
-            NativeMethods.SetWindowPos(
-                _parentHandle,
-                NativeMethods.HwndTop,
-                workingArea.Left,
-                workingArea.Top,
-                workingArea.Width,
-                workingArea.Height,
-                NativeMethods.SwpFrameChanged | NativeMethods.SwpShowWindow
-            );
+            NativeMethods.ShowWindow(_parentHandle, NativeMethods.SwMaximize);
             _parentMaximized = true;
         }
         else
         {
-            var restore = _parentRestoreBounds.Width > 0
-                ? _parentRestoreBounds
-                : GetDefaultParentRestoreBounds(workingArea);
-            NativeMethods.SetWindowPos(
-                _parentHandle,
-                NativeMethods.HwndTop,
-                restore.Left,
-                restore.Top,
-                restore.Width,
-                restore.Height,
-                NativeMethods.SwpFrameChanged | NativeMethods.SwpShowWindow
-            );
+            NativeMethods.ShowWindow(_parentHandle, NativeMethods.SwRestore);
+            if (_parentRestoreBounds.Width <= 0)
+            {
+                var restore = GetDefaultParentRestoreBounds(workingArea);
+                NativeMethods.SetWindowPos(
+                    _parentHandle,
+                    NativeMethods.HwndTop,
+                    restore.Left,
+                    restore.Top,
+                    restore.Width,
+                    restore.Height,
+                    NativeMethods.SwpFrameChanged | NativeMethods.SwpShowWindow
+                );
+            }
             _parentMaximized = false;
         }
         BeginInvoke(() => MaintainParentWindow());
@@ -1356,6 +1342,7 @@ internal sealed class AdminPanelForm : Form
                 : 0.5d;
             var gripX = (int)Math.Round(restore.Width * horizontalRatio);
             var gripY = Math.Clamp(screenY - currentBounds.Top, 0, GetParentChromeHeightPixels() - 1);
+            NativeMethods.ShowWindow(_parentHandle, NativeMethods.SwRestore);
             currentBounds = new Rectangle(screenX - gripX, screenY - gripY, restore.Width, restore.Height);
             NativeMethods.SetWindowPos(
                 _parentHandle,
@@ -1380,8 +1367,7 @@ internal sealed class AdminPanelForm : Form
         if (NativeMethods.GetWindowRect(_parentHandle, out var movedRect))
         {
             var moved = movedRect.ToRectangle();
-            var workingArea = Screen.FromHandle(_parentHandle).WorkingArea;
-            _parentMaximized = RectanglesNearlyEqual(moved, workingArea);
+            _parentMaximized = NativeMethods.IsZoomed(_parentHandle);
             if (!_parentMaximized) _parentRestoreBounds = moved;
         }
         _dashboardChrome?.UpdateState(_parentMaximized);
@@ -1446,6 +1432,7 @@ internal sealed class AdminPanelForm : Form
         var gripY = Math.Clamp(_dragStart.Y - currentBounds.Top, 0, GetParentChromeHeightPixels() - 1);
         _dragStartBounds = new Rectangle(screenX - gripX, screenY - gripY, restore.Width, restore.Height);
         _dragPointerOffset = new Point(gripX, gripY);
+        NativeMethods.ShowWindow(_parentHandle, NativeMethods.SwRestore);
         NativeMethods.SetWindowPos(
             _parentHandle,
             NativeMethods.HwndTop,

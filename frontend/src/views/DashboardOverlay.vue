@@ -10,6 +10,8 @@ const rootRef = ref(null)
 const selectedWidgetId = ref('')
 const hostConnected = ref(false)
 const lineReturnBusy = ref(false)
+const navigationRootReady = ref(false)
+const childNavigationEntered = ref(false)
 const databaseValues = reactive({})
 const runtimeContext = reactive({ viewId: 'factory_overview', viewMode: 'factory', sceneReady: false, sceneId: '', workshopId: '', lineId: '', deviceId: '' })
 const groupVisibility = reactive({})
@@ -48,6 +50,7 @@ const defaultViewId = computed(() => platform.value.document?.scene?.defaultView
     || platform.value.activeScene?.defaultViewId
     || 'factory_overview')
 const canReturnToParentView = computed(() => {
+    if (!childNavigationEntered.value) return false
     if (runtimeContext.sceneReady === false) return false
     const mode = String(runtimeContext.viewMode || currentView.value?.mode || 'factory').toLowerCase()
     if (mode === 'factory' || runtimeContext.viewId === defaultViewId.value) return false
@@ -57,6 +60,30 @@ const canReturnToParentView = computed(() => {
     if (mode === 'workshop') return Boolean(runtimeContext.workshopId || currentView.value?.targetId)
     return true
 })
+
+function runtimeContextIsRoot() {
+    const configuredMode = dashboardViews.value.find(view => view.id === runtimeContext.viewId)?.mode
+    const mode = String(runtimeContext.viewMode || configuredMode || 'factory').toLowerCase()
+    return mode === 'factory' || runtimeContext.viewId === defaultViewId.value
+}
+
+function applyRuntimeContext(payload, { userNavigation = false } = {}) {
+    if (!payload || typeof payload !== 'object') return
+    Object.assign(runtimeContext, payload)
+    if (!Object.prototype.hasOwnProperty.call(payload, 'sceneReady')) runtimeContext.sceneReady = true
+
+    if (runtimeContextIsRoot()) {
+        childNavigationEntered.value = false
+        if (runtimeContext.sceneReady !== false) navigationRootReady.value = true
+        return
+    }
+
+    // 启动时后端可能短暂重放上次的下级视角。只有本次会话已经收到
+    // Unity 的总览就绪状态，或操作由用户在当前画面主动触发，才显示返回键。
+    if (userNavigation || (navigationRootReady.value && runtimeContext.sceneReady !== false)) {
+        childNavigationEntered.value = true
+    }
+}
 const parentViewName = computed(() => {
     const parentId = currentView.value?.returnViewId || currentView.value?.parentViewId
     return dashboardViews.value.find(view => view.id === parentId)?.name || '上一级视角'
@@ -272,13 +299,14 @@ function eventQueryConfig() {
 
 async function focusNativeScene(mode, event = {}) {
     const configuredView = viewFor(mode, event.viewId)
-    Object.assign(runtimeContext, {
+    const nextContext = {
         viewId: configuredView?.id || event.viewId || runtimeContext.viewId,
         viewMode: mode,
         deviceId: mode === 'device' ? (event.deviceId || '') : '',
         lineId: mode === 'line' ? (event.lineId || runtimeContext.lineId || '') : (mode === 'device' ? runtimeContext.lineId : ''),
         workshopId: mode === 'workshop' ? (event.workshopId || '') : (['line', 'device'].includes(mode) ? runtimeContext.workshopId : '')
-    })
+    }
+    Object.assign(runtimeContext, nextContext)
     try {
         const response = await fetch(`${API_BASE}/native-preview`, {
             method: 'POST',
@@ -295,6 +323,7 @@ async function focusNativeScene(mode, event = {}) {
                 }
             })
         })
+        if (response.ok) applyRuntimeContext(nextContext, { userNavigation: true })
         return response.ok
     } catch {
         // Unity 不在线时不影响数据组件本身。
@@ -311,13 +340,14 @@ function viewFor(mode, viewId = '') {
 async function focusNativeView(viewId, event = {}) {
     const view = viewFor(event.mode || 'factory', viewId)
     const mode = view?.mode === 'custom' ? (view.targetType || 'factory') : (view?.mode || event.mode || 'factory')
-    Object.assign(runtimeContext, {
+    const nextContext = {
         viewId: view?.id || viewId || runtimeContext.viewId,
         viewMode: mode,
         deviceId: mode === 'device' ? (event.deviceId || view?.targetId || '') : '',
         lineId: mode === 'line' ? (event.lineId || view?.targetId || runtimeContext.lineId || '') : (mode === 'device' ? runtimeContext.lineId : ''),
         workshopId: mode === 'workshop' ? (event.workshopId || view?.targetId || '') : (['line', 'device'].includes(mode) ? runtimeContext.workshopId : '')
-    })
+    }
+    Object.assign(runtimeContext, nextContext)
     try {
         const response = await fetch(API_BASE + '/native-preview', {
             method: 'POST',
@@ -334,6 +364,7 @@ async function focusNativeView(viewId, event = {}) {
                 }
             })
         })
+        if (response.ok) applyRuntimeContext(nextContext, { userNavigation: true })
         return response.ok
     } catch {
         return false
@@ -389,8 +420,7 @@ function handleWidgetAction({ event }) {
 async function handleRuntimeMessage(message) {
     if (message?.type === 'dashboard_context_changed') {
         const payload = message.payload || {}
-        Object.assign(runtimeContext, payload)
-        if (!Object.prototype.hasOwnProperty.call(payload, 'sceneReady')) runtimeContext.sceneReady = true
+        applyRuntimeContext(payload)
         scheduleRegionReport()
         return
     }
@@ -410,8 +440,7 @@ function handleHostMessage(event) {
     if (event.data?.type !== 'overlay_host_state') return
     hostConnected.value = event.data.visible !== false
     if (event.data.context) {
-        Object.assign(runtimeContext, event.data.context)
-        if (!Object.prototype.hasOwnProperty.call(event.data.context, 'sceneReady')) runtimeContext.sceneReady = true
+        applyRuntimeContext(event.data.context)
     }
     scheduleRegionReport()
 }

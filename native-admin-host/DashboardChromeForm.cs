@@ -135,7 +135,7 @@ internal sealed class DashboardChromeForm : Form
             var actionWidth = ScaleMetric(40);
             return new Rectangle(
                 Math.Max(0, Width - actionWidth * distanceFromRight - ScaleMetric(6)),
-                ScaleMetric(7),
+                0,
                 actionWidth,
                 ScaleMetric(32)
             );
@@ -276,6 +276,11 @@ internal sealed class DashboardChromeForm : Form
             base.OnMouseDown(e);
             if (e.Button != MouseButtons.Left || IsInteractiveZone(e.Location)) return;
             var pointer = Cursor.Position;
+            if (e.Clicks >= 2)
+            {
+                _action("maximize", pointer.X, pointer.Y);
+                return;
+            }
             _action("move_parent_native", pointer.X, pointer.Y);
         }
 
