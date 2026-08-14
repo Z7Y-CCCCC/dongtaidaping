@@ -48,8 +48,31 @@ function Invoke-CheckedCommand {
     )
 
     Write-Host "`n[$Label]" -ForegroundColor Cyan
-    & $Executable @ArgumentList 2>&1 | Tee-Object -LiteralPath $script:buildLogPath -Append
-    $exitCode = $LASTEXITCODE
+    if ($script:transcriptStarted) {
+        Stop-Transcript | Out-Null
+        $script:transcriptStarted = $false
+    }
+    $exitCode = 0
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 wraps native stderr lines (including harmless
+        # Vite/electron-builder warnings) as ErrorRecord objects.  Do not let
+        # those records abort the pipeline; the native exit code remains the
+        # authoritative success/failure signal.
+        $ErrorActionPreference = 'Continue'
+        & $Executable @ArgumentList 2>&1 |
+            ForEach-Object { Write-Host $_; $_ } |
+            Out-File -FilePath $script:buildLogPath -Append -Encoding UTF8 -ErrorAction Stop
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        try {
+            Start-Transcript -LiteralPath $script:buildLogPath -Append | Out-Null
+            $script:transcriptStarted = $true
+        } catch {
+            Write-Host "无法继续写入 PowerShell 构建日志：$($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
     if ($exitCode -ne 0) {
         throw "$Label 失败（退出码 $exitCode）。"
     }
