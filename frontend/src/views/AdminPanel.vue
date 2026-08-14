@@ -371,8 +371,23 @@ function getDbStatusBadgeClass(statusText) {
 // ============ 车间管理 ============
 const workshops = ref([])
 const newWorkshop = reactive({ id: '', name: '' })
-const selectedWorkshopEditorId = ref('')
+const selectedWorkshopEditorId = ref(storedAdminUiState.selectedWorkshopEditorId || '')
 const workshopSavingId = ref('')
+const workshopManagementSteps = [
+    { key: 'list', number: '01', title: '车间列表', description: '新增、选择与管理车间' },
+    { key: 'space', number: '02', title: '空间与边界', description: '设置世界位置和车间尺寸' },
+    { key: 'layout', number: '03', title: '产线布局', description: '按比例拖动并查看产线间距' }
+]
+const workshopManagementStep = ref(
+    workshopManagementSteps.some(step => step.key === storedAdminUiState.workshopManagementStep)
+        ? storedAdminUiState.workshopManagementStep
+        : 'list'
+)
+const workshopMapStageRef = ref(null)
+const workshopMapSelectedLineId = ref(storedAdminUiState.workshopMapSelectedLineId || '')
+const workshopMapDraggingLineId = ref('')
+const workshopMapSaving = ref(false)
+let workshopMapDragState = null
 
 function normalizeWorkshopRecord(workshop) {
     const layout = normalizeWorkshopLayout(workshop?.layout || workshop?.layout_json)
@@ -398,6 +413,26 @@ async function loadWorkshops() {
     if (!workshops.value.some(workshop => workshop.id === selectedWorkshopEditorId.value)) {
         selectedWorkshopEditorId.value = workshops.value[0]?.id || ''
     }
+    if (!workshops.value.length) workshopManagementStep.value = 'list'
+}
+
+function selectWorkshopManagementStep(step) {
+    if (!workshopManagementSteps.some(item => item.key === step)) return
+    if (step !== 'list' && !selectedWorkshopEditor.value) return
+    workshopManagementStep.value = step
+    if (step === 'space') {
+        nextTick(() => scheduleNativeScenePreview({ source: 'spatial', includeLayout: true }))
+    }
+    if (step === 'layout') {
+        ensureWorkshopMapLineSelection()
+        nextTick(() => scheduleNativeScenePreview({ source: 'spatial', includeLayout: true }))
+    }
+}
+
+function openWorkshopManagementStep(workshop, step = 'space') {
+    if (!workshop?.id) return
+    selectedWorkshopEditorId.value = workshop.id
+    selectWorkshopManagementStep(step)
 }
 
 async function createWorkshop() {
@@ -419,10 +454,13 @@ async function createWorkshop() {
     })
     if (result?.error) return alert(result.error, { title: '新增车间失败', type: 'danger' })
     if (!result?.success) return alert('新增车间失败：后端没有返回成功状态', { title: '新增车间失败', type: 'danger' })
+    const createdId = newWorkshop.id
     const createdName = newWorkshop.name
     newWorkshop.id = ''
     newWorkshop.name = ''
     await loadWorkshops()
+    selectedWorkshopEditorId.value = createdId
+    selectWorkshopManagementStep('space')
     await alert(`车间「${createdName}」已创建`, { title: '新增成功', type: 'success' })
 }
 
@@ -470,6 +508,7 @@ async function deleteWorkshop(id) {
     await loadWorkshops()
     await loadLines()
     await loadDevices()
+    workshopManagementStep.value = 'list'
     await alert(`车间「${confirmation.targetName}」已删除`, { title: '删除成功', type: 'success' })
 }
 
@@ -4129,6 +4168,10 @@ watch([lines, devices, selectedLineEditorId], () => {
     }
 }, { deep: true })
 
+watch([selectedWorkshopEditorId, lines], () => {
+    ensureWorkshopMapLineSelection()
+}, { deep: true })
+
 watch(() => composerDraft.line_id, (lineId) => {
     if (lineId && selectedComposerLineId.value !== lineId) {
         selectedComposerLineId.value = lineId
@@ -4181,6 +4224,11 @@ watch(activeTab, async (tab) => {
         await nextTick()
         scheduleNativeScenePreview({ source: 'lines', includeLayout: true })
     }
+    if (tab === 'workshops') {
+        ensureWorkshopMapLineSelection()
+        await nextTick()
+        scheduleNativeScenePreview({ source: 'spatial', includeLayout: true })
+    }
     if (tab === 'models') {
         await nextTick()
         await renderSelectedModelPreview()
@@ -4215,6 +4263,9 @@ watch([
     selectedDeviceForMonitor,
     pointMonitorAutoRefresh,
     selectedLineEditorId,
+    selectedWorkshopEditorId,
+    workshopManagementStep,
+    workshopMapSelectedLineId,
     selectedWidgetPreviewId,
     isLinePlannerEditorCollapsed,
     isLineDevicePoolCollapsed,
@@ -4233,6 +4284,9 @@ watch([
         selectedDeviceForMonitor: selectedDeviceForMonitor.value,
         pointMonitorAutoRefresh: pointMonitorAutoRefresh.value,
         selectedLineEditorId: selectedLineEditorId.value,
+        selectedWorkshopEditorId: selectedWorkshopEditorId.value,
+        workshopManagementStep: workshopManagementStep.value,
+        workshopMapSelectedLineId: workshopMapSelectedLineId.value,
         selectedWidgetPreviewId: selectedWidgetPreviewId.value,
         isLinePlannerEditorCollapsed: isLinePlannerEditorCollapsed.value,
         isLineDevicePoolCollapsed: isLineDevicePoolCollapsed.value,
@@ -4272,6 +4326,10 @@ onMounted(async () => {
     nativeScenePreviewStatusTimer = setInterval(refreshAdminConnectionStatus, 3000)
     if (activeTab.value === 'composer') scheduleNativeScenePreview({ source: 'composer' })
     if (activeTab.value === 'lines') scheduleNativeScenePreview({ source: 'lines', includeLayout: true })
+    if (activeTab.value === 'workshops') {
+        ensureWorkshopMapLineSelection()
+        scheduleNativeScenePreview({ source: 'spatial', includeLayout: true })
+    }
 })
 
 onActivated(async () => {
@@ -4292,6 +4350,7 @@ onDeactivated(() => {
     if (nativeScenePreviewStatusTimer) clearInterval(nativeScenePreviewStatusTimer)
     nativeScenePreviewStatusTimer = null
     finishLinePreviewDrag()
+    finishWorkshopMapLineDrag()
     cancelLineDeviceDrag()
     cancelLineDevicePoolMove()
     stopPointMonitor()
@@ -4307,6 +4366,7 @@ onUnmounted(() => {
     stopRuntimeRefresh()
     stopCastRefresh()
     finishLinePreviewDrag()
+    finishWorkshopMapLineDrag()
     cancelLineDeviceDrag()
     cancelLineDevicePoolMove()
     stopPointMonitor()
@@ -5300,6 +5360,231 @@ const linesByWorkshop = computed(() => {
     return map
 })
 
+const selectedWorkshopMapLines = computed(() => sortByOrder(
+    lines.value.filter(line => line.workshop_id === selectedWorkshopEditor.value?.id)
+))
+
+const selectedWorkshopMapLine = computed(() => (
+    selectedWorkshopMapLines.value.find(line => line.id === workshopMapSelectedLineId.value)
+    || selectedWorkshopMapLines.value[0]
+    || null
+))
+
+function ensureWorkshopMapLineSelection() {
+    const available = selectedWorkshopMapLines.value
+    if (!available.some(line => line.id === workshopMapSelectedLineId.value)) {
+        workshopMapSelectedLineId.value = available[0]?.id || ''
+    }
+}
+
+function workshopLineFootprint(line) {
+    const layout = getLineLayout(line)
+    const tracks = [
+        ...layout.lanes.map(item => ({ ...item, type: 'lane', bandWidth: 4 })),
+        ...layout.rails.map(item => ({ ...item, type: 'rail', bandWidth: 3 }))
+    ]
+    const sourceTracks = tracks.length ? tracks : [{ id: 'default', type: 'lane', offsetZ: 0, length: 60, bandWidth: 4 }]
+    const length = Math.max(1, ...sourceTracks.map(item => numberOrDefault(item.length, 60)))
+    const minZ = Math.min(...sourceTracks.map(item => numberOrDefault(item.offsetZ, 0) - item.bandWidth / 2))
+    const maxZ = Math.max(...sourceTracks.map(item => numberOrDefault(item.offsetZ, 0) + item.bandWidth / 2))
+    return {
+        length: roundLineLayoutValue(length, 0.1),
+        width: roundLineLayoutValue(Math.max(6, maxZ - minZ), 0.1),
+        minZ,
+        maxZ,
+        tracks: sourceTracks
+    }
+}
+
+function workshopLineRotatedBounds(line) {
+    const footprint = workshopLineFootprint(line)
+    const angle = numberOrDefault(getLineLayout(line).transform.rotationY, 0) * Math.PI / 180
+    return {
+        width: Math.abs(footprint.length * Math.cos(angle)) + Math.abs(footprint.width * Math.sin(angle)),
+        depth: Math.abs(footprint.length * Math.sin(angle)) + Math.abs(footprint.width * Math.cos(angle))
+    }
+}
+
+function workshopMapLineStyle(line) {
+    const workshop = selectedWorkshopEditor.value
+    if (!workshop) return {}
+    const workshopLayout = getWorkshopLayout(workshop)
+    const width = Math.max(10, numberOrDefault(workshopLayout.size.width, 100))
+    const depth = Math.max(10, numberOrDefault(workshopLayout.size.depth, 80))
+    const lineLayout = getLineLayout(line)
+    const footprint = workshopLineFootprint(line)
+    const centerX = ((numberOrDefault(lineLayout.transform.x, 0) + width / 2) / width) * 100
+    const centerZ = ((numberOrDefault(lineLayout.transform.z, 0) + depth / 2) / depth) * 100
+    return {
+        left: `${centerX}%`,
+        top: `${centerZ}%`,
+        width: `${Math.min(160, Math.max(4, footprint.length / width * 100))}%`,
+        height: `${Math.min(160, Math.max(7, footprint.width / depth * 100))}%`,
+        transform: `translate(-50%, -50%) rotate(${numberOrDefault(lineLayout.transform.rotationY, 0)}deg)`
+    }
+}
+
+function workshopMapTrackStyle(track, line) {
+    const footprint = workshopLineFootprint(line)
+    const top = ((numberOrDefault(track.offsetZ, 0) - footprint.minZ) / Math.max(0.1, footprint.maxZ - footprint.minZ)) * 100
+    const width = Math.min(100, Math.max(6, numberOrDefault(track.length, 60) / footprint.length * 100))
+    return {
+        left: `${(100 - width) / 2}%`,
+        top: `${Math.min(96, Math.max(4, top))}%`,
+        width: `${width}%`
+    }
+}
+
+function workshopMapLineOutside(line) {
+    const workshop = selectedWorkshopEditor.value
+    if (!workshop) return false
+    const size = getWorkshopLayout(workshop).size
+    const transform = getLineLayout(line).transform
+    const bounds = workshopLineRotatedBounds(line)
+    return Math.abs(numberOrDefault(transform.x, 0)) + bounds.width / 2 > numberOrDefault(size.width, 100) / 2
+        || Math.abs(numberOrDefault(transform.z, 0)) + bounds.depth / 2 > numberOrDefault(size.depth, 80) / 2
+}
+
+const selectedWorkshopMapMetrics = computed(() => {
+    const workshop = selectedWorkshopEditor.value
+    const line = selectedWorkshopMapLine.value
+    if (!workshop || !line) return null
+    const size = getWorkshopLayout(workshop).size
+    const transform = getLineLayout(line).transform
+    const bounds = workshopLineRotatedBounds(line)
+    const centerX = numberOrDefault(transform.x, 0)
+    const centerZ = numberOrDefault(transform.z, 0)
+    const boundary = {
+        left: centerX - bounds.width / 2 + numberOrDefault(size.width, 100) / 2,
+        right: numberOrDefault(size.width, 100) / 2 - centerX - bounds.width / 2,
+        top: centerZ - bounds.depth / 2 + numberOrDefault(size.depth, 80) / 2,
+        bottom: numberOrDefault(size.depth, 80) / 2 - centerZ - bounds.depth / 2
+    }
+    const nearest = selectedWorkshopMapLines.value
+        .filter(item => item.id !== line.id)
+        .map(item => {
+            const otherTransform = getLineLayout(item).transform
+            const otherBounds = workshopLineRotatedBounds(item)
+            const gapX = Math.max(0, Math.abs(centerX - numberOrDefault(otherTransform.x, 0)) - (bounds.width + otherBounds.width) / 2)
+            const gapZ = Math.max(0, Math.abs(centerZ - numberOrDefault(otherTransform.z, 0)) - (bounds.depth + otherBounds.depth) / 2)
+            return { line: item, distance: Math.sqrt(gapX * gapX + gapZ * gapZ), overlaps: gapX === 0 && gapZ === 0 }
+        })
+        .sort((a, b) => a.distance - b.distance)[0] || null
+    return {
+        boundary: Object.fromEntries(Object.entries(boundary).map(([key, value]) => [key, roundLineLayoutValue(value, 0.1)])),
+        nearest: nearest ? { ...nearest, distance: roundLineLayoutValue(nearest.distance, 0.1) } : null
+    }
+})
+
+function selectWorkshopMapLine(line) {
+    if (!line?.id) return
+    workshopMapSelectedLineId.value = line.id
+    selectedLineEditorId.value = line.id
+}
+
+function previewWorkshopMapLine(line = selectedWorkshopMapLine.value) {
+    if (!line) return
+    touchLineLayout(line)
+    scheduleNativeScenePreview({ source: 'spatial', includeLayout: true })
+}
+
+function moveWorkshopMapLine(event) {
+    const state = workshopMapDragState
+    if (!state) return
+    const line = lines.value.find(item => item.id === state.lineId)
+    if (!line) return finishWorkshopMapLineDrag()
+    const layout = getLineLayout(line)
+    const bounds = workshopLineRotatedBounds(line)
+    const deltaX = (event.clientX - state.clientX) / Math.max(1, state.stageWidth) * state.workshopWidth
+    const deltaZ = (event.clientY - state.clientY) / Math.max(1, state.stageHeight) * state.workshopDepth
+    const limitX = Math.max(0, (state.workshopWidth - bounds.width) / 2)
+    const limitZ = Math.max(0, (state.workshopDepth - bounds.depth) / 2)
+    layout.transform.x = roundLineLayoutValue(Math.min(limitX, Math.max(-limitX, state.startX + deltaX)), 0.5)
+    layout.transform.z = roundLineLayoutValue(Math.min(limitZ, Math.max(-limitZ, state.startZ + deltaZ)), 0.5)
+    previewWorkshopMapLine(line)
+}
+
+function finishWorkshopMapLineDrag() {
+    if (!workshopMapDragState) return
+    workshopMapDragState = null
+    workshopMapDraggingLineId.value = ''
+    window.removeEventListener('pointermove', moveWorkshopMapLine)
+    window.removeEventListener('pointerup', finishWorkshopMapLineDrag)
+    window.removeEventListener('pointercancel', finishWorkshopMapLineDrag)
+    document.body.style.userSelect = ''
+}
+
+function startWorkshopMapLineDrag(event, line) {
+    if (event.button !== 0 || !line) return
+    const stage = workshopMapStageRef.value
+    const workshop = selectedWorkshopEditor.value
+    if (!stage || !workshop) return
+    event.preventDefault()
+    selectWorkshopMapLine(line)
+    const rect = stage.getBoundingClientRect()
+    const workshopSize = getWorkshopLayout(workshop).size
+    const transform = getLineLayout(line).transform
+    finishWorkshopMapLineDrag()
+    workshopMapDragState = {
+        lineId: line.id,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        startX: numberOrDefault(transform.x, 0),
+        startZ: numberOrDefault(transform.z, 0),
+        stageWidth: rect.width,
+        stageHeight: rect.height,
+        workshopWidth: Math.max(10, numberOrDefault(workshopSize.width, 100)),
+        workshopDepth: Math.max(10, numberOrDefault(workshopSize.depth, 80))
+    }
+    workshopMapDraggingLineId.value = line.id
+    document.body.style.userSelect = 'none'
+    window.addEventListener('pointermove', moveWorkshopMapLine)
+    window.addEventListener('pointerup', finishWorkshopMapLineDrag)
+    window.addEventListener('pointercancel', finishWorkshopMapLineDrag)
+}
+
+async function saveWorkshopMapLayout() {
+    const workshop = selectedWorkshopEditor.value
+    const targetLines = selectedWorkshopMapLines.value
+    if (!workshop || !targetLines.length) return
+    workshopMapSaving.value = true
+    try {
+        for (const line of targetLines) {
+            const layout = normalizeLineLayout(getLineLayout(line))
+            const result = await adminApi.updateLine(line.id, {
+                name: line.name,
+                workshop_id: line.workshop_id,
+                sort_order: line.sort_order,
+                layout,
+                layout_json: JSON.stringify(layout)
+            })
+            if (result?.error || !result?.success) throw new Error(result?.error || `${line.name} 保存失败`)
+        }
+        await loadLines()
+        ensureWorkshopMapLineSelection()
+        await reloadSavedNativeScenePreview('spatial')
+        await alert(`${workshop.name} 的 ${targetLines.length} 条产线位置已保存`, { title: '布局保存成功', type: 'success' })
+    } catch (error) {
+        await alert(error.message || '保存车间产线布局失败', { title: '保存失败', type: 'danger' })
+    } finally {
+        workshopMapSaving.value = false
+    }
+}
+
+async function resetWorkshopMapLayout() {
+    finishWorkshopMapLineDrag()
+    await loadLines()
+    ensureWorkshopMapLineSelection()
+    await reloadSavedNativeScenePreview('spatial')
+}
+
+function openSelectedWorkshopLineEditor() {
+    const line = selectedWorkshopMapLine.value
+    if (!line) return
+    selectedLineEditorId.value = line.id
+    selectAdminTab('lines')
+}
+
 const factoryTabs = [
     { key: 'workshops', label: '车间管理', icon: 'workshops' },
     { key: 'lines', label: '产线管理', icon: 'lines' },
@@ -5767,64 +6052,222 @@ const mainTabs = [
                 </div>
 
                 <!-- ======== 车间管理 ======== -->
-                <div v-if="activeTab === 'workshops'" class="tab-content">
-                    <h2>车间管理</h2>
-                    <p class="desc">车间是工厂世界中的一级空间容器。移动或旋转车间时，所属产线、设备、地面与围墙会作为整体跟随。</p>
-
-                    <div class="spatial-rule-banner">
-                        <strong>统一空间层级</strong>
-                        <span>工厂世界 → 车间（世界位置/边界）→ 产线（车间局部位置）→ 设备（产线局部位置）；围墙直接使用车间局部坐标。</span>
+                <div v-if="activeTab === 'workshops'" class="tab-content workshop-management-tab">
+                    <div class="workshop-management-heading">
+                        <div>
+                            <h2>车间管理</h2>
+                            <p class="desc">先建立车间，再定义空间边界，最后在比例画布上安排多条产线。</p>
+                        </div>
+                        <span v-if="selectedWorkshopEditor" class="workshop-current-chip">当前：{{ selectedWorkshopEditor.name }}</span>
                     </div>
 
-                    <div class="form-row">
-                        <input v-model="newWorkshop.id" placeholder="车间ID（如 ws_a）" class="input" />
-                        <input v-model="newWorkshop.name" placeholder="车间名称（如 压铸车间）" class="input" />
-                        <button @click="createWorkshop" class="btn btn-primary">+ 添加车间</button>
-                    </div>
+                    <nav class="workshop-step-nav" aria-label="车间配置步骤">
+                        <button
+                            v-for="step in workshopManagementSteps"
+                            :key="step.key"
+                            type="button"
+                            :class="{ active: workshopManagementStep === step.key }"
+                            :disabled="step.key !== 'list' && !selectedWorkshopEditor"
+                            @click="selectWorkshopManagementStep(step.key)"
+                        >
+                            <span class="workshop-step-number">{{ step.number }}</span>
+                            <span class="workshop-step-copy">
+                                <strong>{{ step.title }}</strong>
+                                <small>{{ step.description }}</small>
+                            </span>
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+                        </button>
+                    </nav>
 
-                    <table class="data-table">
-                        <thead>
-                            <tr><th>ID</th><th>名称</th><th>世界位置</th><th>车间边界</th><th>产线数量</th><th>操作</th></tr>
-                        </thead>
-                        <tbody>
-                            <tr v-for="ws in workshops" :key="ws.id" :class="{ 'row-selected': selectedWorkshopEditor?.id === ws.id }">
-                                <td><code>{{ ws.id }}</code></td>
-                                <td>{{ ws.name }}</td>
-                                <td>X {{ getWorkshopLayout(ws).transform.x }} / Z {{ getWorkshopLayout(ws).transform.z }} / {{ getWorkshopLayout(ws).transform.rotationY }}°</td>
-                                <td>{{ getWorkshopLayout(ws).size.width }} × {{ getWorkshopLayout(ws).size.depth }} 米</td>
-                                <td>{{ (linesByWorkshop[ws.id] || []).length }} 条</td>
-                                <td>
-                                    <button type="button" class="btn btn-sm" @click="selectedWorkshopEditorId = ws.id">空间设置</button>
-                                    <button @click="deleteWorkshop(ws.id)" class="btn btn-danger btn-sm">删除</button>
-                                </td>
-                            </tr>
-                        </tbody>
-                    </table>
+                    <template v-if="workshopManagementStep === 'list'">
+                        <div class="spatial-rule-banner">
+                            <strong>统一空间层级</strong>
+                            <span>工厂世界 → 车间（世界位置/边界）→ 产线（车间局部位置）→ 设备（产线局部位置）；围墙直接使用车间局部坐标。</span>
+                        </div>
 
-                    <section v-if="selectedWorkshopEditor" class="workshop-spatial-editor">
-                        <div class="workshop-spatial-heading">
-                            <div>
-                                <h3>{{ selectedWorkshopEditor.name }} · 空间定义</h3>
-                                <p>世界位置决定整个车间放在工厂中的位置；边界决定车间地面、围墙编辑范围及工程师可用空间。</p>
-                            </div>
-                            <div class="line-native-actions">
-                                <button type="button" class="btn" @click="restoreSavedNativeScenePreview">撤销未保存预览</button>
-                                <button type="button" class="btn btn-primary" :disabled="workshopSavingId === selectedWorkshopEditor.id" @click="saveWorkshopSpatialLayout()">
-                                    {{ workshopSavingId === selectedWorkshopEditor.id ? '保存中...' : '保存车间空间' }}
-                                </button>
-                            </div>
+                        <div class="form-row workshop-create-row">
+                            <input v-model="newWorkshop.id" placeholder="车间ID（如 ws_a）" class="input" />
+                            <input v-model="newWorkshop.name" placeholder="车间名称（如 压铸车间）" class="input" />
+                            <button @click="createWorkshop" class="btn btn-primary">+ 添加车间</button>
                         </div>
-                        <div class="workshop-spatial-grid" @input="previewWorkshopSpatialLayout" @change="previewWorkshopSpatialLayout">
-                            <label>车间世界 X（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).transform.x" type="number" step="0.5" class="input" /></label>
-                            <label>车间世界 Y（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).transform.y" type="number" step="0.1" class="input" /></label>
-                            <label>车间世界 Z（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).transform.z" type="number" step="0.5" class="input" /></label>
-                            <label>车间朝向（°）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).transform.rotationY" type="number" min="-180" max="180" step="1" class="input" /></label>
-                            <label>车间宽度 X（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).size.width" type="number" min="10" max="5000" step="1" class="input" /></label>
-                            <label>车间深度 Z（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).size.depth" type="number" min="10" max="5000" step="1" class="input" /></label>
-                            <label>参考高度（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).size.height" type="number" min="1" max="200" step="0.5" class="input" /></label>
-                            <label class="workshop-boundary-toggle"><input v-model="getWorkshopLayout(selectedWorkshopEditor).boundary.enabled" type="checkbox" /> 启用车间地面与边界</label>
+
+                        <table class="data-table">
+                            <thead>
+                                <tr><th>ID</th><th>名称</th><th>世界位置</th><th>车间边界</th><th>产线数量</th><th>操作</th></tr>
+                            </thead>
+                            <tbody>
+                                <tr v-for="ws in workshops" :key="ws.id" :class="{ 'row-selected': selectedWorkshopEditor?.id === ws.id }">
+                                    <td><code>{{ ws.id }}</code></td>
+                                    <td>{{ ws.name }}</td>
+                                    <td>X {{ getWorkshopLayout(ws).transform.x }} / Z {{ getWorkshopLayout(ws).transform.z }} / {{ getWorkshopLayout(ws).transform.rotationY }}°</td>
+                                    <td>{{ getWorkshopLayout(ws).size.width }} × {{ getWorkshopLayout(ws).size.depth }} 米</td>
+                                    <td>{{ (linesByWorkshop[ws.id] || []).length }} 条</td>
+                                    <td>
+                                        <button type="button" class="btn btn-sm" @click="openWorkshopManagementStep(ws, 'space')">空间设置</button>
+                                        <button @click="deleteWorkshop(ws.id)" class="btn btn-danger btn-sm">删除</button>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </template>
+
+                    <template v-else-if="workshopManagementStep === 'space'">
+                        <div class="workshop-step-context">
+                            <button type="button" class="workshop-back-button" title="返回车间列表" @click="selectWorkshopManagementStep('list')">
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
+                            </button>
+                            <label>编辑车间
+                                <select v-model="selectedWorkshopEditorId" class="input">
+                                    <option v-for="workshop in workshops" :key="workshop.id" :value="workshop.id">{{ workshop.name }}</option>
+                                </select>
+                            </label>
+                            <span>{{ getWorkshopLayout(selectedWorkshopEditor).size.width }} × {{ getWorkshopLayout(selectedWorkshopEditor).size.depth }} 米</span>
                         </div>
-                    </section>
+
+                        <section v-if="selectedWorkshopEditor" class="workshop-spatial-editor">
+                            <div class="workshop-spatial-heading">
+                                <div>
+                                    <h3>{{ selectedWorkshopEditor.name }} · 空间定义</h3>
+                                    <p>世界位置决定整个车间在工厂中的位置；宽度和深度会成为下一步产线布局画布的真实边界。</p>
+                                </div>
+                                <div class="line-native-actions">
+                                    <button type="button" class="btn" @click="restoreSavedNativeScenePreview">撤销未保存预览</button>
+                                    <button type="button" class="btn btn-primary" :disabled="workshopSavingId === selectedWorkshopEditor.id" @click="saveWorkshopSpatialLayout()">
+                                        {{ workshopSavingId === selectedWorkshopEditor.id ? '保存中...' : '保存车间空间' }}
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="workshop-spatial-grid" @input="previewWorkshopSpatialLayout" @change="previewWorkshopSpatialLayout">
+                                <label>车间世界 X（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).transform.x" type="number" step="0.5" class="input" /></label>
+                                <label>车间世界 Y（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).transform.y" type="number" step="0.1" class="input" /></label>
+                                <label>车间世界 Z（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).transform.z" type="number" step="0.5" class="input" /></label>
+                                <label>车间朝向（°）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).transform.rotationY" type="number" min="-180" max="180" step="1" class="input" /></label>
+                                <label>车间宽度 X（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).size.width" type="number" min="10" max="5000" step="1" class="input" /></label>
+                                <label>车间深度 Z（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).size.depth" type="number" min="10" max="5000" step="1" class="input" /></label>
+                                <label>参考高度（米）<input v-model.number="getWorkshopLayout(selectedWorkshopEditor).size.height" type="number" min="1" max="200" step="0.5" class="input" /></label>
+                                <label class="workshop-boundary-toggle"><input v-model="getWorkshopLayout(selectedWorkshopEditor).boundary.enabled" type="checkbox" /> 启用车间地面与边界</label>
+                            </div>
+                            <div class="workshop-step-footer">
+                                <span>下一步将在 {{ getWorkshopLayout(selectedWorkshopEditor).size.width }} × {{ getWorkshopLayout(selectedWorkshopEditor).size.depth }} 米范围内按比例展示产线。</span>
+                                <button type="button" class="btn btn-primary" @click="selectWorkshopManagementStep('layout')">查看产线布局</button>
+                            </div>
+                        </section>
+                    </template>
+
+                    <template v-else>
+                        <div class="workshop-step-context">
+                            <button type="button" class="workshop-back-button" title="返回空间设置" @click="selectWorkshopManagementStep('space')">
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
+                            </button>
+                            <label>查看车间
+                                <select v-model="selectedWorkshopEditorId" class="input">
+                                    <option v-for="workshop in workshops" :key="workshop.id" :value="workshop.id">{{ workshop.name }}</option>
+                                </select>
+                            </label>
+                            <span>画布 {{ getWorkshopLayout(selectedWorkshopEditor).size.width }} × {{ getWorkshopLayout(selectedWorkshopEditor).size.depth }} 米 · {{ selectedWorkshopMapLines.length }} 条产线</span>
+                        </div>
+
+                        <section class="workshop-map-shell">
+                            <div class="workshop-map-toolbar">
+                                <div>
+                                    <h3>{{ selectedWorkshopEditor.name }} · 产线平面布局</h3>
+                                    <p>每个产线块按真实长度与宽度同比例绘制。拖动即可调整 X / Z，自动以 0.5 米吸附并限制在车间边界内。</p>
+                                </div>
+                                <div class="line-native-actions">
+                                    <button type="button" class="btn" :disabled="workshopMapSaving" @click="resetWorkshopMapLayout">撤销未保存布局</button>
+                                    <button type="button" class="btn btn-primary" :disabled="workshopMapSaving || !selectedWorkshopMapLines.length" @click="saveWorkshopMapLayout">
+                                        {{ workshopMapSaving ? '保存中...' : '保存全部产线位置' }}
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div class="workshop-map-layout">
+                                <div class="workshop-map-board">
+                                    <div class="workshop-map-dimension workshop-map-dimension-x">X 方向 · {{ getWorkshopLayout(selectedWorkshopEditor).size.width }} 米</div>
+                                    <div class="workshop-map-dimension workshop-map-dimension-z">Z 方向 · {{ getWorkshopLayout(selectedWorkshopEditor).size.depth }} 米</div>
+                                    <div ref="workshopMapStageRef" class="workshop-map-stage">
+                                        <span class="workshop-map-axis workshop-map-axis-x"></span>
+                                        <span class="workshop-map-axis workshop-map-axis-z"></span>
+                                        <span class="workshop-map-origin">0, 0</span>
+                                        <article
+                                            v-for="line in selectedWorkshopMapLines"
+                                            :key="line.id"
+                                            class="workshop-map-line"
+                                            :class="{
+                                                selected: selectedWorkshopMapLine?.id === line.id,
+                                                dragging: workshopMapDraggingLineId === line.id,
+                                                outside: workshopMapLineOutside(line)
+                                            }"
+                                            :style="workshopMapLineStyle(line)"
+                                            tabindex="0"
+                                            @click.stop="selectWorkshopMapLine(line)"
+                                            @pointerdown="startWorkshopMapLineDrag($event, line)"
+                                            @keydown.enter="selectWorkshopMapLine(line)"
+                                        >
+                                            <header>
+                                                <strong>{{ line.name }}</strong>
+                                                <span>{{ workshopLineFootprint(line).length }} × {{ workshopLineFootprint(line).width }} m</span>
+                                            </header>
+                                            <span
+                                                v-for="track in workshopLineFootprint(line).tracks"
+                                                :key="`${track.type}-${track.id}`"
+                                                class="workshop-map-track"
+                                                :class="track.type"
+                                                :style="workshopMapTrackStyle(track, line)"
+                                            ></span>
+                                        </article>
+                                        <div v-if="!selectedWorkshopMapLines.length" class="workshop-map-empty">
+                                            <strong>这个车间还没有产线</strong>
+                                            <span>先到产线管理新增产线，再返回这里安排空间位置。</span>
+                                            <button type="button" class="btn btn-primary" @click="selectAdminTab('lines')">前往产线管理</button>
+                                        </div>
+                                    </div>
+                                    <div class="workshop-map-legend">
+                                        <span><i class="lane"></i>设备线</span>
+                                        <span><i class="rail"></i>小车导轨</span>
+                                        <span><i class="center"></i>车间中心轴</span>
+                                    </div>
+                                </div>
+
+                                <aside class="workshop-map-inspector">
+                                    <template v-if="selectedWorkshopMapLine">
+                                        <label class="workshop-map-line-select">当前产线
+                                            <select v-model="workshopMapSelectedLineId" class="input">
+                                                <option v-for="line in selectedWorkshopMapLines" :key="line.id" :value="line.id">{{ line.name }}</option>
+                                            </select>
+                                        </label>
+                                        <div class="workshop-map-footprint-card">
+                                            <span>实际占地</span>
+                                            <strong>{{ workshopLineFootprint(selectedWorkshopMapLine).length }} × {{ workshopLineFootprint(selectedWorkshopMapLine).width }} 米</strong>
+                                            <small>{{ getLineLayout(selectedWorkshopMapLine).lanes.length }} 条设备线 · {{ getLineLayout(selectedWorkshopMapLine).rails.length }} 条导轨</small>
+                                        </div>
+                                        <div class="workshop-map-input-grid" @input="previewWorkshopMapLine()" @change="previewWorkshopMapLine()">
+                                            <label>相对车间 X<input v-model.number="getLineLayout(selectedWorkshopMapLine).transform.x" type="number" step="0.5" class="input" /></label>
+                                            <label>相对车间 Z<input v-model.number="getLineLayout(selectedWorkshopMapLine).transform.z" type="number" step="0.5" class="input" /></label>
+                                            <label>离地 Y<input v-model.number="getLineLayout(selectedWorkshopMapLine).transform.y" type="number" step="0.1" class="input" /></label>
+                                            <label>朝向<input v-model.number="getLineLayout(selectedWorkshopMapLine).transform.rotationY" type="number" min="-180" max="180" step="1" class="input" /></label>
+                                        </div>
+                                        <div v-if="selectedWorkshopMapMetrics" class="workshop-map-metrics">
+                                            <h4>距车间边界</h4>
+                                            <div class="workshop-map-metric-grid">
+                                                <span>左<strong>{{ selectedWorkshopMapMetrics.boundary.left }} m</strong></span>
+                                                <span>右<strong>{{ selectedWorkshopMapMetrics.boundary.right }} m</strong></span>
+                                                <span>前<strong>{{ selectedWorkshopMapMetrics.boundary.top }} m</strong></span>
+                                                <span>后<strong>{{ selectedWorkshopMapMetrics.boundary.bottom }} m</strong></span>
+                                            </div>
+                                            <p v-if="selectedWorkshopMapMetrics.nearest" :class="{ danger: selectedWorkshopMapMetrics.nearest.overlaps }">
+                                                {{ selectedWorkshopMapMetrics.nearest.overlaps ? '与' : '最近' }}「{{ selectedWorkshopMapMetrics.nearest.line.name }}」
+                                                {{ selectedWorkshopMapMetrics.nearest.overlaps ? '发生占地重叠' : `间隔约 ${selectedWorkshopMapMetrics.nearest.distance} 米` }}
+                                            </p>
+                                            <p v-else>当前车间只有这一条产线。</p>
+                                        </div>
+                                        <button type="button" class="btn workshop-line-detail-button" @click="openSelectedWorkshopLineEditor">编辑这条产线的轨道与设备</button>
+                                    </template>
+                                    <div v-else class="workshop-map-inspector-empty">选择一条产线后可精确调整。</div>
+                                </aside>
+                            </div>
+                        </section>
+                    </template>
                 </div>
 
                 <!-- ======== 产线管理 ======== -->
@@ -12274,11 +12717,34 @@ button:enabled:active {
     0% { opacity: 0.3; transform: scale(0.8); }
     100% { opacity: 1; transform: scale(1.25); }
 }
+.workshop-management-tab { --workshop-accent: #1d1d1f; }
+.workshop-management-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.workshop-management-heading h2 { margin-bottom: 6px; }
+.workshop-current-chip { flex: 0 0 auto; padding: 7px 12px; color: #515154; background: #f5f5f7; border: 1px solid #e5e5e7; border-radius: 999px; font-size: 12px; }
+.workshop-step-nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 18px 0; padding: 8px; background: #f5f5f7; border: 1px solid #e6e6e8; border-radius: 16px; }
+.workshop-step-nav > button { display: flex; align-items: center; min-width: 0; padding: 12px 13px; color: #515154; text-align: left; background: #fff; border: 1px solid #e8e8ed; border-radius: 12px; cursor: pointer; transition: color .18s ease, background .18s ease, border-color .18s ease, box-shadow .18s ease, transform .18s ease; }
+.workshop-step-nav > button:hover:not(:disabled) { border-color: #c7c7cc; box-shadow: 0 7px 20px rgba(0, 0, 0, .06); transform: translateY(-1px); }
+.workshop-step-nav > button.active { color: #fff; background: #1d1d1f; border-color: #1d1d1f; box-shadow: 0 8px 22px rgba(0, 0, 0, .16); }
+.workshop-step-nav > button:disabled { opacity: .45; cursor: not-allowed; }
+.workshop-step-number { display: grid; flex: 0 0 34px; width: 34px; height: 34px; margin-right: 11px; place-items: center; color: #6e6e73; background: #f5f5f7; border-radius: 9px; font-size: 11px; font-weight: 700; }
+.workshop-step-nav > button.active .workshop-step-number { color: #1d1d1f; background: #fff; }
+.workshop-step-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 3px; }
+.workshop-step-copy strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.workshop-step-copy small { overflow: hidden; color: #86868b; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.workshop-step-nav > button.active small { color: #c7c7cc; }
+.workshop-step-nav svg { flex: 0 0 17px; width: 17px; height: 17px; margin-left: 8px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .spatial-rule-banner { display: flex; align-items: center; gap: 14px; margin: 14px 0; padding: 13px 15px; color: #475467; background: #f0f7fa; border: 1px solid #cfe2ea; border-radius: 9px; font-size: 12px; line-height: 1.55; }
 .spatial-rule-banner strong { flex: 0 0 auto; color: #175f7b; }
 .data-table tr.row-selected td { background: #f2f8fb; }
 .data-table td .btn + .btn { margin-left: 6px; }
-.workshop-spatial-editor { margin-top: 18px; padding: 18px; background: #f8fafb; border: 1px solid #dce5eb; border-radius: 11px; }
+.workshop-create-row { margin-bottom: 14px; }
+.workshop-step-context { display: flex; align-items: center; gap: 12px; margin: 6px 0 14px; padding: 10px 12px; color: #6e6e73; background: #f8f8fa; border: 1px solid #e5e5e7; border-radius: 12px; font-size: 12px; }
+.workshop-step-context label { display: flex; align-items: center; gap: 8px; color: #3a3a3c; font-weight: 600; }
+.workshop-step-context .input { width: auto; min-width: 180px; height: 34px; }
+.workshop-back-button { display: grid; flex: 0 0 34px; width: 34px; height: 34px; padding: 0; place-items: center; color: #1d1d1f; background: #fff; border: 1px solid #d9d9de; border-radius: 50%; cursor: pointer; transition: background .16s ease, transform .16s ease; }
+.workshop-back-button:hover { background: #ececf0; transform: translateX(-1px); }
+.workshop-back-button svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 2; }
+.workshop-spatial-editor { margin-top: 0; padding: 20px; background: #f8fafb; border: 1px solid #dce5eb; border-radius: 14px; }
 .workshop-spatial-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
 .workshop-spatial-heading h3 { margin: 0; color: #1d2939; font-size: 16px; }
 .workshop-spatial-heading p { max-width: 720px; margin: 6px 0 0; color: #667085; font-size: 12px; line-height: 1.55; }
@@ -12286,14 +12752,78 @@ button:enabled:active {
 .workshop-spatial-grid > label, .line-transform-grid > label { display: flex; flex-direction: column; gap: 6px; color: #475467; font-size: 12px; font-weight: 500; }
 .workshop-spatial-grid .workshop-boundary-toggle { flex-direction: row; align-items: center; min-height: 38px; padding: 8px 10px; align-self: end; background: #fff; border: 1px solid #d0d5dd; border-radius: 7px; }
 .workshop-boundary-toggle input { accent-color: #176b8b; }
+.workshop-step-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 18px; padding-top: 16px; color: #667085; border-top: 1px solid #e3e7eb; font-size: 12px; }
+.workshop-map-shell { overflow: hidden; background: #fff; border: 1px solid #e5e5e7; border-radius: 16px; box-shadow: 0 10px 34px rgba(0, 0, 0, .055); }
+.workshop-map-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 18px 20px; border-bottom: 1px solid #e8e8ed; }
+.workshop-map-toolbar h3 { margin: 0; color: #1d1d1f; font-size: 16px; }
+.workshop-map-toolbar p { max-width: 760px; margin: 6px 0 0; color: #6e6e73; font-size: 12px; line-height: 1.55; }
+.workshop-map-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; min-height: 620px; background: #f5f7f8; }
+.workshop-map-board { position: relative; min-width: 0; padding: 42px 28px 44px 54px; }
+.workshop-map-dimension { position: absolute; z-index: 2; color: #6e6e73; font-size: 11px; font-weight: 600; letter-spacing: .02em; }
+.workshop-map-dimension-x { top: 18px; left: 54px; right: 28px; text-align: center; }
+.workshop-map-dimension-z { top: 50%; left: 12px; transform: translateY(-50%) rotate(-90deg); white-space: nowrap; }
+.workshop-map-stage { position: relative; overflow: hidden; width: 100%; height: clamp(500px, 62vh, 680px); background-color: #eef3f5; background-image: linear-gradient(rgba(92, 119, 132, .095) 1px, transparent 1px), linear-gradient(90deg, rgba(92, 119, 132, .095) 1px, transparent 1px), linear-gradient(rgba(92, 119, 132, .12) 1px, transparent 1px), linear-gradient(90deg, rgba(92, 119, 132, .12) 1px, transparent 1px); background-position: center; background-size: 20px 20px, 20px 20px, 100px 100px, 100px 100px; border: 1px solid #bfcdd3; border-radius: 12px; box-shadow: inset 0 0 0 1px rgba(255,255,255,.7), inset 0 0 34px rgba(37, 70, 84, .045); touch-action: none; }
+.workshop-map-stage::before { position: absolute; inset: 13px; content: ''; border: 1px dashed rgba(66, 95, 108, .22); border-radius: 7px; pointer-events: none; }
+.workshop-map-axis { position: absolute; z-index: 0; background: rgba(29, 29, 31, .22); pointer-events: none; }
+.workshop-map-axis-x { top: 50%; right: 0; left: 0; height: 1px; }
+.workshop-map-axis-z { top: 0; bottom: 0; left: 50%; width: 1px; }
+.workshop-map-origin { position: absolute; z-index: 1; top: calc(50% + 6px); left: calc(50% + 7px); color: #86868b; font-size: 10px; pointer-events: none; }
+.workshop-map-line { position: absolute; z-index: 3; overflow: hidden; min-width: 46px; min-height: 42px; padding: 0; color: #244654; background: rgba(173, 202, 214, .74); border: 1px solid #82a8b9; border-radius: 9px; box-shadow: 0 6px 18px rgba(40, 68, 81, .14); cursor: grab; transform-origin: center; touch-action: none; transition: box-shadow .16s ease, border-color .16s ease, background .16s ease; }
+.workshop-map-line:hover { z-index: 4; border-color: #4b8198; box-shadow: 0 9px 22px rgba(40, 68, 81, .2); }
+.workshop-map-line.selected { z-index: 5; color: #fff; background: rgba(35, 78, 97, .9); border-color: #173f51; box-shadow: 0 0 0 3px rgba(0, 113, 227, .22), 0 10px 26px rgba(24, 59, 75, .26); }
+.workshop-map-line.dragging { cursor: grabbing; transition: none; }
+.workshop-map-line.outside { border-color: #ff3b30; box-shadow: 0 0 0 3px rgba(255, 59, 48, .2); }
+.workshop-map-line header { position: absolute; z-index: 2; top: 5px; right: 7px; left: 7px; display: flex; align-items: center; justify-content: space-between; gap: 8px; pointer-events: none; }
+.workshop-map-line header strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.workshop-map-line header span { flex: 0 0 auto; font-size: 9px; opacity: .75; }
+.workshop-map-track { position: absolute; z-index: 1; height: 3px; border-radius: 999px; pointer-events: none; transform: translateY(-50%); }
+.workshop-map-track.lane { background: #4d91ad; box-shadow: 0 0 0 2px rgba(89, 146, 169, .16); }
+.workshop-map-track.rail { height: 2px; background: #bd842b; box-shadow: 0 -3px #bd842b, 0 3px #bd842b; }
+.workshop-map-line.selected .workshop-map-track.lane { background: #8dd9f3; }
+.workshop-map-line.selected .workshop-map-track.rail { background: #ffd36a; box-shadow: 0 -3px #ffd36a, 0 3px #ffd36a; }
+.workshop-map-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 8px; color: #6e6e73; text-align: center; }
+.workshop-map-empty strong { color: #1d1d1f; font-size: 16px; }
+.workshop-map-empty span { margin-bottom: 8px; font-size: 12px; }
+.workshop-map-legend { position: absolute; right: 28px; bottom: 12px; display: flex; gap: 14px; color: #6e6e73; font-size: 10px; }
+.workshop-map-legend span { display: flex; align-items: center; gap: 5px; }
+.workshop-map-legend i { display: block; width: 18px; height: 3px; border-radius: 999px; background: #4d91ad; }
+.workshop-map-legend i.rail { height: 2px; background: #bd842b; box-shadow: 0 -3px #bd842b, 0 3px #bd842b; }
+.workshop-map-legend i.center { height: 1px; background: rgba(29, 29, 31, .35); }
+.workshop-map-inspector { padding: 18px; background: #fff; border-left: 1px solid #e5e5e7; }
+.workshop-map-line-select, .workshop-map-input-grid label { display: flex; flex-direction: column; gap: 6px; color: #515154; font-size: 11px; font-weight: 600; }
+.workshop-map-line-select .input { width: 100%; }
+.workshop-map-footprint-card { display: flex; margin: 14px 0; padding: 14px; flex-direction: column; gap: 4px; color: #6e6e73; background: #f5f5f7; border-radius: 11px; }
+.workshop-map-footprint-card span { font-size: 10px; text-transform: uppercase; }
+.workshop-map-footprint-card strong { color: #1d1d1f; font-size: 18px; }
+.workshop-map-footprint-card small { font-size: 10px; }
+.workshop-map-input-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.workshop-map-input-grid .input { width: 100%; min-width: 0; box-sizing: border-box; }
+.workshop-map-metrics { margin-top: 16px; padding-top: 14px; border-top: 1px solid #e8e8ed; }
+.workshop-map-metrics h4 { margin: 0 0 10px; color: #1d1d1f; font-size: 12px; }
+.workshop-map-metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.workshop-map-metric-grid span { display: flex; justify-content: space-between; gap: 6px; padding: 8px; color: #86868b; background: #f8f8fa; border-radius: 7px; font-size: 10px; }
+.workshop-map-metric-grid strong { color: #3a3a3c; }
+.workshop-map-metrics p { margin: 10px 0 0; padding: 9px; color: #3b6d46; background: #eef8f0; border-radius: 7px; font-size: 10px; line-height: 1.45; }
+.workshop-map-metrics p.danger { color: #b42318; background: #fff0ef; }
+.workshop-line-detail-button { width: 100%; margin-top: 14px; }
+.workshop-map-inspector-empty { display: grid; height: 100%; min-height: 240px; place-items: center; color: #86868b; font-size: 12px; text-align: center; }
 .line-transform-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
 .line-transform-grid .input { width: 100%; min-width: 0; box-sizing: border-box; }
 @media (max-width: 1180px) {
     .workshop-spatial-heading { flex-direction: column; }
     .workshop-spatial-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
+    .workshop-map-layout { grid-template-columns: minmax(0, 1fr); }
+    .workshop-map-inspector { border-top: 1px solid #e5e5e7; border-left: 0; }
+    .workshop-map-toolbar { flex-direction: column; }
 }
 @media (max-width: 720px) {
+    .workshop-management-heading, .workshop-step-footer { align-items: flex-start; flex-direction: column; }
+    .workshop-step-nav { display: flex; overflow-x: auto; }
+    .workshop-step-nav > button { flex: 0 0 230px; }
+    .workshop-step-context { align-items: flex-start; flex-wrap: wrap; }
     .spatial-rule-banner { align-items: flex-start; flex-direction: column; }
     .workshop-spatial-grid, .line-transform-grid { grid-template-columns: 1fr; }
+    .workshop-map-board { padding-right: 14px; padding-left: 38px; }
+    .workshop-map-toolbar { padding: 15px; }
 }
 </style>
