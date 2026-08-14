@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+  <title>热处理数字孪生大屏 - 正在启动</title>
+  <style>
+    :root { color-scheme: light; font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; }
+    body { padding: 10px; color: #18212b; }
+    .shell {
+      width: 100%; height: 100%; padding: 30px 34px 24px; border: 1px solid rgba(17, 36, 54, .11);
+      border-radius: 24px; background: rgba(248, 250, 252, .985);
+      box-shadow: 0 24px 70px rgba(9, 24, 39, .28), 0 2px 10px rgba(9, 24, 39, .12);
+      display: flex; flex-direction: column; -webkit-app-region: drag;
+    }
+    .brand { display: flex; align-items: center; gap: 15px; }
+    .brand img { width: 54px; height: 54px; border-radius: 14px; box-shadow: 0 7px 18px rgba(20, 91, 104, .2); }
+    .brand h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: .2px; }
+    .brand p { margin: 5px 0 0; color: #7b8794; font-size: 13px; }
+    .progress-head { display: flex; align-items: flex-end; justify-content: space-between; margin-top: 27px; }
+    #title { font-size: 15px; font-weight: 650; line-height: 1.4; }
+    #percent { color: #177f8e; font-size: 14px; font-variant-numeric: tabular-nums; font-weight: 700; }
+    .track { height: 8px; margin-top: 10px; overflow: hidden; border-radius: 99px; background: #dfe6eb; }
+    #bar {
+      position: relative; width: 0; height: 100%; border-radius: inherit;
+      background: linear-gradient(90deg, #176779, #2ca6a4); transition: width .32s cubic-bezier(.2,.72,.25,1);
+    }
+    #bar::after { content: ""; position: absolute; inset: 0; background: linear-gradient(105deg, transparent 20%, rgba(255,255,255,.52) 48%, transparent 74%); animation: sheen 1.45s linear infinite; }
+    @keyframes sheen { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+    #detail { min-height: 20px; margin-top: 8px; color: #71808d; font-size: 12px; line-height: 1.55; }
+    .steps { flex: 1; min-height: 0; margin: 17px 0 0; padding: 0; list-style: none; overflow: hidden; }
+    .step { display: flex; align-items: center; gap: 10px; height: 27px; color: #8a96a1; font-size: 12px; transition: color .2s; }
+    .step-dot { width: 17px; height: 17px; border-radius: 50%; background: #e3e9ed; display: grid; place-items: center; flex: none; font-size: 10px; color: white; }
+    .step.running { color: #26343f; font-weight: 600; }
+    .step.running .step-dot { background: #278c98; box-shadow: 0 0 0 4px rgba(39,140,152,.12); }
+    .step.done .step-dot { background: #4ca57b; }
+    .step.error { color: #c94444; }
+    .step.error .step-dot { background: #d85252; }
+    .failure { display: none; margin-top: 14px; padding: 12px 14px; border: 1px solid #efcaca; border-radius: 12px; background: #fff4f4; -webkit-app-region: no-drag; }
+    .failure strong { display: block; color: #b93737; font-size: 12px; margin-bottom: 5px; }
+    #error { color: #782f2f; font-size: 12px; line-height: 1.45; max-height: 44px; overflow: auto; }
+    #logPath { margin-top: 5px; color: #987070; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .actions { display: none; justify-content: flex-end; gap: 8px; margin-top: 13px; -webkit-app-region: no-drag; }
+    .button { min-width: 84px; padding: 8px 14px; border: 0; border-radius: 9px; color: #35424d; background: #e7ecef; font: inherit; font-size: 12px; cursor: pointer; }
+    .button:hover { filter: brightness(.97); }
+    .button.primary { color: white; background: #207e8b; }
+    body.error .failure, body.error .actions { display: flex; }
+    body.error .failure { flex-direction: column; }
+    body.error .steps { display: none; }
+    body.error #bar { background: #d85252; }
+    body.success #bar::after, body.error #bar::after { display: none; }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="brand">
+      <img src="./icon.png" alt="">
+      <div><h1>热处理数字孪生大屏</h1><p id="subtitle">正在安全启动现场运行环境</p></div>
+    </header>
+    <div class="progress-head"><span id="title">正在准备启动环境</span><span id="percent">0%</span></div>
+    <div class="track"><div id="bar"></div></div>
+    <div id="detail">正在检查程序组件</div>
+    <ul id="steps" class="steps"></ul>
+    <section class="failure">
+      <strong>失败原因</strong>
+      <div id="error"></div>
+      <div id="logPath"></div>
+    </section>
+    <div class="actions">
+      <button class="button" data-action="open-log">打开日志</button>
+      <button class="button primary" data-action="restart">重新启动</button>
+      <button class="button" data-action="exit">退出</button>
+    </div>
+  </main>
+  <script>
+    const byId = id => document.getElementById(id);
+    document.querySelectorAll('[data-action]').forEach(button => {
+      button.addEventListener('click', () => { location.href = `startup-action://${button.dataset.action}`; });
+    });
+    window.updateStartup = state => {
+      const progress = Math.max(0, Math.min(100, Number(state.progress) || 0));
+      document.body.className = state.status || 'running';
+      document.title = state.status === 'error'
+        ? '热处理数字孪生大屏 - 启动失败'
+        : state.status === 'success' ? '热处理数字孪生大屏 - 启动完成' : '热处理数字孪生大屏 - 正在启动';
+      byId('subtitle').textContent = state.status === 'error' ? '部分启动步骤未能完成' : '正在安全启动现场运行环境';
+      byId('title').textContent = state.title || '正在启动';
+      byId('detail').textContent = state.detail || '';
+      byId('percent').textContent = `${Math.round(progress)}%`;
+      byId('bar').style.width = `${progress}%`;
+      byId('error').textContent = state.error || '未知启动错误';
+      byId('logPath').textContent = state.logPath ? `日志：${state.logPath}` : '';
+      const steps = Array.isArray(state.steps) ? state.steps.slice(-6) : [];
+      byId('steps').replaceChildren(...steps.map(step => {
+        const item = document.createElement('li');
+        item.className = `step ${step.status || ''}`;
+        const dot = document.createElement('span');
+        dot.className = 'step-dot';
+        dot.textContent = step.status === 'done' ? '✓' : step.status === 'error' ? '!' : '•';
+        const label = document.createElement('span');
+        label.textContent = step.title || '';
+        item.append(dot, label);
+        return item;
+      }));
+    };
+  </script>
+</body>
+</html>

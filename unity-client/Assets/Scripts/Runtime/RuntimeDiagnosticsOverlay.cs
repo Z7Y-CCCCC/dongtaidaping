@@ -17,6 +17,8 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private bool _loadingVisible;
         private float _loadingProgress;
         private string _loadingStep = "正在初始化渲染";
+        private float _lastReportedLoadingProgress = -1f;
+        private string _lastReportedLoadingStep = string.Empty;
 
         public bool Visible { get; set; } = true;
         public string BackendState { get; set; } = "starting";
@@ -33,6 +35,9 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _loadingVisible = true;
             _loadingProgress = 0f;
             _loadingStep = "正在初始化渲染";
+            _lastReportedLoadingProgress = -1f;
+            _lastReportedLoadingStep = string.Empty;
+            ReportLoadingProgress();
         }
 
         public void UpdateLoading(float progress, string step)
@@ -40,13 +45,25 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _loadingVisible = true;
             _loadingProgress = Mathf.Clamp01(progress);
             if (!string.IsNullOrWhiteSpace(step)) _loadingStep = step;
+            ReportLoadingProgress();
         }
 
         public void CompleteLoading()
         {
             _loadingProgress = 1f;
             _loadingStep = "场景已就绪";
+            ReportLoadingProgress();
             _loadingVisible = false;
+        }
+
+        private void ReportLoadingProgress()
+        {
+            if (Mathf.Abs(_lastReportedLoadingProgress - _loadingProgress) < 0.001f &&
+                string.Equals(_lastReportedLoadingStep, _loadingStep, StringComparison.Ordinal)) return;
+            _lastReportedLoadingProgress = _loadingProgress;
+            _lastReportedLoadingStep = _loadingStep;
+            var safeStep = (_loadingStep ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Replace('|', ' ');
+            Debug.Log($"[StartupProgress] {Mathf.RoundToInt(_loadingProgress * 100f)}|{safeStep}");
         }
 
         public void RecordRealtimeFrame(long timestamp, int deviceCount)

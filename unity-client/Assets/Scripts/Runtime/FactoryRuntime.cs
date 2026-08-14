@@ -125,6 +125,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             catch (Exception exception)
             {
                 _diagnostics.BackendState = "invalid websocket URL";
+                Debug.LogWarning($"[StartupWarning] 2|实时数据连接初始化失败：{ShortMessage(exception.Message)}");
                 Debug.LogError($"[FactoryRuntime] WebSocket startup failed: {exception}");
             }
         }
@@ -174,6 +175,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                     _diagnostics.BackendState = "configuration offline";
                     _diagnostics.UpdateLoading(0.08f, "现场服务暂不可用，正在重试…");
                     _diagnostics.Activity = $"Config retry in {retry:0}s: {ShortMessage(exception.Message)}";
+                    Debug.LogWarning($"[StartupWarning] 8|现场配置读取失败：{ShortMessage(exception.Message)}");
                     Debug.LogWarning($"[FactoryRuntime] Configuration unavailable: {exception.Message}");
                     try { await Task.Delay(TimeSpan.FromSeconds(retry), cancellationToken); }
                     catch (OperationCanceledException) { return; }
@@ -811,6 +813,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _dashboard?.SetWebOverlayActive(overlayStarted);
             if (!overlayStarted)
             {
+                Debug.LogWarning("[StartupWarning] 96|顶部组件启动失败，请检查 WebView2 运行环境");
                 Debug.LogWarning("[FactoryRuntime] Application tab chrome could not be started; press F10 to retry.");
             }
 #else

@@ -47,6 +47,20 @@ let backendRestartInProgress = false;
 let applicationShutdownForceTimer = null;
 let applicationReadyForInteraction = false;
 let pendingNativeAdminRequest = false;
+let startupWindow = null;
+let startupWindowClosingForSuccess = false;
+let startupFailureLogPath = null;
+let nativeHostReady = false;
+const nativeHostReadyWaiters = new Set();
+const startupState = {
+    progress: 0,
+    status: 'running',
+    title: '正在准备启动环境',
+    detail: '正在检查程序组件',
+    error: '',
+    logPath: '',
+    steps: []
+};
 const BACKEND_RESTART_DELAYS_MS = [1000, 3000, 10000];
 const BACKEND_RESTART_RESET_MS = 60 * 1000;
 
@@ -58,6 +72,170 @@ function resourcePath(...parts) {
 function ensureDirectory(directory) {
     fs.mkdirSync(directory, { recursive: true });
     return directory;
+}
+
+function delay(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function sendStartupState() {
+    if (!startupWindow || startupWindow.isDestroyed() || startupWindow.webContents.isLoading()) return;
+    const serialized = JSON.stringify(startupState).replace(/</g, '\\u003c');
+    startupWindow.webContents.executeJavaScript(`window.updateStartup?.(${serialized})`, true).catch(() => {});
+}
+
+function updateStartupProgress(id, progress, title, detail = '') {
+    const previous = startupState.steps.find(step => step.status === 'running');
+    if (previous && previous.id !== id) previous.status = 'done';
+    let step = startupState.steps.find(item => item.id === id);
+    if (!step) {
+        step = { id, title, detail, status: 'running' };
+        startupState.steps.push(step);
+    } else {
+        step.title = title;
+        step.detail = detail;
+        step.status = 'running';
+    }
+    startupState.progress = Math.max(startupState.progress, Math.min(100, Math.round(progress)));
+    startupState.status = 'running';
+    startupState.title = title;
+    startupState.detail = detail;
+    startupState.error = '';
+    sendStartupState();
+}
+
+function completeStartupProgress() {
+    const current = startupState.steps.find(step => step.status === 'running');
+    if (current) current.status = 'done';
+    startupState.progress = 100;
+    startupState.status = 'success';
+    startupState.title = '启动完成';
+    startupState.detail = '三维场景、实时数据和顶部组件均已就绪';
+    sendStartupState();
+}
+
+function startupAction(url) {
+    let action = '';
+    try { action = new URL(url).hostname; } catch (error) { return; }
+    if (action === 'open-log') {
+        if (startupFailureLogPath && fs.existsSync(startupFailureLogPath)) {
+            shell.showItemInFolder(startupFailureLogPath);
+        } else {
+            shell.openPath(path.join(app.getPath('userData'), 'logs')).catch(() => {});
+        }
+        return;
+    }
+    if (action === 'restart') {
+        app.relaunch();
+        app.quit();
+        return;
+    }
+    if (action === 'exit') app.quit();
+}
+
+async function createStartupWindow() {
+    if (startupWindow && !startupWindow.isDestroyed()) return startupWindow;
+    startupWindowClosingForSuccess = false;
+    startupWindow = new BrowserWindow({
+        width: 620,
+        height: 430,
+        minWidth: 620,
+        minHeight: 430,
+        maxWidth: 620,
+        maxHeight: 430,
+        frame: false,
+        transparent: true,
+        resizable: false,
+        maximizable: false,
+        minimizable: false,
+        show: false,
+        center: true,
+        alwaysOnTop: true,
+        skipTaskbar: false,
+        backgroundColor: '#00000000',
+        icon: path.join(__dirname, 'assets', 'icon.png'),
+        webPreferences: {
+            contextIsolation: true,
+            nodeIntegration: false,
+            sandbox: true
+        }
+    });
+    startupWindow.webContents.on('will-navigate', (event, targetUrl) => {
+        if (!targetUrl.startsWith('startup-action://')) return;
+        event.preventDefault();
+        startupAction(targetUrl);
+    });
+    startupWindow.webContents.setWindowOpenHandler(({ url }) => {
+        if (url.startsWith('startup-action://')) startupAction(url);
+        return { action: 'deny' };
+    });
+    startupWindow.on('closed', () => {
+        const shouldQuit = !startupWindowClosingForSuccess && !applicationReadyForInteraction;
+        startupWindow = null;
+        startupWindowClosingForSuccess = false;
+        if (shouldQuit && !isQuitting) setImmediate(() => app.quit());
+    });
+    await startupWindow.loadFile(path.join(__dirname, 'assets', 'startup.html'));
+    if (!startupWindow || startupWindow.isDestroyed()) throw new Error('启动加载页面创建失败');
+    startupWindow.show();
+    startupWindow.focus();
+    sendStartupState();
+    await delay(120);
+    return startupWindow;
+}
+
+function closeStartupWindow() {
+    if (!startupWindow || startupWindow.isDestroyed()) return;
+    startupWindowClosingForSuccess = true;
+    startupWindow.setAlwaysOnTop(false);
+    startupWindow.close();
+}
+
+function persistStartupFailure(error) {
+    const logDirectory = ensureDirectory(path.join(app.getPath('userData'), 'logs'));
+    const filename = path.join(logDirectory, 'startup-error.log');
+    const message = error?.stack || error?.message || String(error || '未知启动错误');
+    try {
+        fs.appendFileSync(filename, `[${new Date().toISOString()}] ${message}\n`, 'utf8');
+    } catch (writeError) { /* startup UI will still show the original error */ }
+    return filename;
+}
+
+async function showStartupFailure(error) {
+    startupFailureLogPath = persistStartupFailure(error);
+    const current = startupState.steps.find(step => step.status === 'running');
+    if (current) current.status = 'error';
+    startupState.status = 'error';
+    startupState.title = '程序启动失败';
+    startupState.detail = '请查看下面的失败原因，修复后可重新启动';
+    startupState.error = error?.message || String(error || '未知启动错误');
+    startupState.logPath = startupFailureLogPath;
+    if (!startupWindow || startupWindow.isDestroyed()) await createStartupWindow();
+    sendStartupState();
+    startupWindow?.show();
+    startupWindow?.focus();
+}
+
+function signalNativeHostReady() {
+    nativeHostReady = true;
+    for (const resolve of nativeHostReadyWaiters) resolve();
+    nativeHostReadyWaiters.clear();
+}
+
+function waitForNativeHostReady(timeoutMs = 30000) {
+    if (nativeHostReady) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+        const finish = () => {
+            clearTimeout(timer);
+            nativeHostReadyWaiters.delete(finish);
+            resolve();
+        };
+        const timer = setTimeout(() => {
+            nativeHostReadyWaiters.delete(finish);
+            reject(new Error('顶部栏与数据组件加载超时，请检查 admin-host.log 和 WebView2 运行环境'));
+        }, timeoutMs);
+        nativeHostReadyWaiters.add(finish);
+    });
 }
 
 function copyMissingDirectoryContents(source, destination) {
@@ -260,6 +438,13 @@ function startDesktopControlServer() {
         if (!isLoopbackAddress(request.socket.remoteAddress) || suppliedToken !== desktopControlToken) {
             response.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
             response.end(JSON.stringify({ success: false, error: '拒绝访问' }));
+            return;
+        }
+
+        if (request.method === 'POST' && pathname === '/startup-ready') {
+            response.writeHead(202, { 'content-type': 'application/json; charset=utf-8' });
+            response.end(JSON.stringify({ success: true }));
+            setImmediate(signalNativeHostReady);
             return;
         }
 
@@ -479,13 +664,13 @@ async function syncDesktopSettings() {
     }
 }
 
-function startDesktopSettingsSync() {
+async function startDesktopSettingsSync() {
     if (desktopSettingsTimer) clearInterval(desktopSettingsTimer);
     desktopSettingsTimer = setInterval(() => {
         syncDesktopSettings();
     }, 4000);
     desktopSettingsTimer.unref?.();
-    syncDesktopSettings();
+    await syncDesktopSettings();
 }
 
 function logDesktopError(context, error) {
@@ -643,8 +828,75 @@ function closeNativeLogStreams() {
     nativeErrorLogStream = null;
 }
 
-async function startNativeClient(origin, writable) {
-    if (nativeProcess) return;
+function monitorNativeStartup(child, onUpdate, timeoutMs = 300000) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let stdoutBuffer = '';
+        let stderrBuffer = '';
+        let lastProgress = 0;
+        let lastStep = '正在启动 Unity 渲染进程';
+        let lastWarning = '';
+        const finish = (error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            child.stdout?.off('data', onStdout);
+            child.stderr?.off('data', onStderr);
+            child.off('exit', onExit);
+            child.off('error', onError);
+            if (error) reject(error);
+            else resolve();
+        };
+        const parseLine = line => {
+            const progressMatch = line.match(/\[StartupProgress\]\s*(\d{1,3})\|(.+)/);
+            if (progressMatch) {
+                lastProgress = Math.max(0, Math.min(100, Number(progressMatch[1])));
+                lastStep = progressMatch[2].trim() || lastStep;
+                onUpdate?.({ progress: lastProgress, step: lastStep, warning: lastWarning });
+                if (lastProgress >= 100) finish();
+                return;
+            }
+            const warningMatch = line.match(/\[StartupWarning\]\s*(\d{1,3})\|(.+)/);
+            if (warningMatch) {
+                lastProgress = Math.max(lastProgress, Math.min(100, Number(warningMatch[1])));
+                lastWarning = warningMatch[2].trim();
+                onUpdate?.({ progress: lastProgress, step: lastStep, warning: lastWarning });
+                return;
+            }
+            if (line.includes('[FactoryRuntime] Native factory ready')) {
+                lastProgress = 100;
+                lastStep = '三维场景已就绪';
+                onUpdate?.({ progress: 100, step: lastStep, warning: lastWarning });
+                finish();
+            }
+        };
+        const consume = (chunk, isError) => {
+            const combined = (isError ? stderrBuffer : stdoutBuffer) + chunk.toString('utf8');
+            const lines = combined.split(/\r?\n/);
+            const remainder = lines.pop() || '';
+            if (isError) stderrBuffer = remainder;
+            else stdoutBuffer = remainder;
+            lines.forEach(parseLine);
+        };
+        const onStdout = chunk => consume(chunk, false);
+        const onStderr = chunk => consume(chunk, true);
+        const onExit = code => finish(new Error(
+            `Unity 在“${lastStep}”时退出（代码 ${code ?? '未知'}）${lastWarning ? `：${lastWarning}` : ''}`
+        ));
+        const onError = error => finish(new Error(`Unity 启动失败：${error.message}`));
+        const timer = setTimeout(() => finish(new Error(
+            `Unity 在“${lastStep}”步骤加载超时${lastWarning ? `：${lastWarning}` : '，请查看 native-client.log'}`
+        )), timeoutMs);
+        child.stdout?.on('data', onStdout);
+        child.stderr?.on('data', onStderr);
+        child.once('exit', onExit);
+        child.once('error', onError);
+        onUpdate?.({ progress: lastProgress, step: lastStep, warning: '' });
+    });
+}
+
+async function startNativeClient(origin, writable, startupProgressCallback = null) {
+    if (nativeProcess) return { process: nativeProcess, ready: Promise.resolve() };
     const clientDir = nativeClientDirectory();
     const executable = path.join(clientDir, 'HeatTreatmentDigitalTwin.exe');
     if (!fs.existsSync(executable)) {
@@ -698,16 +950,18 @@ async function startNativeClient(origin, writable) {
         },
         stdio: ['ignore', 'pipe', 'pipe']
     });
+    nativeHostReady = false;
     nativeProcess = child;
     child.stdout?.pipe(nativeLogStream, { end: false });
     child.stderr?.pipe(nativeErrorLogStream, { end: false });
     child.once('exit', code => {
         const wasCurrent = nativeProcess === child;
         if (wasCurrent) nativeProcess = null;
+        if (wasCurrent) nativeHostReady = false;
         closeNativeLogStreams();
         updateTrayMenu();
         if (!isQuitting && wasCurrent) {
-            if (code !== 0) {
+            if (code !== 0 && applicationReadyForInteraction) {
                 const error = new Error(`Unity 原生大屏异常退出（代码 ${code}）`);
                 logDesktopError('native-client-exit', error);
                 dialog.showErrorBox(
@@ -715,7 +969,7 @@ async function startNativeClient(origin, writable) {
                     `${error.message}。\n错误日志：${path.join(writable.logsDir, 'native-client-error.log')}`
                 );
             }
-            showAdminWindow();
+            if (applicationReadyForInteraction) showAdminWindow();
         }
     });
     await new Promise((resolve, reject) => {
@@ -723,6 +977,13 @@ async function startNativeClient(origin, writable) {
         child.once('error', reject);
     });
     updateTrayMenu();
+    const timeoutMs = Math.max(30000, Number(process.env.DESKTOP_NATIVE_STARTUP_TIMEOUT_MS || 300000));
+    return {
+        process: child,
+        ready: startupProgressCallback
+            ? monitorNativeStartup(child, startupProgressCallback, timeoutMs)
+            : Promise.resolve()
+    };
 }
 
 function stopNativeClient() {
@@ -1037,38 +1298,58 @@ function createMainWindow(origin, showInitially = false) {
 }
 
 async function launchApplication() {
+    await createStartupWindow();
+    updateStartupProgress('resources', 6, '正在准备程序资源', '检查运行目录、数据目录和模型资源');
+    if (process.env.DESKTOP_SMOKE_FORCE_STARTUP_ERROR) {
+        throw new Error(String(process.env.DESKTOP_SMOKE_FORCE_STARTUP_ERROR));
+    }
     const writable = initializeWritableData();
     writablePaths = writable;
+    updateStartupProgress('logs', 18, '正在初始化日志系统', `日志目录：${writable.logsDir}`);
     desktopErrorLogStream = guardLogStream(
         await createRotatingLogWriter(writable.logsDir, 'desktop-error.log'),
         '桌面错误日志'
     );
     startLogMaintenance(writable.logsDir);
+    updateStartupProgress('network', 25, '正在分配本地服务端口', '检测端口占用和本机通信环境');
     const port = await findAvailablePort();
     const origin = `http://127.0.0.1:${port}`;
     applicationOrigin = origin;
     // The backend needs this loopback channel in its environment so a DLNA
     // cast can switch the embedded host back to the Unity dashboard before
     // the desktop region is captured.
+    updateStartupProgress('control', 32, '正在启动桌面控制服务', '准备 Unity、后台管理与系统托盘之间的通信');
     await startDesktopControlServer();
+    updateStartupProgress('backend', 41, '正在启动数据服务', '连接配置数据库并载入现场配置');
     const initialBackendProcess = await startBackend(port, writable);
+    updateStartupProgress('backend-health', 50, '正在检查数据服务', `等待本地接口 ${origin} 就绪`);
     await waitForHealth(`${origin}/api/health`, 60000, initialBackendProcess);
-    startDesktopSettingsSync();
+    updateStartupProgress('settings', 59, '正在读取系统设置', '同步开机自启、日志、备份和运行参数');
+    await startDesktopSettingsSync();
+    updateStartupProgress('tray', 65, '正在创建系统托盘', '初始化后台常驻与安全退出功能');
     createTray();
-    try {
-        await startNativeClient(origin, writable);
-    } catch (error) {
-        logDesktopError('native-client-start', error);
-        dialog.showErrorBox(APP_NAME, `原生大屏启动失败：${error.message}`);
-        applicationReadyForInteraction = true;
-        pendingNativeAdminRequest = false;
-        showAdminWindow();
-    }
+    updateStartupProgress('unity-process', 69, '正在启动三维大屏', '创建 Unity 渲染进程');
+    const nativeStartup = await startNativeClient(origin, writable, state => {
+        const overallProgress = 70 + Math.round(Math.min(100, Math.max(0, state.progress)) * 0.22);
+        updateStartupProgress(
+            'unity-scene',
+            overallProgress,
+            state.step || '正在加载三维场景',
+            state.warning ? `最近一次加载异常：${state.warning}` : '正在加载现场层级、设备模型与实时数据'
+        );
+    });
+    await nativeStartup.ready;
+    updateStartupProgress('admin-host', 94, '正在加载顶部栏和数据组件', '等待后台管理 WebView2 完成首屏渲染');
+    await waitForNativeHostReady(45000);
     applicationReadyForInteraction = true;
     if (nativeProcess && (process.argv.includes('--admin') || pendingNativeAdminRequest)) {
         pendingNativeAdminRequest = false;
         setTimeout(showNativeAdminPanel, 600).unref?.();
     }
+    updateStartupProgress('ready', 99, '正在完成启动', '确认三维场景、实时数据和顶部组件状态');
+    completeStartupProgress();
+    await delay(420);
+    closeStartupWindow();
     const smokeCrashBackendAfterMs = Number(process.env.DESKTOP_SMOKE_CRASH_BACKEND_AFTER_MS || 0);
     if (Number.isFinite(smokeCrashBackendAfterMs) && smokeCrashBackendAfterMs > 0) {
         setTimeout(() => {
@@ -1085,14 +1366,25 @@ async function launchApplication() {
 if (!app.requestSingleInstanceLock()) {
     app.quit();
 } else {
-    app.on('second-instance', showNativeAdminPanel);
+    app.on('second-instance', () => {
+        if (startupWindow && !startupWindow.isDestroyed() && !applicationReadyForInteraction) {
+            startupWindow.show();
+            startupWindow.focus();
+            return;
+        }
+        showNativeAdminPanel();
+    });
 
     app.whenReady().then(() => {
         return launchApplication();
-    }).catch((error) => {
+    }).catch(async (error) => {
         logDesktopError('application-start', error);
-        dialog.showErrorBox(APP_NAME, `${error.message}\n请查看用户数据目录中的 logs/desktop-error.log 和 logs/backend-error.log。`);
-        app.quit();
+        try {
+            await showStartupFailure(error);
+        } catch (displayError) {
+            dialog.showErrorBox(APP_NAME, `${error.message}\n启动错误界面也无法显示：${displayError.message}`);
+            app.quit();
+        }
     });
 
     // Windows 上关闭后台窗口只隐藏到托盘，Unity 大屏和后端继续运行。

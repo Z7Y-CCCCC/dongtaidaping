@@ -56,6 +56,8 @@ internal sealed class AdminPanelForm : Form
     private bool _waitingForParentWindow;
     private bool _closing;
     private bool _webViewDisposeAttempted;
+    private bool _startupReadyReported;
+    private bool _startupReadyReportInProgress;
     private Task? _pipeTask;
 
     public AdminPanelForm(HostOptions options)
@@ -221,15 +223,24 @@ internal sealed class AdminPanelForm : Form
             _webView.CoreWebView2.NewWindowRequested += HandleNewWindow;
             _webView.CoreWebView2.DownloadStarting += HandleDownload;
             _webView.CoreWebView2.WebMessageReceived += HandleWebMessage;
-            _webView.CoreWebView2.NavigationCompleted += (_, _) =>
+            _webView.CoreWebView2.NavigationCompleted += (_, args) =>
             {
                 BeginInvoke(() =>
                 {
                     if (_closing || IsDisposed) return;
+                    if (!args.IsSuccess)
+                    {
+                        WriteHostError(
+                            $"后台页面加载失败（{args.WebErrorStatus}）",
+                            new InvalidOperationException($"WebView2 navigation failed: {args.WebErrorStatus}")
+                        );
+                        return;
+                    }
                     // 大屏模式只显示这个 WebView 的顶部 46px，承载“实时大屏 / 后台管理”页签。
                     // 不能按 _adminVisible 隐藏，否则只会剩下一条深色空白底。
                     _webView.Visible = !_panelHidden;
                     SendHostState();
+                    _ = ReportStartupReadyAsync();
                 });
             };
             _webView.CoreWebView2.Navigate(_options.Url);
@@ -1042,6 +1053,28 @@ internal sealed class AdminPanelForm : Form
         catch
         {
             return false;
+        }
+    }
+
+    private async Task ReportStartupReadyAsync()
+    {
+        if (_startupReadyReported || _startupReadyReportInProgress || !HasDesktopControl) return;
+        _startupReadyReportInProgress = true;
+        try
+        {
+            for (var attempt = 0; attempt < 6 && !_closing; attempt += 1)
+            {
+                if (await PostDesktopControlAsync("startup-ready"))
+                {
+                    _startupReadyReported = true;
+                    return;
+                }
+                await Task.Delay(250);
+            }
+        }
+        finally
+        {
+            _startupReadyReportInProgress = false;
         }
     }
 
