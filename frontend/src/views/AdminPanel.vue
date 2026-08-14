@@ -181,7 +181,7 @@ const storedAdminUiState = loadAdminUiState()
 
 const PLATFORM_SUBPAGES = [
     { key: 'designer', label: '大屏设计器', description: '拖拽组件、绑定数据并发布画面' },
-    { key: 'scene', label: '项目与场景', description: '标题、主题、视角与数据时效' },
+    { key: 'scene', label: '项目与场景', description: '项目归属与场景基础信息' },
     { key: 'environment', label: '场景与光效', description: 'Unity 灯光、后处理、围墙与空间' },
     { key: 'native-dashboard', label: 'Unity 原生组件', description: '总览、详情栏与设备点位展示' }
 ]
@@ -3387,25 +3387,11 @@ async function loadPlatform() {
     }
 }
 
-const activeSceneDisplayTitle = computed({
-    get: () => {
-        const scene = platform.value.activeScene
-        return String(scene?.theme?.title || settings.factory_name || scene?.name || '').trim()
-    },
-    set: value => {
-        const scene = platform.value.activeScene
-        if (!scene) return
-        if (!scene.theme || typeof scene.theme !== 'object') scene.theme = {}
-        scene.theme.title = String(value ?? '')
-    }
-})
-
 async function saveActiveScene() {
     const scene = platform.value.activeScene
     if (!scene) return
     if (!scene.camera || typeof scene.camera !== 'object') scene.camera = {}
     if (!scene.theme || typeof scene.theme !== 'object') scene.theme = {}
-    scene.theme.title = activeSceneDisplayTitle.value || scene.name
     const result = await adminApi.updateScene(scene.id, {
         name: scene.name,
         scene_type: scene.scene_type,
@@ -3417,20 +3403,7 @@ async function saveActiveScene() {
     })
     if (result?.error) return alert(result.error, { title: '场景保存失败', type: 'danger' })
     if (!result?.success) return alert('场景保存失败：后端没有返回成功状态', { title: '场景保存失败', type: 'danger' })
-
-    // 当前场景是唯一配置源；同步旧字段仅用于仍在运行的 Unity / 旧 Web 客户端兼容。
-    const compatibilitySettings = {
-        factory_name: scene.theme.title,
-        camera_mode: scene.camera.mode || 'auto',
-        realtime_stale_ms: String(Number(scene.camera.staleMs) || 6000),
-        display_mode: scene.theme.preset || 'industrial_twin'
-    }
-    const compatibilityResult = await adminApi.saveSettings(compatibilitySettings)
-    if (compatibilityResult?.error) {
-        return alert(`场景已保存，但运行端兼容参数同步失败：${compatibilityResult.error}`, { title: '部分保存成功', type: 'warning' })
-    }
-    Object.assign(settings, compatibilitySettings)
-    await alert('场景配置已保存', { title: '保存成功', type: 'success' })
+    await alert('场景名称已保存', { title: '保存成功', type: 'success' })
     await loadPlatform()
 }
 
@@ -7173,6 +7146,7 @@ const mainTabs = [
 
                     <div v-show="platformSubpage === 'scene'" v-if="platform.activeProject" class="settings-section secondary-page-panel">
                         <h3 class="section-title">项目与当前场景</h3>
+                        <p class="scene-basic-note">这里只管理场景的基础身份信息。大屏名称、主题和多级视角请在“大屏设计器”中配置；灯光与环境请在“场景与光效”中配置。</p>
                         <div class="settings-grid" v-if="platform.activeScene">
                             <label>项目名称
                                 <input :value="platform.activeProject.name" disabled class="input" />
@@ -7180,35 +7154,8 @@ const mainTabs = [
                             <label>场景名称
                                 <input v-model="platform.activeScene.name" class="input" />
                             </label>
-                            <label>大屏显示标题
-                                <input v-model="activeSceneDisplayTitle" class="input" placeholder="智能热处理数字孪生控制中心" />
-                            </label>
-                            <label>场景类型
-                                <select v-model="platform.activeScene.scene_type" class="input">
-                                    <option value="factory_overview">工厂总览</option>
-                                    <option value="workshop_overview">车间总览</option>
-                                    <option value="line_overview">产线总览</option>
-                                    <option value="device_detail">设备详情</option>
-                                </select>
-                            </label>
-                            <label>主题预设
-                                <select v-model="platform.activeScene.theme.preset" class="input">
-                                    <option value="industrial_twin">真实工业数字孪生</option>
-                                    <option value="classic_blue">经典科技蓝</option>
-                                </select>
-                            </label>
-                            <label>相机模式
-                                <select v-model="platform.activeScene.camera.mode" class="input">
-                                    <option value="auto">自动</option>
-                                    <option value="4level">四级运镜</option>
-                                    <option value="3level">三级运镜</option>
-                                </select>
-                            </label>
-                            <label>数据过期阈值(ms)
-                                <input v-model.number="platform.activeScene.camera.staleMs" type="number" class="input" />
-                            </label>
                         </div>
-                        <button @click="saveActiveScene" class="btn btn-primary" style="margin-top:16px;">保存当前场景</button>
+                        <button @click="saveActiveScene" class="btn btn-primary" style="margin-top:16px;">保存场景名称</button>
                     </div>
 
                     <div v-show="platformSubpage === 'environment'" class="secondary-page-panel">
@@ -12207,6 +12154,7 @@ button:enabled:active {
     margin: 0 0 20px 0; font-size: 16px; color: #1d1d1f; font-weight: 600;
     padding-bottom: 12px; border-bottom: 1px solid rgba(0, 0, 0, 0.06);
 }
+.scene-basic-note { margin: -8px 0 18px; padding: 11px 13px; color: #6e6e73; background: #f5f5f7; border-radius: 9px; font-size: 12px; line-height: 1.55; }
 .legacy-web-render-section {
     padding-top: 18px;
     padding-bottom: 18px;
