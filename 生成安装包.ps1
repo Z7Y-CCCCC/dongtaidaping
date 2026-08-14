@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$DatabaseHost = '127.0.0.1',
     [int]$DatabasePort = 3307,
