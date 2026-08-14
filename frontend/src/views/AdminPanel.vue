@@ -426,15 +426,51 @@ async function createWorkshop() {
     await alert(`车间「${createdName}」已创建`, { title: '新增成功', type: 'success' })
 }
 
+async function requestNamedDeletionConfirmation(typeLabel, id, loadImpact) {
+    let impact
+    try {
+        impact = await loadImpact(id)
+    } catch (error) {
+        await alert(error.message || `无法读取${typeLabel}关联项`, { title: '删除前检查失败', type: 'danger' })
+        return null
+    }
+    const targetName = String(impact?.name || '')
+    if (!targetName) {
+        await alert(`${typeLabel}名称为空，无法执行名称确认删除`, { title: '无法删除', type: 'danger' })
+        return null
+    }
+    const associationCount = Number(impact?.associationCount || 0)
+    const accepted = await confirm(
+        associationCount > 0
+            ? `此操作不可撤销，共有 ${associationCount} 个关联项会被一并删除。`
+            : '此操作不可撤销，当前没有需要一并删除的关联项。',
+        {
+            title: `永久删除${typeLabel}「${targetName}」`,
+            type: 'danger',
+            confirmText: '永久删除',
+            details: Array.isArray(impact?.associations) ? impact.associations : [],
+            verificationText: targetName,
+            verificationLabel: `请输入${typeLabel}名称“${targetName}”确认删除`
+        }
+    )
+    return accepted ? { impact, targetName } : null
+}
+
 async function deleteWorkshop(id) {
-    if (!(await confirm(`确定删除车间 ${id}？该车间下的所有产线及设备也会被删除！`))) return
-    const result = await adminApi.deleteWorkshop(id)
+    const confirmation = await requestNamedDeletionConfirmation('车间', id, adminApi.getWorkshopDeletionImpact)
+    if (!confirmation) return
+    let result
+    try {
+        result = await adminApi.deleteWorkshop(id, confirmation.targetName)
+    } catch (error) {
+        return alert(error.message || '删除车间失败', { title: '删除车间失败', type: 'danger' })
+    }
     if (result?.error) return alert(result.error, { title: '删除车间失败', type: 'danger' })
     if (!result?.success) return alert('删除车间失败：后端没有返回成功状态', { title: '删除车间失败', type: 'danger' })
     await loadWorkshops()
     await loadLines()
     await loadDevices()
-    await alert(`车间「${id}」已删除`, { title: '删除成功', type: 'success' })
+    await alert(`车间「${confirmation.targetName}」已删除`, { title: '删除成功', type: 'success' })
 }
 
 function previewWorkshopSpatialLayout() {
@@ -771,13 +807,19 @@ async function createLine() {
 }
 
 async function deleteLine(id) {
-    if (!(await confirm(`确定删除产线 ${id}？该产线下的所有设备也会被删除！`))) return
-    const result = await adminApi.deleteLine(id)
+    const confirmation = await requestNamedDeletionConfirmation('产线', id, adminApi.getLineDeletionImpact)
+    if (!confirmation) return
+    let result
+    try {
+        result = await adminApi.deleteLine(id, confirmation.targetName)
+    } catch (error) {
+        return alert(error.message || '删除产线失败', { title: '删除产线失败', type: 'danger' })
+    }
     if (result?.error) return alert(result.error, { title: '删除产线失败', type: 'danger' })
     if (!result?.success) return alert('删除产线失败：后端没有返回成功状态', { title: '删除产线失败', type: 'danger' })
     await loadLines()
     await loadDevices()
-    await alert(`产线「${id}」已删除`, { title: '删除成功', type: 'success' })
+    await alert(`产线「${confirmation.targetName}」已删除`, { title: '删除成功', type: 'success' })
 }
 
 // ============ 设备管理 ============
@@ -981,13 +1023,19 @@ async function saveDevice() {
 }
 
 async function deleteDevice(id) {
-    if (!(await confirm(`确定删除设备 ${id}？`))) return
-    const result = await adminApi.deleteDevice(id)
+    const confirmation = await requestNamedDeletionConfirmation('设备', id, adminApi.getDeviceDeletionImpact)
+    if (!confirmation) return
+    let result
+    try {
+        result = await adminApi.deleteDevice(id, confirmation.targetName)
+    } catch (error) {
+        return alert(error.message || '删除设备失败', { title: '删除失败', type: 'danger' })
+    }
     if (result?.error) return alert(result.error, { title: '删除失败', type: 'danger' })
     if (!result?.success) return alert('删除失败：后端没有返回成功状态', { title: '删除失败', type: 'danger' })
     await loadDevices()
     setTimeout(() => loadEngineStatus(), 800)
-    await alert(`设备「${id}」已删除`, { title: '删除成功', type: 'success' })
+    await alert(`设备「${confirmation.targetName}」已删除`, { title: '删除成功', type: 'success' })
 }
 
 const {
@@ -8211,12 +8259,35 @@ const mainTabs = [
                     <div class="app-dialog-body">
                         <h3>{{ appDialog.title }}</h3>
                         <p>{{ appDialog.message }}</p>
+                        <div v-if="appDialog.details.length" class="app-dialog-details">
+                            <div v-for="item in appDialog.details" :key="item.key || item.label">
+                                <span>{{ item.label }}</span>
+                                <strong>{{ item.count }} 项</strong>
+                            </div>
+                        </div>
+                        <label v-if="appDialog.verificationText" class="app-dialog-verification">
+                            <span>{{ appDialog.verificationLabel || '请输入名称以确认删除' }}</span>
+                            <input
+                                v-model="appDialog.verificationInput"
+                                class="input"
+                                autocomplete="off"
+                                spellcheck="false"
+                                :placeholder="appDialog.verificationText"
+                                @keydown.enter.prevent="closeAppDialog(true)"
+                            />
+                            <small>需要输入：<strong>{{ appDialog.verificationText }}</strong></small>
+                        </label>
                     </div>
                     <div class="app-dialog-actions">
                         <button v-if="appDialog.showCancel" type="button" class="btn" @click="closeAppDialog(false)">
                             {{ appDialog.cancelText }}
                         </button>
-                        <button type="button" class="btn btn-primary" @click="closeAppDialog(true)">
+                        <button
+                            type="button"
+                            class="btn btn-primary"
+                            :disabled="!!appDialog.verificationText && appDialog.verificationInput !== appDialog.verificationText"
+                            @click="closeAppDialog(true)"
+                        >
                             {{ appDialog.confirmText }}
                         </button>
                     </div>
@@ -11105,6 +11176,37 @@ button:enabled:active {
     line-height: 1.55;
     white-space: pre-line;
 }
+.app-dialog-details {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 14px;
+}
+.app-dialog-details > div {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    min-width: 0;
+    padding: 9px 11px;
+    background: #f5f5f7;
+    border: 1px solid #e7e7ea;
+    border-radius: 9px;
+}
+.app-dialog-details span { color: #6e6e73; font-size: 12px; }
+.app-dialog-details strong { color: #1d1d1f; font-size: 13px; white-space: nowrap; }
+.app-dialog-verification {
+    display: grid;
+    gap: 7px;
+    margin-top: 16px;
+    color: #515154;
+    font-size: 12px;
+}
+.app-dialog-verification .input { width: 100%; }
+.app-dialog-verification small { color: #86868b; font-size: 11px; }
+.app-dialog-verification small strong { color: #1d1d1f; user-select: all; }
+.dialog-danger .app-dialog-actions .btn-primary { border-color: #d92d20; background: #d92d20; }
+.dialog-danger .app-dialog-actions .btn-primary:disabled { border-color: #d9d9dd; background: #d9d9dd; }
 .app-dialog-actions {
     grid-column: 2;
     display: flex;

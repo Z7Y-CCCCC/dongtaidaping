@@ -2,6 +2,11 @@ const express = require('express');
 const router = express.Router();
 const { getDb } = require('../db/database');
 const { normalizeLineLayout } = require('../utils/spatialLayout');
+const {
+    assertDeletionConfirmation,
+    getLineDeletionImpact,
+    publicDeletionImpact
+} = require('../services/deletionImpact');
 
 function normalizeLineRow(row) {
     const layout = normalizeLineLayout(row.layout_json || row.layout);
@@ -17,6 +22,16 @@ router.get('/', async (req, res) => {
         const db = await getDb();
         const lines = await db.all('SELECT * FROM `lines` ORDER BY sort_order ASC');
         res.json(lines.map(normalizeLineRow));
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.get('/:id/deletion-impact', async (req, res) => {
+    try {
+        const impact = await getLineDeletionImpact(await getDb(), req.params.id);
+        if (!impact) return res.status(404).json({ error: '产线不存在，可能已经被删除或 ID 未正确编码' });
+        res.json(publicDeletionImpact(impact));
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -67,17 +82,25 @@ router.put('/:id', async (req, res) => {
 router.delete('/:id', async (req, res) => {
     try {
         const db = await getDb();
-        const existing = await db.get('SELECT id FROM `lines` WHERE id = ?', [req.params.id]);
-        if (!existing) return res.status(404).json({ error: '产线不存在，可能已经被删除或 ID 未正确编码' });
-
-        await db.transaction(async (tx) => {
-            await tx.run('DELETE FROM data_points WHERE device_id IN (SELECT id FROM devices WHERE line_id = ?)', [req.params.id]);
-            await tx.run('DELETE FROM devices WHERE line_id = ?', [req.params.id]);
+        const deletedImpact = await db.transaction(async (tx) => {
+            const impact = await getLineDeletionImpact(tx, req.params.id);
+            if (!impact) {
+                const error = new Error('产线不存在，可能已经被删除或 ID 未正确编码');
+                error.statusCode = 404;
+                throw error;
+            }
+            assertDeletionConfirmation(req.body, impact.name);
+            if (impact.deviceIds.length) {
+                const placeholders = impact.deviceIds.map(() => '?').join(',');
+                await tx.run(`DELETE FROM data_points WHERE device_id IN (${placeholders})`, impact.deviceIds);
+                await tx.run(`DELETE FROM devices WHERE id IN (${placeholders})`, impact.deviceIds);
+            }
             await tx.run('DELETE FROM `lines` WHERE id = ?', [req.params.id]);
+            return impact;
         });
-        res.json({ success: true });
+        res.json({ success: true, impact: publicDeletionImpact(deletedImpact) });
     } catch (e) {
-        res.status(400).json({ error: e.message });
+        res.status(e.statusCode || 400).json({ error: e.message });
     }
 });
 

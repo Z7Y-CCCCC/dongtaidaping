@@ -177,13 +177,15 @@ export const adminApi = {
     async getWorkshops() { return (await fetch(`${API_BASE}/workshops`)).json() },
     async createWorkshop(data) { return readApiJson(await fetch(`${API_BASE}/workshops`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '创建车间失败') },
     async updateWorkshop(id, data) { return readApiJson(await fetch(`${API_BASE}/workshops/${pathId(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存车间失败') },
-    async deleteWorkshop(id) { return readApiJson(await fetch(`${API_BASE}/workshops/${pathId(id)}`, { method: 'DELETE' }), '删除车间失败') },
+    async getWorkshopDeletionImpact(id) { return readApiJson(await fetch(`${API_BASE}/workshops/${pathId(id)}/deletion-impact`), '读取车间关联项失败') },
+    async deleteWorkshop(id, confirmationName) { return readApiJson(await fetch(`${API_BASE}/workshops/${pathId(id)}`, { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ confirmationName }) }), '删除车间失败') },
 
     // 产线
     async getLines() { return (await fetch(`${API_BASE}/lines`)).json() },
     async createLine(data) { return readApiJson(await fetch(`${API_BASE}/lines`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '创建产线失败') },
     async updateLine(id, data) { return readApiJson(await fetch(`${API_BASE}/lines/${pathId(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存产线失败') },
-    async deleteLine(id) { return readApiJson(await fetch(`${API_BASE}/lines/${pathId(id)}`, { method: 'DELETE' }), '删除产线失败') },
+    async getLineDeletionImpact(id) { return readApiJson(await fetch(`${API_BASE}/lines/${pathId(id)}/deletion-impact`), '读取产线关联项失败') },
+    async deleteLine(id, confirmationName) { return readApiJson(await fetch(`${API_BASE}/lines/${pathId(id)}`, { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ confirmationName }) }), '删除产线失败') },
 
     // 设备
     async getDevices(lineId) { 
@@ -193,7 +195,8 @@ export const adminApi = {
     async getDevice(id) { return readApiJson(await fetch(`${API_BASE}/devices/${pathId(id)}`), '读取设备失败') },
     async createDevice(data) { return readApiJson(await fetch(`${API_BASE}/devices`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '创建设备失败') },
     async updateDevice(id, data) { return readApiJson(await fetch(`${API_BASE}/devices/${pathId(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) }), '保存设备失败') },
-    async deleteDevice(id) { return readApiJson(await fetch(`${API_BASE}/devices/${pathId(id)}`, { method: 'DELETE' }), '删除设备失败') },
+    async getDeviceDeletionImpact(id) { return readApiJson(await fetch(`${API_BASE}/devices/${pathId(id)}/deletion-impact`), '读取设备关联项失败') },
+    async deleteDevice(id, confirmationName) { return readApiJson(await fetch(`${API_BASE}/devices/${pathId(id)}`, { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ confirmationName }) }), '删除设备失败') },
 
     // 点位
     async getDataPoints(deviceId) {

@@ -8,6 +8,11 @@ const {
     normalizeProtocol,
     sanitizePlcOptions
 } = require('../services/plcProtocolConfig');
+const {
+    assertDeletionConfirmation,
+    getDeviceDeletionImpact,
+    publicDeletionImpact
+} = require('../services/deletionImpact');
 
 function numberWithDefault(value, defaultValue) {
     return value === undefined || value === null || value === '' ? defaultValue : Number(value);
@@ -81,6 +86,16 @@ router.get('/', async (req, res) => {
             ? await db.all('SELECT * FROM devices WHERE line_id = ? ORDER BY sort_order ASC', [line_id])
             : await db.all('SELECT * FROM devices ORDER BY line_id, sort_order ASC');
         res.json(devices.map(publicDevice));
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.get('/:id/deletion-impact', async (req, res) => {
+    try {
+        const impact = await getDeviceDeletionImpact(await getDb(), req.params.id);
+        if (!impact) return res.status(404).json({ error: '设备不存在，可能已经被删除或 ID 未正确编码' });
+        res.json(publicDeletionImpact(impact));
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -229,18 +244,23 @@ router.put('/:id', async (req, res) => {
 router.delete('/:id', async (req, res) => {
     try {
         const db = await getDb();
-        const existing = await db.get('SELECT id FROM devices WHERE id = ?', [req.params.id]);
-        if (!existing) return res.status(404).json({ error: '设备不存在，可能已经被删除或 ID 未正确编码' });
-
-        await db.transaction(async (tx) => {
+        const deletedImpact = await db.transaction(async (tx) => {
+            const impact = await getDeviceDeletionImpact(tx, req.params.id);
+            if (!impact) {
+                const error = new Error('设备不存在，可能已经被删除或 ID 未正确编码');
+                error.statusCode = 404;
+                throw error;
+            }
+            assertDeletionConfirmation(req.body, impact.name);
             await tx.run('DELETE FROM data_points WHERE device_id = ?', [req.params.id]);
             const result = await tx.run('DELETE FROM devices WHERE id = ?', [req.params.id]);
             if (!result?.affectedRows && !result?.changes) throw new Error('设备删除失败：没有删除到任何记录');
+            return impact;
         });
         restartDataEngineSoon('delete device');
-        res.json({ success: true });
+        res.json({ success: true, impact: publicDeletionImpact(deletedImpact) });
     } catch (e) {
-        res.status(400).json({ error: e.message });
+        res.status(e.statusCode || 400).json({ error: e.message });
     }
 });
 
