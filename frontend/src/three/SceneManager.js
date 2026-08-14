@@ -4,6 +4,12 @@ import { CSS2DObject, CSS2DRenderer } from 'three/examples/jsm/renderers/CSS2DRe
 import { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
 import gsap from 'gsap';
 import { getBackendOrigin } from '../runtime/backendEndpoint.js';
+import {
+    composeSpatialTransforms,
+    localToParentPoint,
+    normalizeSpatialTransform,
+    normalizeWorkshopLayout
+} from '../utils/spatialLayout.js';
 
 function createConcreteTexture() {
     const size = 512;
@@ -143,11 +149,25 @@ function getLineLayout(line) {
     if (!lanes.length) {
         lanes.push({ id: 'lane_1', name: '设备线 1', type: 'device_lane', offsetZ: 0, length: 60, sort_order: 0 });
     }
-    return { version: 1, flowDirection, lanes, rails };
+    return {
+        version: Number(source.version || 1),
+        coordinateSpace: source.coordinateSpace || (Number(source.version || 0) >= 2 ? 'workshop_local' : 'legacy_world'),
+        transform: normalizeSpatialTransform(source.transform),
+        flowDirection,
+        lanes,
+        rails
+    };
 }
 
-function getLineBaseZ(globalLineIndex) {
+function getLineBaseZ(globalLineIndex, line = null) {
+    if (Number(getLineLayout(line).version || 0) >= 2) return 0;
     return -numberOrDefault(globalLineIndex, 0) * 16;
+}
+
+function getLineGuideWorldTransform(workshop, line, layout = getLineLayout(line)) {
+    if (Number(layout.version || 0) < 2) return normalizeSpatialTransform(null);
+    const workshopLayout = normalizeWorkshopLayout(workshop?.layout || workshop?.layout_json);
+    return composeSpatialTransforms(workshopLayout.transform, layout.transform);
 }
 
 export class SceneManager {
@@ -216,6 +236,27 @@ export class SceneManager {
 
     initScene() {
         this.scene = new THREE.Scene();
+
+        if (this.renderOptions.lightweight === true) {
+            const envColor = 0xaab3af;
+            this.scene.background = new THREE.Color(envColor);
+            const ground = new THREE.Mesh(
+                new THREE.PlaneGeometry(560, 560),
+                new THREE.MeshBasicMaterial({ color: 0x8a928e })
+            );
+            ground.rotation.x = -Math.PI / 2;
+            ground.position.y = -0.1;
+            this.scene.add(ground);
+            this.environmentObjects.push(ground);
+
+            const grid = new THREE.GridHelper(440, 32, 0x66716c, 0x77817d);
+            grid.position.y = -0.085;
+            grid.material.opacity = 0.1;
+            grid.material.transparent = true;
+            this.scene.add(grid);
+            this.environmentObjects.push(grid);
+            return;
+        }
         
         // 真实车间观感：浅灰厂房、混凝土地坪、通道标线和尺度网格。
         const envColor = 0xa9b0ad;
@@ -318,6 +359,13 @@ export class SceneManager {
     }
 
     initLights() {
+        if (this.renderOptions.lightweight === true) {
+            this.scene.add(new THREE.HemisphereLight(0xffffff, 0x6f7772, 1.65));
+            const light = new THREE.DirectionalLight(0xffffff, 1.15);
+            light.position.set(24, 42, 18);
+            this.scene.add(light);
+            return;
+        }
         // 使用半球光提供基础的体积感和漫反射（顶光白，地面暖灰）
         const hemiLight = new THREE.HemisphereLight(0xffffff, 0x6f7772, 1.45);
         this.scene.add(hemiLight);
@@ -335,6 +383,7 @@ export class SceneManager {
     }
 
     initEnvironment() {
+        if (this.renderOptions.environment === false || this.renderOptions.lightweight === true) return;
         const generator = new THREE.PMREMGenerator(this.renderer);
         generator.compileEquirectangularShader();
         const url = `${getBackendOrigin()}/assets/textures/industrial/blocky_photo_studio_1k.hdr`;
@@ -548,11 +597,13 @@ export class SceneManager {
         workshops.forEach((ws, wsIdx) => {
             (ws.lines || []).forEach((line) => {
                 const globalLineIndex = this.lineDeviceRanges.length;
+                const layout = getLineLayout(line);
                 this.lineDeviceRanges.push({
                     lineId: line.id,
                     line,
-                    layout: getLineLayout(line),
-                    baseZ: getLineBaseZ(globalLineIndex),
+                    layout,
+                    baseZ: getLineBaseZ(globalLineIndex, line),
+                    worldTransform: getLineGuideWorldTransform(ws, line, layout),
                     workshopIdx: wsIdx,
                     globalLineIndex
                 });
@@ -582,8 +633,7 @@ export class SceneManager {
         layer.name = 'factory_layout_guides';
 
         this.lineDeviceRanges.forEach((range) => {
-            const devices = this.getLineStructureDevices(range.globalLineIndex);
-            const bounds = this.getLineSceneBounds(range, devices, 7, 5);
+            const bounds = this.getLineLocalGuideBounds(range, 7, 5);
             const width = Math.max(64, bounds.spanX);
             const depth = Math.max(10, bounds.spanZ);
             const centerX = bounds.centerX;
@@ -594,6 +644,9 @@ export class SceneManager {
                 globalLineIndex: range.globalLineIndex,
                 workshopIdx: range.workshopIdx
             };
+            const worldTransform = range.worldTransform || normalizeSpatialTransform(null);
+            group.position.set(worldTransform.x, worldTransform.y, worldTransform.z);
+            group.rotation.y = -THREE.MathUtils.degToRad(worldTransform.rotationY);
 
             const zone = makeFloorPlane(width, depth, range.globalLineIndex % 2 === 0 ? 0x4a6f62 : 0x596a70, 0.13);
             zone.position.set(centerX, -0.052, centerZ);
@@ -811,11 +864,15 @@ export class SceneManager {
         });
 
         const layout = range?.layout || getLineLayout(range?.line);
-        const baseZ = numberOrDefault(range?.baseZ, getLineBaseZ(range?.globalLineIndex));
+        const baseZ = numberOrDefault(range?.baseZ, getLineBaseZ(range?.globalLineIndex, range?.line));
+        const worldTransform = range?.worldTransform || normalizeSpatialTransform(null);
         [...(layout.lanes || []), ...(layout.rails || [])].forEach((item) => {
             const halfLength = Math.max(1, numberOrDefault(item.length, 60) / 2);
-            xs.push(-halfLength, halfLength);
-            zs.push(baseZ + layoutOffsetToSceneZ(item.offsetZ));
+            const localZ = baseZ + layoutOffsetToSceneZ(item.offsetZ);
+            const start = localToParentPoint({ x: -halfLength, z: localZ }, worldTransform);
+            const end = localToParentPoint({ x: halfLength, z: localZ }, worldTransform);
+            xs.push(start.x, end.x);
+            zs.push(start.z, end.z);
         });
 
         if (!xs.length) xs.push(-30, 30);
@@ -826,6 +883,34 @@ export class SceneManager {
         const minZ = Math.min(...zs) - paddingZ;
         const maxZ = Math.max(...zs) + paddingZ;
 
+        return {
+            minX,
+            maxX,
+            minZ,
+            maxZ,
+            centerX: (minX + maxX) / 2,
+            centerZ: (minZ + maxZ) / 2,
+            spanX: Math.max(12, maxX - minX),
+            spanZ: Math.max(12, maxZ - minZ)
+        };
+    }
+
+    getLineLocalGuideBounds(range, paddingX = 0, paddingZ = 0) {
+        const layout = range?.layout || getLineLayout(range?.line);
+        const baseZ = numberOrDefault(range?.baseZ, getLineBaseZ(range?.globalLineIndex, range?.line));
+        const xs = [];
+        const zs = [];
+        [...(layout.lanes || []), ...(layout.rails || [])].forEach((item) => {
+            const halfLength = Math.max(1, numberOrDefault(item.length, 60) / 2);
+            xs.push(-halfLength, halfLength);
+            zs.push(baseZ + layoutOffsetToSceneZ(item.offsetZ));
+        });
+        if (!xs.length) xs.push(-30, 30);
+        if (!zs.length) zs.push(baseZ);
+        const minX = Math.min(...xs) - paddingX;
+        const maxX = Math.max(...xs) + paddingX;
+        const minZ = Math.min(...zs) - paddingZ;
+        const maxZ = Math.max(...zs) + paddingZ;
         return {
             minX,
             maxX,
@@ -1210,6 +1295,10 @@ export class SceneManager {
                 antialias: this.antialiasEnabled,
                 labelTargetFps: this.labelTargetFps,
                 environmentReady: !!this.scene.environment,
+                guideTransforms: this.lineDeviceRanges.map(range => ({
+                    lineId: range.lineId,
+                    ...range.worldTransform
+                })),
                 optimizedModels: this.batchRenderers.map(renderer => renderer.userData.optimization).filter(Boolean)
             };
             this.lastStatsTime = now;

@@ -1,3 +1,5 @@
+import * as THREE from 'three';
+import { CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import { SceneManager } from '../three/SceneManager.js';
 import { applyConfiguredDeviceTransform, applyRealtimeToDeviceModel, createConfiguredDeviceModel } from './DeviceRenderer.js';
 import { createBatchedDeviceRenderer, getBatchableModelInfo } from './BatchDeviceRenderer.js';
@@ -250,6 +252,86 @@ function runtimeModelKey(deviceCfg, models = []) {
     ]);
 }
 
+function createLayoutPreviewDeviceModel(definition) {
+    const { deviceCfg } = definition;
+    const auxiliary = isAuxiliaryDevice(deviceCfg);
+    const group = new THREE.Group();
+    const bodySize = auxiliary ? [3.2, 0.75, 1.75] : [4.6, 3.1, 2.8];
+    const bodyColor = auxiliary ? 0xc89437 : 0x53636b;
+    const bodyMaterial = new THREE.MeshLambertMaterial({ color: bodyColor });
+    const frontMaterial = new THREE.MeshBasicMaterial({ color: 0x59bde8 });
+    const topMaterial = new THREE.MeshLambertMaterial({ color: auxiliary ? 0xe3b85c : 0xe5e8e9 });
+    [bodyMaterial, frontMaterial, topMaterial].forEach((material) => {
+        material.side = THREE.DoubleSide;
+    });
+
+    const body = new THREE.Mesh(new THREE.BoxGeometry(...bodySize), bodyMaterial);
+    body.position.y = bodySize[1] / 2;
+    group.add(body);
+
+    const top = new THREE.Mesh(
+        new THREE.BoxGeometry(bodySize[0] * 0.72, Math.max(0.14, bodySize[1] * 0.08), bodySize[2] * 0.72),
+        topMaterial
+    );
+    top.position.y = bodySize[1] + Math.max(0.07, bodySize[1] * 0.04);
+    group.add(top);
+
+    const direction = new THREE.Mesh(new THREE.ConeGeometry(0.34, 0.95, 3), frontMaterial);
+    direction.rotation.z = -Math.PI / 2;
+    direction.position.set(bodySize[0] / 2 + 0.42, bodySize[1] + 0.12, 0);
+    group.add(direction);
+
+    const label = document.createElement('div');
+    label.textContent = deviceCfg.name || deviceCfg.id || '设备';
+    Object.assign(label.style, {
+        padding: '5px 8px',
+        border: '1px solid rgba(255,255,255,.28)',
+        borderRadius: '7px',
+        color: '#fff',
+        background: 'rgba(25,30,33,.78)',
+        boxShadow: '0 3px 10px rgba(0,0,0,.18)',
+        fontSize: '12px',
+        fontWeight: '600',
+        lineHeight: '1',
+        whiteSpace: 'nowrap',
+        opacity: '0'
+    });
+    const labelObject = new CSS2DObject(label);
+    labelObject.visible = false;
+    const labelAnchor = new THREE.Object3D();
+    labelAnchor.position.set(0, bodySize[1] + 0.85, 0);
+    labelAnchor.add(labelObject);
+    group.add(labelAnchor);
+
+    group.deviceConfig = deviceCfg;
+    group.furnaceId = deviceCfg.id;
+    group.furnaceName = deviceCfg.name || deviceCfg.id;
+    group.labelAnchor = labelAnchor;
+    group.labelObj = labelObject;
+    group.labelDiv = label;
+    group.materials = [bodyMaterial, topMaterial, frontMaterial];
+    Object.assign(group.userData, {
+        isDevice: true,
+        id: deviceCfg.id,
+        defaultScale: 1,
+        layoutPreviewProxy: true
+    });
+    group.setLabelVisible = (visible) => {
+        labelObject.visible = !!visible;
+        label.style.opacity = visible ? '1' : '0';
+    };
+    group.setXRayMode = (enabled) => {
+        const opacity = enabled ? 0.38 : 1;
+        group.materials.forEach((material) => {
+            material.transparent = !!enabled;
+            material.opacity = opacity;
+            material.depthWrite = !enabled;
+        });
+    };
+    group.updateData = () => {};
+    return group;
+}
+
 export class SceneRuntime {
     constructor(containerElement, options) {
         this.containerElement = containerElement;
@@ -280,47 +362,58 @@ export class SceneRuntime {
 
         const definitions = flattenDeviceDefinitions(workshops || []);
         const results = new Array(definitions.length);
-        const batchGroups = new Map();
+        if (this.options.layoutPreview === true) {
+            definitions.forEach((definition, index) => {
+                const deviceModel = createLayoutPreviewDeviceModel(definition);
+                applyConfiguredDeviceTransform(deviceModel, definition);
+                results[index] = {
+                    ...definition,
+                    deviceModel
+                };
+            });
+        } else {
+            const batchGroups = new Map();
 
-        definitions.forEach((definition, index) => {
-            const modelInfo = getBatchableModelInfo(definition.deviceCfg, models || []);
-            if (!modelInfo) return;
-            const batchKey = `${modelInfo.id}:${modelInfo.file_path}`;
-            if (!batchGroups.has(batchKey)) {
-                batchGroups.set(batchKey, { modelInfo, items: [] });
-            }
-            batchGroups.get(batchKey).items.push({ definition, index });
-        });
+            definitions.forEach((definition, index) => {
+                const modelInfo = getBatchableModelInfo(definition.deviceCfg, models || []);
+                if (!modelInfo) return;
+                const batchKey = `${modelInfo.id}:${modelInfo.file_path}`;
+                if (!batchGroups.has(batchKey)) {
+                    batchGroups.set(batchKey, { modelInfo, items: [] });
+                }
+                batchGroups.get(batchKey).items.push({ definition, index });
+            });
 
-        const batchedIndexes = new Set();
-        for (const group of batchGroups.values()) {
-            if (!shouldOptimizeModelGroup(group.modelInfo, group.items.length)) continue;
-            try {
-                const batch = await createBatchedDeviceRenderer(
-                    group.modelInfo,
-                    group.items.map(item => item.definition),
-                    { labelConfig: this.options.deviceLabelConfig || {} }
-                );
-                this.sceneManager.addBatchRenderer(batch.batchRenderer);
-                group.items.forEach((item, localIndex) => {
-                    results[item.index] = {
-                        ...item.definition,
-                        deviceModel: batch.deviceModels[localIndex]
-                    };
-                    batchedIndexes.add(item.index);
-                });
-            } catch (error) {
-                console.warn(`[SceneRuntime] 模型 ${group.modelInfo.id} 自动优化失败，使用原始渲染:`, error);
+            const batchedIndexes = new Set();
+            for (const group of batchGroups.values()) {
+                if (!shouldOptimizeModelGroup(group.modelInfo, group.items.length)) continue;
+                try {
+                    const batch = await createBatchedDeviceRenderer(
+                        group.modelInfo,
+                        group.items.map(item => item.definition),
+                        { labelConfig: this.options.deviceLabelConfig || {} }
+                    );
+                    this.sceneManager.addBatchRenderer(batch.batchRenderer);
+                    group.items.forEach((item, localIndex) => {
+                        results[item.index] = {
+                            ...item.definition,
+                            deviceModel: batch.deviceModels[localIndex]
+                        };
+                        batchedIndexes.add(item.index);
+                    });
+                } catch (error) {
+                    console.warn(`[SceneRuntime] 模型 ${group.modelInfo.id} 自动优化失败，使用原始渲染:`, error);
+                }
             }
+
+            await Promise.all(definitions.map(async (definition, index) => {
+                if (batchedIndexes.has(index)) return;
+                results[index] = {
+                    ...definition,
+                    deviceModel: await createConfiguredDeviceModel(definition, models || [], { labelConfig: this.options.deviceLabelConfig || {} })
+                };
+            }));
         }
-
-        await Promise.all(definitions.map(async (definition, index) => {
-            if (batchedIndexes.has(index)) return;
-            results[index] = {
-                ...definition,
-                deviceModel: await createConfiguredDeviceModel(definition, models || [], { labelConfig: this.options.deviceLabelConfig || {} })
-            };
-        }));
 
         results.forEach(({ deviceCfg, deviceModel, wsIdx, gLineIdx, lineId, isLineMember }) => {
             Object.assign(deviceModel.userData, {

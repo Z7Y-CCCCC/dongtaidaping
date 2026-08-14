@@ -429,12 +429,6 @@ function selectWorkshopManagementStep(step) {
     }
 }
 
-function openWorkshopManagementStep(workshop, step = 'space') {
-    if (!workshop?.id) return
-    selectedWorkshopEditorId.value = workshop.id
-    selectWorkshopManagementStep(step)
-}
-
 async function createWorkshop() {
     if (!newWorkshop.id || !newWorkshop.name) return alert('请填写车间ID和名称')
     const layout = normalizeWorkshopLayout(null)
@@ -4042,6 +4036,16 @@ async function renderComposerPreview() {
             workshops: composerWorkshops.value,
             models: models.value || [],
             cameraMode: '4level',
+            layoutPreview: true,
+            renderOptions: {
+                profile: 'layout-editor',
+                targetFps: 24,
+                renderScale: 0.65,
+                antialias: false,
+                labelFps: 6,
+                lightweight: true,
+                environment: false
+            },
             onLevelChange: () => {},
             onDeviceSelect: deviceId => {
                 if (devices.value.some(device => device.id === deviceId)) {
@@ -6115,7 +6119,6 @@ const mainTabs = [
                                     <td>{{ getWorkshopLayout(ws).size.width }} × {{ getWorkshopLayout(ws).size.depth }} 米</td>
                                     <td>{{ (linesByWorkshop[ws.id] || []).length }} 条</td>
                                     <td>
-                                        <button type="button" class="btn btn-sm" @click="openWorkshopManagementStep(ws, 'space')">空间设置</button>
                                         <button @click="deleteWorkshop(ws.id)" class="btn btn-danger btn-sm">删除</button>
                                     </td>
                                 </tr>
