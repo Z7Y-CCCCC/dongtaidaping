@@ -48,9 +48,10 @@ function Invoke-CheckedCommand {
     )
 
     Write-Host "`n[$Label]" -ForegroundColor Cyan
-    & $Executable @ArgumentList
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Label 失败（退出码 $LASTEXITCODE）。"
+    & $Executable @ArgumentList 2>&1 | Tee-Object -LiteralPath $script:buildLogPath -Append
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "$Label 失败（退出码 $exitCode）。"
     }
 }
 
