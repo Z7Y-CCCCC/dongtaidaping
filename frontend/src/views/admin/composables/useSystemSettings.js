@@ -937,7 +937,7 @@ export function useSystemSettings({
             syncComposerDraftFromSelection()
             await nextTick()
             scheduleComposerPreview()
-            siteBackupMessage.value = `整站恢复完成：灾备时间 ${new Date(result.manifestCreatedAt).toLocaleString()}，上传模型 ${result.uploadedFileCount || 0} 个。`
+            siteBackupMessage.value = `整站恢复完成：灾备时间 ${formatBackupTime(result.manifestCreatedAt)}，上传模型 ${result.uploadedFileCount || 0} 个。`
             await alert('现场配置、数据库和上传模型已恢复完成。', { title: '整站恢复成功', type: 'success' })
         } catch (e) {
             siteBackupMessage.value = `整站恢复失败：${e.message || e}`
@@ -1017,6 +1017,23 @@ export function useSystemSettings({
         }
     }
 
+    async function deleteDatabaseBackup(backup) {
+        if (!backup?.filename) return
+        if (!(await confirm(`确定删除备份 ${backup.filename}？删除后无法恢复。`))) return
+        databaseBackupBusy.value = true
+        databaseBackupMessage.value = '正在删除备份...'
+        try {
+            const result = await adminApi.deleteDatabaseBackup(backup.filename)
+            if (!result?.success) throw new Error(result?.error || '删除失败')
+            assignDatabaseBackupStatus(result.status || {})
+            databaseBackupMessage.value = `已删除：${backup.filename}`
+        } catch (e) {
+            databaseBackupMessage.value = `删除失败：${e.message || e}`
+        } finally {
+            databaseBackupBusy.value = false
+        }
+    }
+
     function downloadDatabaseBackup(backup) {
         const link = document.createElement('a')
         link.href = adminApi.databaseBackupDownloadUrl(backup.filename)
@@ -1036,7 +1053,9 @@ export function useSystemSettings({
 
     function formatBackupTime(value) {
         const date = new Date(value || '')
-        return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString()
+        if (Number.isNaN(date.getTime())) return '-'
+        const pad = number => String(number).padStart(2, '0')
+        return `${date.getFullYear()}年${pad(date.getMonth() + 1)}月${pad(date.getDate())}日 ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
     }
 
     function formatBackupInterval(milliseconds) {
@@ -1309,6 +1328,7 @@ export function useSystemSettings({
         saveDatabaseBackupPolicy,
         createDatabaseBackup,
         restoreDatabaseBackup,
+        deleteDatabaseBackup,
         downloadDatabaseBackup,
         formatBackupSize,
         formatBackupTime,

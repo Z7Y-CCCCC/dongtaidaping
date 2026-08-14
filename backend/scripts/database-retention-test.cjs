@@ -117,6 +117,20 @@ async function main() {
         });
         const invalidBody = await invalidResponse.json();
 
+        const created = await requestJson(`${origin}/api/database/backups`, { method: 'POST' });
+        const createdFilename = created.backup.filename;
+        const createdPath = path.join(backupDir, createdFilename);
+        const deleted = await requestJson(`${origin}/api/database/backups/${encodeURIComponent(createdFilename)}`, {
+            method: 'DELETE'
+        });
+        const deleteAgainResponse = await fetch(
+            `${origin}/api/database/backups/${encodeURIComponent(createdFilename)}`,
+            { method: 'DELETE' }
+        );
+        const invalidDeleteResponse = await fetch(`${origin}/api/database/backups/not-a-backup.txt`, {
+            method: 'DELETE'
+        });
+
         const checks = {
             retentionDaysSaved: status30.retentionDays === 30 && storedConfig.backupRetentionDays === 1,
             expiredBackupsDeleted: !names30.has(seededBackups[0].filename)
@@ -126,13 +140,18 @@ async function main() {
                 && policy30.cleanup?.deleted?.every(item => item.cause === 'expired'),
             orphanArtifactsRemoved: policy30.cleanup?.orphanDeletedCount >= 1
                 && !fs.existsSync(orphanTemporary),
-            latestValidBackupProtected: policy1.cleanup?.deletedCount >= 1
-                && status1.backups.length === 1
+            latestValidBackupProtected: status1.backups.length === 1
                 && status1.backups[0].valid === true,
             statusStatisticsCorrect: status1.totalBackupBytes === status1.backups[0].size
                 && status1.oldestBackup?.filename === status1.newestBackup?.filename,
             invalidRetentionRejected: invalidResponse.status === 400
-                && /1-3650/.test(String(invalidBody.error || ''))
+                && /1-3650/.test(String(invalidBody.error || '')),
+            manualBackupDeleted: deleted.success === true
+                && deleted.deleted?.filename === createdFilename
+                && !fs.existsSync(createdPath)
+                && !deleted.status.backups.some(item => item.filename === createdFilename),
+            missingBackupDeleteRejected: deleteAgainResponse.status === 404,
+            invalidBackupNameDeleteRejected: invalidDeleteResponse.status === 400
         };
         const failed = Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name);
         if (failed.length) {

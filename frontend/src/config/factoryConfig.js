@@ -269,6 +269,7 @@ export const adminApi = {
     async saveDatabaseBackupPolicy(config) { return readApiJson(await fetch(`${API_BASE}/database/backups/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(config) }), '保存备份保留策略失败') },
     async createDatabaseBackup() { return readApiJson(await fetch(`${API_BASE}/database/backups`, { method: 'POST' }), '创建数据库备份失败') },
     async restoreDatabaseBackup(filename) { return readApiJson(await fetch(`${API_BASE}/database/backups/${pathId(filename)}/restore`, { method: 'POST' }), '恢复数据库备份失败') },
+    async deleteDatabaseBackup(filename) { return readApiJson(await fetch(`${API_BASE}/database/backups/${pathId(filename)}`, { method: 'DELETE' }), '删除数据库备份失败') },
     databaseBackupDownloadUrl(filename) { return `${API_BASE}/database/backups/${pathId(filename)}/download` },
     async getSiteBackups() { return readApiJson(await fetch(`${API_BASE}/site-backups`), '读取整站灾备状态失败') },
     async getSiteBackupConfig() { return readApiJson(await fetch(`${API_BASE}/site-backups/config`), '读取整站灾备配置失败') },

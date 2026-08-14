@@ -17,6 +17,7 @@ const {
     reconnectDb,
     createDatabaseBackup,
     restoreDatabaseBackup,
+    deleteDatabaseBackup,
     getDatabaseBackupStatus,
     saveDatabaseBackupPolicy,
     resolveDatabaseBackupPath,
@@ -474,6 +475,14 @@ app.post('/api/database/backups/:filename/restore', backupOperationLimiter, asyn
             try { await dataEngine.start(); } catch (restartError) { /* report original restore error */ }
         }
         res.status(400).json({ success: false, error: e.message });
+    }
+});
+
+app.delete('/api/database/backups/:filename', backupOperationLimiter, async (req, res) => {
+    try {
+        res.json(await deleteDatabaseBackup(req.params.filename));
+    } catch (e) {
+        res.status(e.message === '备份文件不存在' ? 404 : 400).json({ success: false, error: e.message });
     }
 });
 

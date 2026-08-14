@@ -205,6 +205,8 @@ const isAdminNavCollapsed = ref(!!storedAdminUiState.isAdminNavCollapsed)
 const isFactoryMenuOpen = ref(true)
 const isDataMenuOpen = ref(true)
 const isLegacyWebRenderSettingsOpen = ref(false)
+const isExternalDataSourcesOpen = ref(!!storedAdminUiState.isExternalDataSourcesOpen)
+const isAlarmConfigOpen = ref(!!storedAdminUiState.isAlarmConfigOpen)
 
 async function selectPlatformSubpage(key) {
     if (!PLATFORM_SUBPAGES.some(option => option.key === key)) return
@@ -318,6 +320,7 @@ const {
     saveDatabaseBackupPolicy,
     createDatabaseBackup,
     restoreDatabaseBackup,
+    deleteDatabaseBackup,
     downloadDatabaseBackup,
     formatBackupSize,
     formatBackupTime,
@@ -4167,6 +4170,8 @@ watch([
     selectedWidgetPreviewId,
     isLinePlannerEditorCollapsed,
     isLineDevicePoolCollapsed,
+    isExternalDataSourcesOpen,
+    isAlarmConfigOpen,
     () => lineDevicePoolDock.x,
     () => lineDevicePoolDock.y
 ], () => {
@@ -4183,6 +4188,8 @@ watch([
         selectedWidgetPreviewId: selectedWidgetPreviewId.value,
         isLinePlannerEditorCollapsed: isLinePlannerEditorCollapsed.value,
         isLineDevicePoolCollapsed: isLineDevicePoolCollapsed.value,
+        isExternalDataSourcesOpen: isExternalDataSourcesOpen.value,
+        isAlarmConfigOpen: isAlarmConfigOpen.value,
         lineDevicePoolDockX: lineDevicePoolDock.x,
         lineDevicePoolDockY: lineDevicePoolDock.y
     }))
@@ -6107,7 +6114,7 @@ const mainTabs = [
                 <!-- ======== 设备管理 ======== -->
                 <div v-if="activeTab === 'devices'" class="tab-content">
                     <h2>设备管理</h2>
-                    <p class="desc">管理所有设备，包括设备名称、所属产线、3D 位置和使用的模型。</p>
+                    <p class="desc">管理所有设备，包括设备名称、所属产线、使用模型和数据连接。</p>
 
                     <button @click="openCreateDevice" class="btn btn-primary" style="margin-bottom:20px">+ 添加设备</button>
 
@@ -6234,13 +6241,6 @@ const mainTabs = [
                                         </p>
                                     </div>
                                 </div>
-                                <label>X 坐标<input v-model.number="editingDevice.pos_x" type="number" class="input" /></label>
-                                <label>Y 坐标<input v-model.number="editingDevice.pos_y" type="number" class="input" /></label>
-                                <label>Z 坐标<input v-model.number="editingDevice.pos_z" type="number" class="input" /></label>
-                                <label>旋转角度(Y)<input v-model.number="editingDevice.rotation_y" type="number" step="0.1" class="input" /></label>
-                                <label>缩放比例<input v-model.number="editingDevice.scale" type="number" step="0.1" class="input" /></label>
-                                <label>排序<input v-model.number="editingDevice.sort_order" type="number" class="input" /></label>
-                                <label style="grid-column:1 / -1">实例配置 JSON<textarea v-model="editingDevice.instance_config" class="input widget-json" placeholder='{"caption":"1#炉","animationProfile":"furnace"}'></textarea></label>
                             </div>
                             <div class="modal-actions">
                                 <button @click="saveDevice" class="btn btn-primary">保存</button>
@@ -6255,7 +6255,7 @@ const mainTabs = [
                         <h3 class="group-title">{{ line.name }}</h3>
                         <table class="data-table">
                             <thead>
-                                <tr><th>ID</th><th>名称</th><th>模型</th><th>PLC</th><th>坐标 (X,Y,Z)</th><th>操作</th></tr>
+                                <tr><th>ID</th><th>名称</th><th>模型</th><th>PLC</th><th>操作</th></tr>
                             </thead>
                             <tbody>
                                 <tr v-for="d in (devicesByLine[line.id] || [])" :key="d.id">
@@ -6275,14 +6275,13 @@ const mainTabs = [
                                             <span>最近读取：{{ formatPlcTime(plcStatusByDevice[d.id]?.lastReadAt) }}</span>
                                         </div>
                                     </td>
-                                    <td>{{ d.pos_x }}, {{ d.pos_y }}, {{ d.pos_z }}</td>
                                     <td>
                                         <button @click="openEditDevice(d)" class="btn btn-sm">编辑</button>
                                         <button @click="deleteDevice(d.id)" class="btn btn-danger btn-sm">删除</button>
                                     </td>
                                 </tr>
                                 <tr v-if="! (devicesByLine[line.id] || []).length">
-                                    <td colspan="6" style="text-align:center;color:#888">暂无设备</td>
+                                    <td colspan="5" style="text-align:center;color:#888">暂无设备</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -6291,7 +6290,7 @@ const mainTabs = [
                         <h3 class="group-title">辅助设备 / 料车</h3>
                         <table class="data-table">
                             <thead>
-                                <tr><th>ID</th><th>名称</th><th>车间</th><th>模型</th><th>PLC</th><th>坐标 (X,Y,Z)</th><th>操作</th></tr>
+                                <tr><th>ID</th><th>名称</th><th>车间</th><th>模型</th><th>PLC</th><th>操作</th></tr>
                             </thead>
                             <tbody>
                                 <tr v-for="d in auxiliaryDevices" :key="d.id">
@@ -6312,7 +6311,6 @@ const mainTabs = [
                                             <span>最近读取：{{ formatPlcTime(plcStatusByDevice[d.id]?.lastReadAt) }}</span>
                                         </div>
                                     </td>
-                                    <td>{{ d.pos_x }}, {{ d.pos_y }}, {{ d.pos_z }}</td>
                                     <td>
                                         <button @click="openEditDevice(d)" class="btn btn-sm">编辑</button>
                                         <button @click="deleteDevice(d.id)" class="btn btn-danger btn-sm">删除</button>
@@ -7392,42 +7390,54 @@ const mainTabs = [
                             </div>
                         </div>
 
-                        <section class="alarm-config-card">
-                            <div class="alarm-config-header">
+                        <section class="alarm-config-card" :class="{ open: isAlarmConfigOpen }">
+                            <button
+                                type="button"
+                                class="alarm-config-header"
+                                :aria-expanded="isAlarmConfigOpen"
+                                @click="isAlarmConfigOpen = !isAlarmConfigOpen"
+                            >
                                 <div>
                                     <h3>报警点位与报警文本</h3>
                                     <p>按排产软件习惯，报警触发点位建议命名为 bj1、bj2、bj3...，报警说明可粘贴 <code>1 =&gt; "报警内容"</code> 格式，也可以一行一条按顺序导入。</p>
                                 </div>
-                                <span class="alarm-config-count">{{ alarmTextImportSummary }}</span>
-                            </div>
+                                <span class="alarm-config-header-actions">
+                                    <span class="alarm-config-count">{{ alarmTextImportSummary }}</span>
+                                    <svg class="collapse-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5" /></svg>
+                                </span>
+                            </button>
 
-                            <div class="alarm-record-status">
-                                <div v-for="item in alarmRecordPointStatus.slice(0, 3)" :key="item.role" :class="{ configured: item.configured }">
-                                    <span>{{ item.label }}</span>
-                                    <strong>{{ item.configured ? '已配置' : '未配置' }}</strong>
-                                </div>
-                            </div>
+                            <Transition name="section-collapse">
+                                <div v-show="isAlarmConfigOpen" class="collapsible-section-body">
+                                    <div class="alarm-record-status">
+                                        <div v-for="item in alarmRecordPointStatus.slice(0, 3)" :key="item.role" :class="{ configured: item.configured }">
+                                            <span>{{ item.label }}</span>
+                                            <strong>{{ item.configured ? '已配置' : '未配置' }}</strong>
+                                        </div>
+                                    </div>
 
-                            <div class="alarm-import-layout">
-                                <textarea v-model="alarmTextImportRaw" class="input alarm-textarea" placeholder="例如：
+                                    <div class="alarm-import-layout">
+                                        <textarea v-model="alarmTextImportRaw" class="input alarm-textarea" placeholder="例如：
 1 => &quot;循环风扇冷却水流量低故障&quot;,
 2 => &quot;油搅拌1不运行&quot;,
 3 => &quot;内推链电机空开跌落&quot;," />
-                                <div class="alarm-import-side">
-                                    <button @click="fillAlarmTextTemplate" class="btn" :disabled="isAllPointsMode">生成当前报警模板</button>
-                                    <button @click="triggerAlarmTextFileSelect" class="btn" :disabled="isAllPointsMode">导入文本文件</button>
-                                    <button @click="applyAlarmTextImport" class="btn btn-primary" :disabled="isAllPointsMode">匹配到报警点位</button>
-                                    <input ref="alarmTextFileInput" type="file" accept=".txt,.csv" style="display:none" @change="handleAlarmTextFileChange" />
-                                    <div class="alarm-preview">
-                                        <strong>解析预览</strong>
-                                        <div v-if="parsedAlarmTextEntries.length === 0" class="muted-cell">暂无可解析文本</div>
-                                        <div v-for="entry in parsedAlarmTextEntries.slice(0, 8)" :key="entry.number">
-                                            bj{{ entry.number }}：{{ entry.text }}
+                                        <div class="alarm-import-side">
+                                            <button @click="fillAlarmTextTemplate" class="btn" :disabled="isAllPointsMode">生成当前报警模板</button>
+                                            <button @click="triggerAlarmTextFileSelect" class="btn" :disabled="isAllPointsMode">导入文本文件</button>
+                                            <button @click="applyAlarmTextImport" class="btn btn-primary" :disabled="isAllPointsMode">匹配到报警点位</button>
+                                            <input ref="alarmTextFileInput" type="file" accept=".txt,.csv" style="display:none" @change="handleAlarmTextFileChange" />
+                                            <div class="alarm-preview">
+                                                <strong>解析预览</strong>
+                                                <div v-if="parsedAlarmTextEntries.length === 0" class="muted-cell">暂无可解析文本</div>
+                                                <div v-for="entry in parsedAlarmTextEntries.slice(0, 8)" :key="entry.number">
+                                                    bj{{ entry.number }}：{{ entry.text }}
+                                                </div>
+                                                <div v-if="parsedAlarmTextEntries.length > 8" class="muted-cell">还有 {{ parsedAlarmTextEntries.length - 8 }} 条...</div>
+                                            </div>
                                         </div>
-                                        <div v-if="parsedAlarmTextEntries.length > 8" class="muted-cell">还有 {{ parsedAlarmTextEntries.length - 8 }} 条...</div>
                                     </div>
                                 </div>
-                            </div>
+                            </Transition>
                         </section>
                     </div>
                 </div>
@@ -7651,57 +7661,72 @@ const mainTabs = [
                                 </span>
                             </div>
 
-                            <div class="external-data-source-manager">
+                            <div class="external-data-source-manager" :class="{ open: isExternalDataSourcesOpen }">
                                 <div class="external-data-source-heading">
-                                    <div>
-                                        <strong>外部只读数据库连接</strong>
-                                        <p>用于大屏组件取数，不接管对方数据库，也不会执行新增、修改或删除。</p>
-                                    </div>
-                                    <button type="button" class="btn btn-small" @click="resetDataSourceEditor">＋ 新建连接</button>
-                                </div>
-
-                                <div class="external-data-source-list">
                                     <button
-                                        v-for="connection in dataSourceConnections.filter(item => !item.primary)"
-                                        :key="connection.id"
                                         type="button"
-                                        class="external-data-source-card"
-                                        :class="{ active: dataSourceEditor.id === connection.id }"
-                                        @click="editDataSource(connection)"
+                                        class="external-data-source-toggle"
+                                        :aria-expanded="isExternalDataSourcesOpen"
+                                        @click="isExternalDataSourcesOpen = !isExternalDataSourcesOpen"
                                     >
-                                        <span class="external-data-source-icon">DB</span>
-                                        <span><strong>{{ connection.name }}</strong><small>{{ connection.type }} · {{ connection.database || connection.filename }}</small></span>
-                                        <em>{{ connection.enabled ? '启用' : '停用' }}</em>
+                                        <span>
+                                            <strong>外部只读数据库连接</strong>
+                                            <small>用于大屏组件取数，不接管对方数据库，也不会执行新增、修改或删除。</small>
+                                        </span>
+                                        <span class="external-data-source-toggle-status">
+                                            {{ dataSourceConnections.filter(item => !item.primary).length }} 个连接
+                                            <svg class="collapse-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5" /></svg>
+                                        </span>
                                     </button>
-                                    <p v-if="!dataSourceConnections.some(item => !item.primary)" class="empty-hint">尚未添加外部数据源。添加后，设计器里可直接选择“连接 → 表 → 字段”。</p>
+                                    <button type="button" class="btn btn-small" @click="resetDataSourceEditor(); isExternalDataSourcesOpen = true">＋ 新建连接</button>
                                 </div>
 
-                                <div class="external-data-source-editor">
-                                    <label>连接名称<input v-model="dataSourceEditor.name" class="input" placeholder="例如：MES 生产数据库" /></label>
-                                    <label>数据库类型
-                                        <select v-model="dataSourceEditor.type" class="input">
-                                            <option value="mysql">MySQL / MariaDB</option>
-                                            <option value="postgres">PostgreSQL</option>
-                                            <option value="sqlserver">SQL Server</option>
-                                            <option value="sqlite">SQLite 文件</option>
-                                        </select>
-                                    </label>
-                                    <label v-if="dataSourceEditor.type !== 'sqlite'">主机<input v-model="dataSourceEditor.host" class="input" placeholder="127.0.0.1" /></label>
-                                    <label v-if="dataSourceEditor.type !== 'sqlite'">端口<input v-model.number="dataSourceEditor.port" type="number" class="input" /></label>
-                                    <label v-if="dataSourceEditor.type !== 'sqlite'">数据库名<input v-model="dataSourceEditor.database" class="input" /></label>
-                                    <label v-if="dataSourceEditor.type !== 'sqlite'">默认 Schema<input v-model="dataSourceEditor.defaultSchema" class="input" placeholder="PostgreSQL: public / SQL Server: dbo" /></label>
-                                    <label v-if="dataSourceEditor.type !== 'sqlite'">只读账号<input v-model="dataSourceEditor.user" class="input" /></label>
-                                    <label v-if="dataSourceEditor.type !== 'sqlite'">密码<input v-model="dataSourceEditor.password" type="password" class="input" /></label>
-                                    <label v-else class="external-data-source-wide">SQLite 文件<input v-model="dataSourceEditor.filename" class="input" placeholder="完整 .db 文件路径" /></label>
-                                    <label>查询超时（毫秒）<input v-model.number="dataSourceEditor.queryTimeoutMs" type="number" min="1000" max="60000" class="input" /></label>
-                                    <label class="checkbox-line"><input v-model="dataSourceEditor.enabled" type="checkbox" /> 启用此连接</label>
-                                </div>
-                                <div class="external-data-source-actions">
-                                    <button type="button" class="btn" :disabled="dataSourceBusy" @click="testExternalDataSource">测试只读连接</button>
-                                    <button type="button" class="btn btn-primary" :disabled="dataSourceBusy" @click="saveExternalDataSource">保存连接</button>
-                                    <button v-if="dataSourceEditor.id" type="button" class="btn btn-danger" :disabled="dataSourceBusy" @click="removeExternalDataSource({ ...dataSourceEditor })">删除</button>
-                                    <span v-if="dataSourceMessage">{{ dataSourceMessage }}</span>
-                                </div>
+                                <Transition name="section-collapse">
+                                    <div v-show="isExternalDataSourcesOpen" class="collapsible-section-body">
+                                        <div class="external-data-source-list">
+                                            <button
+                                                v-for="connection in dataSourceConnections.filter(item => !item.primary)"
+                                                :key="connection.id"
+                                                type="button"
+                                                class="external-data-source-card"
+                                                :class="{ active: dataSourceEditor.id === connection.id }"
+                                                @click="editDataSource(connection)"
+                                            >
+                                                <span class="external-data-source-icon">DB</span>
+                                                <span><strong>{{ connection.name }}</strong><small>{{ connection.type }} · {{ connection.database || connection.filename }}</small></span>
+                                                <em>{{ connection.enabled ? '启用' : '停用' }}</em>
+                                            </button>
+                                            <p v-if="!dataSourceConnections.some(item => !item.primary)" class="empty-hint">尚未添加外部数据源。添加后，设计器里可直接选择“连接 → 表 → 字段”。</p>
+                                        </div>
+
+                                        <div class="external-data-source-editor">
+                                            <label>连接名称<input v-model="dataSourceEditor.name" class="input" placeholder="例如：MES 生产数据库" /></label>
+                                            <label>数据库类型
+                                                <select v-model="dataSourceEditor.type" class="input">
+                                                    <option value="mysql">MySQL / MariaDB</option>
+                                                    <option value="postgres">PostgreSQL</option>
+                                                    <option value="sqlserver">SQL Server</option>
+                                                    <option value="sqlite">SQLite 文件</option>
+                                                </select>
+                                            </label>
+                                            <label v-if="dataSourceEditor.type !== 'sqlite'">主机<input v-model="dataSourceEditor.host" class="input" placeholder="127.0.0.1" /></label>
+                                            <label v-if="dataSourceEditor.type !== 'sqlite'">端口<input v-model.number="dataSourceEditor.port" type="number" class="input" /></label>
+                                            <label v-if="dataSourceEditor.type !== 'sqlite'">数据库名<input v-model="dataSourceEditor.database" class="input" /></label>
+                                            <label v-if="dataSourceEditor.type !== 'sqlite'">默认 Schema<input v-model="dataSourceEditor.defaultSchema" class="input" placeholder="PostgreSQL: public / SQL Server: dbo" /></label>
+                                            <label v-if="dataSourceEditor.type !== 'sqlite'">只读账号<input v-model="dataSourceEditor.user" class="input" /></label>
+                                            <label v-if="dataSourceEditor.type !== 'sqlite'">密码<input v-model="dataSourceEditor.password" type="password" class="input" /></label>
+                                            <label v-else class="external-data-source-wide">SQLite 文件<input v-model="dataSourceEditor.filename" class="input" placeholder="完整 .db 文件路径" /></label>
+                                            <label>查询超时（毫秒）<input v-model.number="dataSourceEditor.queryTimeoutMs" type="number" min="1000" max="60000" class="input" /></label>
+                                            <label class="checkbox-line"><input v-model="dataSourceEditor.enabled" type="checkbox" /> 启用此连接</label>
+                                        </div>
+                                        <div class="external-data-source-actions">
+                                            <button type="button" class="btn" :disabled="dataSourceBusy" @click="testExternalDataSource">测试只读连接</button>
+                                            <button type="button" class="btn btn-primary" :disabled="dataSourceBusy" @click="saveExternalDataSource">保存连接</button>
+                                            <button v-if="dataSourceEditor.id" type="button" class="btn btn-danger" :disabled="dataSourceBusy" @click="removeExternalDataSource({ ...dataSourceEditor })">删除</button>
+                                            <span v-if="dataSourceMessage">{{ dataSourceMessage }}</span>
+                                        </div>
+                                    </div>
+                                </Transition>
                             </div>
 
                             <div class="database-backup-panel database-auto-backup-panel">
@@ -7796,7 +7821,7 @@ const mainTabs = [
                                     最近一次自动备份失败：{{ databaseBackupStatus.lastBackupError.error }}
                                 </p>
                                 <p v-if="databaseBackupStatus.lastRecovery" class="database-recovery-notice">
-                                    最近恢复：{{ new Date(databaseBackupStatus.lastRecovery.recoveredAt).toLocaleString() }}，
+                                    最近恢复：{{ formatBackupTime(databaseBackupStatus.lastRecovery.recoveredAt) }}，
                                     来源 {{ databaseBackupStatus.lastRecovery.source }}
                                 </p>
                                 <p v-if="databaseBackupMessage" class="database-backup-message">{{ databaseBackupMessage }}</p>
@@ -7807,13 +7832,14 @@ const mainTabs = [
                                     <div v-for="backup in databaseBackupStatus.backups" :key="backup.filename" class="database-backup-row">
                                         <div>
                                             <strong>{{ backup.filename }}</strong>
-                                            <span>{{ new Date(backup.createdAt).toLocaleString() }} · {{ formatBackupSize(backup.size) }}</span>
+                                            <span>{{ formatBackupTime(backup.createdAt) }} · {{ formatBackupSize(backup.size) }}</span>
                                         </div>
                                         <span class="backup-validity" :class="backup.valid ? 'is-valid' : 'is-invalid'">
                                             {{ backup.valid ? '校验通过' : '已损坏' }}
                                         </span>
                                         <button @click="downloadDatabaseBackup(backup)" class="btn btn-small" :disabled="!backup.valid">下载</button>
                                         <button @click="restoreDatabaseBackup(backup)" class="btn btn-small" :disabled="databaseBackupBusy || !backup.valid">恢复</button>
+                                        <button @click="deleteDatabaseBackup(backup)" class="btn btn-small btn-danger backup-delete-button" :disabled="databaseBackupBusy">删除</button>
                                     </div>
                                     <div v-if="databaseBackupStatus.backups.length === 0" class="empty-hint">暂无备份</div>
                                 </div>
@@ -7871,7 +7897,7 @@ const mainTabs = [
                                         @click="downloadSiteBackup(backup)"
                                     >
                                         <strong>{{ backup.filename }}</strong>
-                                        <small>{{ new Date(backup.createdAt).toLocaleString() }} · {{ formatBackupSize(backup.size) }} · 重新保存</small>
+                                        <small>{{ formatBackupTime(backup.createdAt) }} · {{ formatBackupSize(backup.size) }} · 重新保存</small>
                                     </button>
                                 </div>
                             </div>
@@ -10318,14 +10344,22 @@ button:enabled:active {
     border-radius: 8px;
 }
 .alarm-config-header {
+    width: 100%;
     display: flex;
     justify-content: space-between;
     align-items: flex-start;
     gap: 20px;
-    margin-bottom: 14px;
+    padding: 0;
+    color: inherit;
+    background: transparent;
+    border: 0;
+    text-align: left;
+    cursor: pointer;
 }
+.alarm-config-card.open .alarm-config-header { margin-bottom: 14px; }
 .alarm-config-header h3 { margin: 0 0 6px; font-size: 16px; color: #1d1d1f; }
 .alarm-config-header p { margin: 0; color: #6e6e73; font-size: 13px; line-height: 1.6; }
+.alarm-config-header-actions { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 9px; }
 .alarm-config-count {
     white-space: nowrap;
     padding: 6px 10px;
@@ -10334,6 +10368,13 @@ button:enabled:active {
     color: #515154;
     font-size: 12px;
 }
+.collapse-chevron { width: 18px; height: 18px; fill: none; stroke: #6e6e73; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; transition: transform 180ms ease; }
+.alarm-config-card.open .collapse-chevron,
+.external-data-source-manager.open .collapse-chevron { transform: rotate(180deg); }
+.section-collapse-enter-active,
+.section-collapse-leave-active { transition: opacity 170ms ease, transform 170ms ease; }
+.section-collapse-enter-from,
+.section-collapse-leave-to { opacity: 0; transform: translateY(-6px); }
 .alarm-record-status {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -11732,10 +11773,16 @@ button:enabled:active {
 .native-dashboard-point-message { margin: 16px 0 0; color: #515154; font-size: 12px; }
 .native-dashboard-point-message.is-error { color: #b42318; }
 .native-dashboard-message { margin: 14px 0 0; color: #176b3a; font-size: 12px; line-height: 1.5; }
-.external-data-source-manager { margin-top: 24px; padding-top: 22px; border-top: 1px solid #e5e5e7; }
-.external-data-source-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.external-data-source-manager { margin-top: 24px; padding: 16px; background: #fff; border: 1px solid #e2e2e5; border-radius: 10px; transition: border-color 180ms ease, box-shadow 180ms ease; }
+.external-data-source-manager.open { border-color: #d5d5da; box-shadow: 0 8px 24px #00000008; }
+.external-data-source-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
 .external-data-source-heading strong { color: #1d1d1f; font-size: 14px; }
-.external-data-source-heading p { margin: 5px 0 0; color: #6e6e73; font-size: 12px; line-height: 1.55; }
+.external-data-source-toggle { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 0; color: inherit; background: transparent; border: 0; text-align: left; cursor: pointer; }
+.external-data-source-toggle > span:first-child { min-width: 0; }
+.external-data-source-toggle strong,.external-data-source-toggle small { display: block; }
+.external-data-source-toggle small { margin-top: 5px; color: #6e6e73; font-size: 12px; line-height: 1.55; }
+.external-data-source-toggle-status { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 8px; color: #6e6e73; font-size: 11px; white-space: nowrap; }
+.external-data-source-manager .collapsible-section-body { padding-top: 2px; }
 .external-data-source-list { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; margin-top: 16px; }
 .external-data-source-card { display: grid; grid-template-columns: 34px minmax(0,1fr) auto; align-items: center; gap: 10px; min-width: 0; padding: 12px; color: #1d1d1f; background: #fff; border: 1px solid #e2e2e5; border-radius: 10px; text-align: left; cursor: pointer; transition: border-color 160ms ease,box-shadow 160ms ease,transform 160ms ease; }
 .external-data-source-card:hover,.external-data-source-card.active { border-color: #8e8e93; box-shadow: 0 8px 24px #0000000d; transform: translateY(-1px); }
@@ -11792,7 +11839,7 @@ button:enabled:active {
 .database-local-only-notice { margin: 14px 0 0; padding: 10px 12px; background: #fff8e6; border-left: 3px solid #c68a00; color: #5c4300; font-size: 13px; line-height: 1.55; }
 .database-backup-message { margin: 12px 0 0; color: #515154; font-size: 13px; }
 .database-backup-list { margin-top: 14px; border-top: 1px solid #e5e5e7; }
-.database-backup-row { display: grid; grid-template-columns: minmax(280px, 1fr) auto auto auto; align-items: center; gap: 10px; min-height: 58px; padding: 8px 0; border-bottom: 1px solid #ededee; }
+.database-backup-row { display: grid; grid-template-columns: minmax(280px, 1fr) auto auto auto auto; align-items: center; gap: 10px; min-height: 58px; padding: 8px 0; border-bottom: 1px solid #ededee; }
 .database-backup-row > div { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .database-backup-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .database-backup-row span { color: #6e6e73; font-size: 12px; }
@@ -11930,7 +11977,7 @@ button:enabled:active {
     .database-retention-stats > div:nth-child(2) { border-right: 0; }
     .database-retention-stats > div:nth-child(-n+2) { border-bottom: 1px solid #ededee; }
     .database-backup-row {
-        grid-template-columns: minmax(220px, 1fr) auto auto;
+        grid-template-columns: minmax(220px, 1fr) auto auto auto;
     }
     .site-backup-header { flex-direction: column; }
     .site-backup-actions { justify-content: flex-start; }

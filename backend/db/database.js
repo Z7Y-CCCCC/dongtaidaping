@@ -288,6 +288,27 @@ function resolveDatabaseBackupPath(filename) {
     return resolved;
 }
 
+async function deleteDatabaseBackup(filename) {
+    if (backupPromise) await backupPromise;
+    const resolved = resolveDatabaseBackupPath(filename);
+    const name = path.basename(resolved);
+    if (protectedBackupFiles.has(name)) {
+        throw new Error('该备份正在用于恢复，暂时不能删除');
+    }
+
+    const removed = removeDatabaseBackupArtifacts(resolved);
+    if (removed.primaryExists) throw new Error('备份文件删除失败');
+    if (removed.errors.length) {
+        throw new Error(`备份附属文件删除不完整：${removed.errors.map(item => item.error).join('；')}`);
+    }
+    if (lastBackup?.filename === name) lastBackup = null;
+    return {
+        success: true,
+        deleted: { filename: name, size: removed.bytes },
+        status: getDatabaseBackupStatus()
+    };
+}
+
 function latestRecoverySource() {
     const backup = listDatabaseBackups({ validate: true }).find(item => item.valid);
     if (backup) return { type: 'backup', filename: path.join(BACKUP_DIR, backup.filename) };
@@ -2415,6 +2436,7 @@ module.exports = {
     createDatabaseBackup,
     importDatabaseBackupFile,
     restoreDatabaseBackup,
+    deleteDatabaseBackup,
     getDatabaseBackupStatus,
     saveDatabaseBackupPolicy,
     resolveDatabaseBackupPath,
