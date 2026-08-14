@@ -4036,12 +4036,11 @@ async function renderComposerPreview() {
             workshops: composerWorkshops.value,
             models: models.value || [],
             cameraMode: '4level',
-            layoutPreview: true,
             renderOptions: {
                 profile: 'layout-editor',
                 targetFps: 24,
-                renderScale: 0.65,
-                antialias: false,
+                renderScale: 0.8,
+                antialias: true,
                 labelFps: 6,
                 lightweight: true,
                 environment: false
