@@ -44,6 +44,19 @@ const dashboardViews = computed(() => {
 const currentView = computed(() => dashboardViews.value.find(view => view.id === runtimeContext.viewId)
     || dashboardViews.value.find(view => view.mode === runtimeContext.viewMode)
     || dashboardViews.value[0])
+const defaultViewId = computed(() => platform.value.document?.scene?.defaultViewId
+    || platform.value.activeScene?.defaultViewId
+    || 'factory_overview')
+const canReturnToParentView = computed(() => {
+    if (runtimeContext.sceneReady === false) return false
+    const mode = String(runtimeContext.viewMode || currentView.value?.mode || 'factory').toLowerCase()
+    if (mode === 'factory' || runtimeContext.viewId === defaultViewId.value) return false
+    if (!currentView.value?.returnViewId && !currentView.value?.parentViewId) return false
+    if (mode === 'device') return Boolean(runtimeContext.deviceId || currentView.value?.targetId)
+    if (mode === 'line') return Boolean(runtimeContext.lineId || currentView.value?.targetId)
+    if (mode === 'workshop') return Boolean(runtimeContext.workshopId || currentView.value?.targetId)
+    return true
+})
 const parentViewName = computed(() => {
     const parentId = currentView.value?.returnViewId || currentView.value?.parentViewId
     return dashboardViews.value.find(view => view.id === parentId)?.name || '上一级视角'
@@ -474,7 +487,7 @@ onUnmounted(() => {
         <div class="overlay-canvas">
             <button
                 type="button"
-                v-if="runtimeContext.viewMode !== 'factory' && viewComponentVisible('navigation')"
+                v-if="canReturnToParentView && viewComponentVisible('navigation')"
                 class="overlay-line-return"
                 :class="{ 'is-busy': lineReturnBusy }"
                 :disabled="lineReturnBusy"
