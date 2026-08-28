@@ -43,7 +43,8 @@ router.get('/runtime-values', async (req, res) => {
             viewId: String(req.query.view_id || ''),
             workshopId: String(req.query.workshop_id || ''),
             lineId: String(req.query.line_id || ''),
-            deviceId: String(req.query.device_id || '')
+            deviceId: String(req.query.device_id || ''),
+            partId: String(req.query.part_id || '')
         });
         res.json({
             success: true,

@@ -118,6 +118,7 @@ internal sealed class DashboardChromeForm : Form
 
         private Rectangle DashboardTabRect => LogicalRectangle(8, 6, 108, 35);
         private Rectangle DetachedChipRect => LogicalRectangle(126, 10, 204, 29);
+        private Rectangle RefreshRect => WindowActionRect(4);
         private Rectangle MinimizeRect => WindowActionRect(3);
         private Rectangle MaximizeRect => WindowActionRect(2);
         private Rectangle CloseRect => WindowActionRect(1);
@@ -212,11 +213,24 @@ internal sealed class DashboardChromeForm : Form
 
         private void DrawWindowActions(Graphics graphics)
         {
+            DrawActionBackground(graphics, RefreshRect, _hoverZone == 5, false);
             DrawActionBackground(graphics, MinimizeRect, _hoverZone == 2, false);
             DrawActionBackground(graphics, MaximizeRect, _hoverZone == 3, false);
             DrawActionBackground(graphics, CloseRect, _hoverZone == 4, true);
             var iconColor = _hoverZone == 4 ? Color.White : Color.FromArgb(71, 84, 103);
             using var pen = new Pen(iconColor, ScaleMetric(1.5f)) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+
+            var refresh = RefreshRect;
+            var refreshArc = new RectangleF(
+                refresh.Left + ScaleMetric(12),
+                refresh.Top + ScaleMetric(7),
+                ScaleMetric(16),
+                ScaleMetric(16)
+            );
+            graphics.DrawArc(pen, refreshArc, -42, 300);
+            var refreshTip = new PointF(refreshArc.Right - ScaleMetric(1.2f), refreshArc.Top + ScaleMetric(3.2f));
+            graphics.DrawLine(pen, refreshTip, new PointF(refreshTip.X - ScaleMetric(5), refreshTip.Y));
+            graphics.DrawLine(pen, refreshTip, new PointF(refreshTip.X, refreshTip.Y + ScaleMetric(5)));
 
             var minimize = MinimizeRect;
             graphics.DrawLine(pen, minimize.Left + ScaleMetric(13), minimize.Top + ScaleMetric(21), minimize.Left + ScaleMetric(27), minimize.Top + ScaleMetric(21));
@@ -256,6 +270,8 @@ internal sealed class DashboardChromeForm : Form
             base.OnMouseMove(e);
             var zone = DetachedChipRect.Contains(e.Location)
                 ? 1
+                : RefreshRect.Contains(e.Location)
+                    ? 5
                 : MinimizeRect.Contains(e.Location)
                     ? 2
                 : MaximizeRect.Contains(e.Location)
@@ -297,6 +313,7 @@ internal sealed class DashboardChromeForm : Form
             base.OnMouseUp(e);
             if (e.Button != MouseButtons.Left) return;
             if (DetachedChipRect.Contains(e.Location)) _action("focus_admin", Cursor.Position.X, Cursor.Position.Y);
+            else if (RefreshRect.Contains(e.Location)) _action("reload", Cursor.Position.X, Cursor.Position.Y);
             else if (MinimizeRect.Contains(e.Location)) _action("minimize", Cursor.Position.X, Cursor.Position.Y);
             else if (MaximizeRect.Contains(e.Location)) _action("maximize", Cursor.Position.X, Cursor.Position.Y);
             else if (CloseRect.Contains(e.Location)) _action("close", Cursor.Position.X, Cursor.Position.Y);
@@ -305,6 +322,7 @@ internal sealed class DashboardChromeForm : Form
         private bool IsInteractiveZone(Point location)
         {
             return DetachedChipRect.Contains(location)
+                || RefreshRect.Contains(location)
                 || MinimizeRect.Contains(location)
                 || MaximizeRect.Contains(location)
                 || CloseRect.Contains(location);

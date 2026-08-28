@@ -117,6 +117,8 @@ async function run() {
 
     assert.equal(workshopLayout.version, 2);
     assert.equal(lineLayout.version, 2);
+    assert.equal(lineLayout.placementPending, false);
+    assert.equal(normalizeLineLayout({ ...lineLayout, placementPending: true }).placementPending, true);
     assert.equal(furnace.coordinate_space, 'line_local');
     assert.equal(cart.coordinate_space, 'line_local');
     assert.equal(cart.line_id, 'line_a');

@@ -113,6 +113,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 _diagnostics
             );
             _dashboard.ViewContextChanged += OnDashboardViewContextChanged;
+            _dashboard.InspectionContextChanged += OnInspectionContextChanged;
 
             _modelLibrary = GetOrAdd<RuntimeModelLibrary>();
             _webSocket = GetOrAdd<RealtimeWebSocketClient>();
@@ -217,7 +218,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 var driver = instance.Root.GetComponent<ModelBindingDriver>();
                 var visual = instance.Root.AddComponent<DeviceStatusVisual>();
                 visual.Initialize(device);
-                _dashboard.RegisterDevice(device, instance.Root);
+                _dashboard.RegisterDevice(device, instance.Root, instance.Inspection);
                 if (!string.IsNullOrWhiteSpace(device.Id))
                 {
                     _drivers[device.Id] = driver;
@@ -398,6 +399,13 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 return;
             }
 
+            if (string.Equals(action, "inspection_back", StringComparison.OrdinalIgnoreCase))
+            {
+                _dashboard.NavigateBack();
+                _diagnostics.Activity = "Inspection level returned";
+                return;
+            }
+
             if (string.Equals(action, "focus", StringComparison.OrdinalIgnoreCase))
             {
                 var focusBounds = CalculateRendererBounds(_factoryRoot);
@@ -514,7 +522,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 _visuals[device.Id] = visual;
                 _deviceRoots[device.Id] = root.transform;
                 _deviceModelTypes[device.Id] = device.ModelType ?? string.Empty;
-                _dashboard.ApplyPreviewDevice(device, root);
+                _dashboard.ApplyPreviewDevice(device, root, instance.Inspection);
                 if (_latestDeviceFrames.TryGetValue(device.Id, out var latest))
                 {
                     driver?.ApplyRealtime(latest);
@@ -607,8 +615,15 @@ namespace HeatTreatment.DigitalTwin.Runtime
             if (string.Equals(effectiveMode, "device", StringComparison.OrdinalIgnoreCase))
             {
                 var deviceId = focus?.Value<string>("deviceId");
-                _dashboard.FocusPreviewDevice(deviceId, configuredView);
-                PublishDashboardContext("device", deviceId: deviceId, viewId: configuredView?.Id ?? viewId);
+                _dashboard.FocusPreviewDevice(
+                    deviceId,
+                    configuredView,
+                    focus?.Value<string>("inspectionStage") ?? string.Empty,
+                    focus?.Value<string>("partId") ?? string.Empty);
+                if (string.IsNullOrWhiteSpace(focus?.Value<string>("inspectionStage")))
+                {
+                    PublishDashboardContext("device", deviceId: deviceId, viewId: configuredView?.Id ?? viewId);
+                }
                 Debug.Log($"[FactoryRuntime] Native focus applied: mode=device, target={deviceId ?? string.Empty}");
                 return;
             }
@@ -670,6 +685,20 @@ namespace HeatTreatment.DigitalTwin.Runtime
             PublishDashboardContext(effectiveMode, deviceId: deviceId, viewId: view?.Id ?? _dashboard?.ActiveViewId ?? string.Empty);
         }
 
+        private void OnInspectionContextChanged(JObject payload)
+        {
+            if (payload == null) return;
+            var context = _lastDashboardContext.DeepClone() as JObject ?? new JObject();
+            foreach (var property in payload.Properties()) context[property.Name] = property.Value.DeepClone();
+            context["sceneReady"] = _sceneReady;
+            _lastDashboardContext = context;
+            _webSocket?.SendMessage(new JObject
+            {
+                ["type"] = "dashboard_context",
+                ["payload"] = context.DeepClone()
+            });
+        }
+
         private void PublishDashboardContext(string mode, string deviceId = "", string lineId = "", string workshopId = "", string viewId = "")
         {
             var normalizedMode = string.IsNullOrWhiteSpace(mode) ? "factory" : mode.ToLowerInvariant();
@@ -686,7 +715,14 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 ["sceneId"] = _config?.Platform?["activeScene"]?["id"]?.Value<string>() ?? string.Empty,
                 ["workshopId"] = workshopId ?? string.Empty,
                 ["lineId"] = lineId ?? string.Empty,
-                ["deviceId"] = deviceId ?? string.Empty
+                ["deviceId"] = deviceId ?? string.Empty,
+                ["inspectionStage"] = string.IsNullOrWhiteSpace(deviceId) ? "" : "solid",
+                ["partId"] = string.Empty,
+                ["partName"] = string.Empty,
+                ["partDescription"] = string.Empty,
+                ["partPointIds"] = new JArray(),
+                ["partPointKeys"] = new JArray(),
+                ["partDetailViewId"] = string.Empty
             };
             _webSocket?.SendMessage(new JObject
             {
@@ -1012,6 +1048,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 _webSocket.StopClient();
             }
             if (_dashboard != null) _dashboard.ViewContextChanged -= OnDashboardViewContextChanged;
+            if (_dashboard != null) _dashboard.InspectionContextChanged -= OnInspectionContextChanged;
             if (_windowMenu != null) _windowMenu.SettingsRequested -= OpenAdminSettings;
             _reload?.Cancel();
             _reload?.Dispose();

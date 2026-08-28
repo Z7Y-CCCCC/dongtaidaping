@@ -152,7 +152,7 @@ function normalizeDatabaseDataset(source = {}, fallback = {}, index = 0) {
         rowLimit: integer(data.rowLimit ?? base.rowLimit, 50, 1, 500),
         refreshMs: integer(data.refreshMs ?? base.refreshMs, 5000, 1000, 3600000),
         contextField: shortText(data.contextField, '', 255),
-        contextKey: ['deviceId', 'lineId', 'workshopId', 'viewId'].includes(data.contextKey) ? data.contextKey : ''
+        contextKey: ['deviceId', 'lineId', 'workshopId', 'viewId', 'partId'].includes(data.contextKey) ? data.contextKey : ''
     };
 }
 
@@ -160,7 +160,7 @@ function normalizeDataBinding(source, legacyBinding = {}) {
     const data = objectValue(source, {});
     const binding = objectValue(legacyBinding, {});
     let mode = shortText(data.mode, '', 32);
-    if (!['static', 'plc', 'database'].includes(mode)) {
+    if (!['static', 'plc', 'database', 'runtime'].includes(mode)) {
         mode = (data.connectionId || binding.connectionId || binding.connection_id)
             ? 'database'
             : (data.pointId || binding.pointId || binding.point_id)
@@ -221,7 +221,10 @@ const DEFAULT_VIEW_DEFINITIONS = [
     { id: 'factory_overview', name: '全厂总览', mode: 'factory', targetType: 'factory', parentViewId: '', camera: { yaw: -39, pitch: 33, distanceScale: 1.08, transitionSeconds: 0.8 } },
     { id: 'workshop_overview', name: '车间视角', mode: 'workshop', targetType: 'workshop', parentViewId: 'factory_overview', camera: { yaw: -39, pitch: 36, distanceScale: 1.08, transitionSeconds: 0.7 } },
     { id: 'line_overview', name: '产线视角', mode: 'line', targetType: 'line', parentViewId: 'workshop_overview', camera: { yaw: -39, pitch: 33, distanceScale: 1.08, transitionSeconds: 0.65 } },
-    { id: 'device_detail', name: '设备详情', mode: 'device', targetType: 'device', parentViewId: 'line_overview', camera: { yaw: 238, pitch: 19, distanceScale: 1.12, transitionSeconds: 0.55, relativeToTarget: true } }
+    { id: 'device_detail', name: '设备实体视角', mode: 'device', targetType: 'device', parentViewId: 'line_overview', camera: { yaw: 238, pitch: 19, distanceScale: 1.12, transitionSeconds: 0.55, relativeToTarget: true }, metadata: { inspectionStage: 'solid' } },
+    { id: 'device_xray', name: '设备透视视角', mode: 'device', targetType: 'device', parentViewId: 'device_detail', camera: { yaw: 238, pitch: 19, distanceScale: 1.08, transitionSeconds: 0.65, relativeToTarget: true }, metadata: { inspectionStage: 'xray' } },
+    { id: 'device_exploded', name: '设备拆解视角', mode: 'device', targetType: 'device', parentViewId: 'device_xray', camera: { yaw: 238, pitch: 22, distanceScale: 1.22, transitionSeconds: 0.7, relativeToTarget: true }, metadata: { inspectionStage: 'exploded' } },
+    { id: 'device_part', name: '部件详情视角', mode: 'device', targetType: 'device_part', parentViewId: 'device_exploded', camera: { yaw: 238, pitch: 18, distanceScale: 1.35, transitionSeconds: 0.55, relativeToTarget: true }, metadata: { inspectionStage: 'part' } }
 ];
 
 function defaultDashboardViews() {
@@ -271,7 +274,9 @@ function normalizeDashboardView(source, index = 0) {
 function normalizeDashboardViews(scene) {
     const input = objectValue(scene, {});
     const raw = Array.isArray(input.views) && input.views.length ? input.views : defaultDashboardViews();
-    const views = raw.slice(0, 50).map((view, index) => normalizeDashboardView(view, index));
+    const existingIds = new Set(raw.map(view => String(view?.id || '')));
+    const inspectionDefaults = defaultDashboardViews().filter(view => view.id.startsWith('device_') && !existingIds.has(view.id));
+    const views = [...raw, ...inspectionDefaults].slice(0, 50).map((view, index) => normalizeDashboardView(view, index));
     const ids = new Set(views.map(view => view.id));
     const defaultViewId = ids.has(String(input.defaultViewId || ''))
         ? String(input.defaultViewId)

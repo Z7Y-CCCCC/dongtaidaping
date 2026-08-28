@@ -7,6 +7,7 @@ using HeatTreatment.DigitalTwin.Rendering;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace HeatTreatment.DigitalTwin.Runtime
 {
@@ -21,6 +22,14 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             Overview,
             Detail
+        }
+
+        private enum InspectionStage
+        {
+            Solid,
+            Xray,
+            Exploded,
+            PartDetail
         }
 
         public sealed class ConfiguredView
@@ -41,6 +50,42 @@ namespace HeatTreatment.DigitalTwin.Runtime
             public readonly HashSet<string> ShowComponents = new HashSet<string>();
             public readonly HashSet<string> HideComponents = new HashSet<string>();
             public bool HideNonTargetDevices;
+            public JObject Metadata = new JObject();
+        }
+
+        private sealed class InspectionRendererState
+        {
+            public Renderer Renderer;
+            public Material[] OriginalMaterials = Array.Empty<Material>();
+            public Material[] RuntimeMaterials = Array.Empty<Material>();
+            public bool OriginalEnabled;
+            public ShadowCastingMode OriginalShadowCastingMode;
+            public bool OriginalReceiveShadows;
+        }
+
+        private sealed class InspectionPartState
+        {
+            public DeviceInspectionPartDto Config;
+            public Transform Target;
+            public Transform OffsetRoot;
+            public Vector3 StartOffset;
+            public Vector3 ExplodeOffset;
+            public Vector3 TargetOffset;
+            public Renderer[] Renderers = Array.Empty<Renderer>();
+            public Bounds WorldBounds;
+        }
+
+        private sealed class DeviceInspectionRuntime
+        {
+            public DeviceInspectionConfigDto Config = new DeviceInspectionConfigDto();
+            public InspectionStage Stage = InspectionStage.Solid;
+            public readonly List<InspectionRendererState> ShellRenderers = new List<InspectionRendererState>();
+            public readonly List<InspectionPartState> Parts = new List<InspectionPartState>();
+            public readonly List<InspectionRendererState> HighlightRenderers = new List<InspectionRendererState>();
+            public InspectionPartState SelectedPart;
+            public bool TransitionActive;
+            public float TransitionElapsed;
+            public float TransitionDuration = .65f;
         }
 
         private sealed class DeviceView
@@ -52,6 +97,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             public JObject Frame;
             public float LastHistoryAt;
             public readonly Dictionary<string, List<float>> History = new Dictionary<string, List<float>>();
+            public DeviceInspectionRuntime Inspection;
         }
 
         private sealed class DashboardPanelConfig
@@ -186,8 +232,11 @@ namespace HeatTreatment.DigitalTwin.Runtime
         }
 
         public string SelectedDeviceId => _selected?.Device?.Id ?? string.Empty;
+        public string SelectedPartId => _selected?.Inspection?.SelectedPart?.Config?.Id ?? string.Empty;
+        public string InspectionStageName => InspectionStageKey(_selected?.Inspection?.Stage ?? InspectionStage.Solid);
         public string ActiveViewId => _activeViewId;
         public event Action<string, string> ViewContextChanged;
+        public event Action<JObject> InspectionContextChanged;
 
         /// <summary>
         /// Determines whether a native Unity component is enabled for the active
@@ -303,7 +352,8 @@ namespace HeatTreatment.DigitalTwin.Runtime
                         DistanceScale = Mathf.Clamp(camera?.Value<float?>("distanceScale") ?? 1.08f, .1f, 10f),
                         TransitionSeconds = Mathf.Clamp(camera?.Value<float?>("transitionSeconds") ?? .8f, 0f, 10f),
                         RelativeToTarget = camera?.Value<bool?>("relativeToTarget") ?? false,
-                        HideNonTargetDevices = state?.Value<bool?>("hideNonTargetDevices") ?? false
+                        HideNonTargetDevices = state?.Value<bool?>("hideNonTargetDevices") ?? false,
+                        Metadata = token["metadata"] as JObject ?? new JObject()
                     };
                     if (targetOffset != null)
                     {
@@ -341,7 +391,8 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 DistanceScale = Mathf.Clamp(camera?.Value<float?>("distanceScale") ?? 1.08f, .1f, 10f),
                 TransitionSeconds = Mathf.Clamp(camera?.Value<float?>("transitionSeconds") ?? .8f, 0f, 10f),
                 RelativeToTarget = camera?.Value<bool?>("relativeToTarget") ?? false,
-                HideNonTargetDevices = state?.Value<bool?>("hideNonTargetDevices") ?? false
+                HideNonTargetDevices = state?.Value<bool?>("hideNonTargetDevices") ?? false,
+                Metadata = token["metadata"] as JObject ?? new JObject()
             };
             var targetOffset = camera?["targetOffset"] as JArray;
             if (targetOffset != null)
@@ -366,6 +417,12 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 _configuredViews["line_overview"] = new ConfiguredView { Id = "line_overview", Name = "产线视角", Mode = "line", TargetType = "line", ParentViewId = "workshop_overview", ReturnViewId = "workshop_overview", Yaw = -39f, Pitch = 33f, DistanceScale = 1.08f };
             if (!_configuredViews.ContainsKey("device_detail"))
                 _configuredViews["device_detail"] = new ConfiguredView { Id = "device_detail", Name = "设备详情", Mode = "device", TargetType = "device", ParentViewId = "line_overview", ReturnViewId = "line_overview", Yaw = 238f, Pitch = 19f, DistanceScale = 1.12f, RelativeToTarget = true };
+            if (!_configuredViews.ContainsKey("device_xray"))
+                _configuredViews["device_xray"] = new ConfiguredView { Id = "device_xray", Name = "设备透视", Mode = "device", TargetType = "device", ParentViewId = "device_detail", ReturnViewId = "device_detail", Yaw = 238f, Pitch = 19f, DistanceScale = 1.08f, RelativeToTarget = true };
+            if (!_configuredViews.ContainsKey("device_exploded"))
+                _configuredViews["device_exploded"] = new ConfiguredView { Id = "device_exploded", Name = "设备拆解", Mode = "device", TargetType = "device", ParentViewId = "device_xray", ReturnViewId = "device_xray", Yaw = 238f, Pitch = 22f, DistanceScale = 1.22f, RelativeToTarget = true };
+            if (!_configuredViews.ContainsKey("device_part"))
+                _configuredViews["device_part"] = new ConfiguredView { Id = "device_part", Name = "部件详情", Mode = "device", TargetType = "device_part", ParentViewId = "device_exploded", ReturnViewId = "device_exploded", Yaw = 238f, Pitch = 18f, DistanceScale = 1.35f, RelativeToTarget = true };
             if (!_configuredViews.ContainsKey(_defaultViewId)) _defaultViewId = "factory_overview";
         }
 
@@ -385,29 +442,35 @@ namespace HeatTreatment.DigitalTwin.Runtime
             if (_orbit != null && active) _orbit.PointerInputBlocked = false;
         }
 
-        public void RegisterDevice(DeviceDto device, GameObject root)
+        public void RegisterDevice(DeviceDto device, GameObject root, DeviceInspectionConfigDto inspection = null)
         {
             if (device == null || root == null || string.IsNullOrWhiteSpace(device.Id)) return;
-            _devices[device.Id] = new DeviceView
+            var view = new DeviceView
             {
                 Device = device,
                 Root = root,
                 WorldBounds = CalculateBounds(root),
-                LineName = _lineNames.TryGetValue(device.Id, out var lineName) ? lineName : "未分配产线"
+                LineName = _lineNames.TryGetValue(device.Id, out var lineName) ? lineName : "未分配产线",
+                Inspection = new DeviceInspectionRuntime { Config = inspection ?? ResolveInspectionConfig(device) }
             };
+            PrepareInspection(view);
+            _devices[device.Id] = view;
         }
 
-        public void ApplyPreviewDevice(DeviceDto device, GameObject root)
+        public void ApplyPreviewDevice(DeviceDto device, GameObject root, DeviceInspectionConfigDto inspection = null)
         {
             if (device == null || root == null || string.IsNullOrWhiteSpace(device.Id)) return;
             if (_devices.TryGetValue(device.Id, out var existing))
             {
+                ResetInspection(existing, true);
                 existing.Device = device;
                 existing.Root = root;
                 existing.WorldBounds = CalculateBounds(root);
+                existing.Inspection = new DeviceInspectionRuntime { Config = inspection ?? ResolveInspectionConfig(device) };
+                PrepareInspection(existing);
                 return;
             }
-            RegisterDevice(device, root);
+            RegisterDevice(device, root, inspection);
         }
 
         public void UpdatePreviewFactoryBounds(Bounds factoryBounds)
@@ -421,6 +484,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
 
         public void FocusPreviewBounds(Bounds bounds, ConfiguredView view = null, ISet<string> targetDeviceIds = null)
         {
+            if (_selected != null) ResetInspection(_selected, false);
             _selected = null;
             _mode = DashboardMode.Overview;
             _uiBlend = 1f;
@@ -438,10 +502,15 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _orbit?.FocusBounds(bounds, configured?.Yaw ?? -39f, configured?.Pitch ?? 33f, configured?.DistanceScale ?? 1.08f, false);
         }
 
-        public void FocusPreviewDevice(string deviceId, ConfiguredView view = null)
+        public void FocusPreviewDevice(string deviceId, ConfiguredView view = null, string inspectionStage = "", string partId = "")
         {
             if (string.IsNullOrWhiteSpace(deviceId)) return;
-            if (_devices.TryGetValue(deviceId, out var device)) ShowDetail(device, view ?? ResolveView(string.Empty, "device"));
+            if (!_devices.TryGetValue(deviceId, out var device)) return;
+            ShowDetail(device, view ?? ResolveView(string.Empty, "device"));
+            if (!string.IsNullOrWhiteSpace(inspectionStage))
+            {
+                SetInspectionStage(device, ParseInspectionStage(inspectionStage), false, partId);
+            }
         }
 
         public void CompleteFactory(Bounds factoryBounds)
@@ -477,6 +546,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             foreach (var entry in _devices.Values)
             {
+                ResetInspection(entry, true);
                 if (entry.Root != null) entry.Root.SetActive(true);
             }
             _devices.Clear();
@@ -489,6 +559,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private void Update()
         {
             UpdateCanvasMetrics();
+            UpdateInspectionTransition();
             _uiBlend = Mathf.MoveTowards(_uiBlend, 1f, Time.unscaledDeltaTime * 4.2f);
             var pointer = ScreenToDesign(Input.mousePosition);
             var legacyDashboardBlocksPointer = !_webOverlayActive && IsPointerOverDashboard(pointer);
@@ -497,11 +568,10 @@ namespace HeatTreatment.DigitalTwin.Runtime
             if (_mode == DashboardMode.Detail
                 && (Input.GetKeyDown(KeyCode.Escape) || Input.GetKeyDown(KeyCode.Backspace)))
             {
-                ShowOverview(false);
+                NavigateBack();
                 return;
             }
 
-            if (_mode != DashboardMode.Overview) return;
             if (Input.GetMouseButtonDown(0)) _pointerDown = pointer;
             if (!Input.GetMouseButtonUp(0)) return;
             if (legacyDashboardBlocksPointer) return;
@@ -587,7 +657,7 @@ namespace HeatTreatment.DigitalTwin.Runtime
             GUI.Label(new Rect(58f, 55f, 560f, 22f), _factoryName, _mutedStyle);
 
             var title = _mode == DashboardMode.Detail && _selected != null
-                ? $"设备运行详情  /  {_selected.Device.Name}"
+                ? $"{InspectionStageLabel(_selected.Inspection?.Stage ?? InspectionStage.Solid)}  /  {_selected.Device.Name}"
                 : "全厂设备运行总览";
             GUI.Label(new Rect(630f, 28f, 660f, 38f), title, _headerStyle);
 
@@ -728,11 +798,31 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             var device = _selected;
             if (IsActiveViewComponentVisible("widget_navigation", "navigation")
-                && GUI.Button(DetailBackRect(), "〈 返回上一级", _buttonStyle)) ReturnToParentView();
+                && GUI.Button(DetailBackRect(), "〈 返回上一级", _buttonStyle)) NavigateBack();
+            DrawInspectionHint(device);
             if (!IsActiveViewComponentVisible("widget_diagnostics", "diagnostics")) return;
             if (_dashboardConfig.Detail.Left.Visible) DrawDetailLeft(device);
             if (_dashboardConfig.Detail.Right.Visible) DrawDetailRight(device);
             if (_dashboardConfig.Detail.Trends.Visible) DrawDetailTrends(device);
+        }
+
+        private void DrawInspectionHint(DeviceView device)
+        {
+            if (device?.Inspection?.Config?.Enabled != true) return;
+            var stage = device.Inspection.Stage;
+            var selectedPart = device.Inspection.SelectedPart?.Config;
+            var text = stage == InspectionStage.Solid
+                ? "再次点击设备：查看透明外壳与内部结构"
+                : stage == InspectionStage.Xray
+                    ? "再次点击设备：移除外壳并拆解关键部件"
+                    : stage == InspectionStage.Exploded
+                        ? "点击任一关键部件：在右侧查看参数与运行状态"
+                        : $"当前部件：{selectedPart?.Name ?? selectedPart?.Id ?? "未选择"}";
+            var width = Mathf.Min(620f, Mathf.Max(360f, text.Length * 16f));
+            var rect = new Rect((DesignWidth - width) * .5f, _dashboardConfig.ShowHeader ? 98f : 24f, width, 38f);
+            DrawSolid(rect, new Color(0.025f, 0.075f, 0.11f, .9f));
+            DrawSolid(new Rect(rect.x, rect.yMax - 2f, rect.width, 2f), Accent);
+            GUI.Label(rect, text, _centerStyle);
         }
 
         private void DrawDetailLeft(DeviceView device)
@@ -894,10 +984,18 @@ namespace HeatTreatment.DigitalTwin.Runtime
         private void ShowDetail(DeviceView device, ConfiguredView configuredView = null)
         {
             if (device == null || device.Root == null) return;
+            if (_selected != null && _selected != device) ResetInspection(_selected, false);
             _selected = device;
             _mode = DashboardMode.Detail;
             _uiBlend = 0f;
             _pointScroll = Vector2.zero;
+            ResetInspection(device, false);
+            if (device.Inspection == null)
+            {
+                device.Inspection = new DeviceInspectionRuntime { Config = ResolveInspectionConfig(device.Device) };
+                PrepareInspection(device);
+            }
+            device.Inspection.Stage = InspectionStage.Solid;
             var hideOtherDevices = configuredView == null
                 || string.Equals(configuredView.Mode, "device", System.StringComparison.OrdinalIgnoreCase)
                 || configuredView.HideNonTargetDevices;
@@ -918,10 +1016,12 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _orbit?.SetTargetOffset(view?.TargetOffset ?? Vector3.zero);
             _orbit?.FocusBounds(device.WorldBounds, detailYaw, view?.Pitch ?? 19f, view?.DistanceScale ?? 1.12f, false);
             ViewContextChanged?.Invoke("device", device.Device?.Id ?? string.Empty);
+            PublishInspectionContext(device);
         }
 
         private void ShowOverview(bool immediate, ConfiguredView configuredView = null)
         {
+            if (_selected != null) ResetInspection(_selected, false);
             _selected = null;
             _mode = DashboardMode.Overview;
             _uiBlend = immediate ? 1f : 0f;
@@ -935,6 +1035,26 @@ namespace HeatTreatment.DigitalTwin.Runtime
             _orbit?.SetTargetOffset(view?.TargetOffset ?? Vector3.zero);
             _orbit?.FocusBounds(_factoryBounds, view?.Yaw ?? -39f, view?.Pitch ?? 33f, view?.DistanceScale ?? 1.08f, immediate);
             ViewContextChanged?.Invoke("factory", string.Empty);
+        }
+
+        public void NavigateBack()
+        {
+            if (_mode == DashboardMode.Detail && _selected?.Inspection != null)
+            {
+                switch (_selected.Inspection.Stage)
+                {
+                    case InspectionStage.PartDetail:
+                        SetInspectionStage(_selected, InspectionStage.Exploded);
+                        return;
+                    case InspectionStage.Exploded:
+                        SetInspectionStage(_selected, InspectionStage.Xray);
+                        return;
+                    case InspectionStage.Xray:
+                        SetInspectionStage(_selected, InspectionStage.Solid);
+                        return;
+                }
+            }
+            ReturnToParentView();
         }
 
         private void ReturnToParentView()
@@ -955,6 +1075,11 @@ namespace HeatTreatment.DigitalTwin.Runtime
         {
             if (_camera == null) return;
             var ray = _camera.ScreenPointToRay(screenPosition);
+            if (_mode == DashboardMode.Detail && _selected != null)
+            {
+                SelectInspectionTarget(ray);
+                return;
+            }
             DeviceView closest = null;
             var distance = float.PositiveInfinity;
             foreach (var device in _devices.Values)
@@ -965,6 +1090,474 @@ namespace HeatTreatment.DigitalTwin.Runtime
                 distance = hitDistance;
             }
             if (closest != null) ShowDetail(closest);
+        }
+
+        private DeviceInspectionConfigDto ResolveInspectionConfig(DeviceDto device)
+        {
+            var asset = _config?.Models?.FirstOrDefault(model => string.Equals(model?.Id, device?.ModelType, StringComparison.OrdinalIgnoreCase));
+            return InspectionConfigResolver.Resolve(asset, device);
+        }
+
+        private void PrepareInspection(DeviceView device)
+        {
+            if (device?.Root == null) return;
+            device.Inspection ??= new DeviceInspectionRuntime();
+            device.Inspection.Config ??= ResolveInspectionConfig(device.Device);
+            device.Inspection.Config.Normalize();
+            var runtime = device.Inspection;
+            var pathMap = BuildTransformPathMap(device.Root.transform);
+            var transforms = device.Root.GetComponentsInChildren<Transform>(true);
+            var shellTargets = new HashSet<Transform>();
+            foreach (var path in runtime.Config.Shell.NodePaths)
+            {
+                if (pathMap.TryGetValue(path, out var target)) shellTargets.Add(target);
+            }
+            foreach (var name in runtime.Config.Shell.NodeNames)
+            {
+                foreach (var target in transforms.Where(item => string.Equals(item.name, name, StringComparison.OrdinalIgnoreCase))) shellTargets.Add(target);
+            }
+            if (shellTargets.Count == 0)
+            {
+                foreach (var target in transforms)
+                {
+                    var name = (target.name ?? string.Empty).ToLowerInvariant();
+                    if (name.Contains("shell") || name.Contains("housing") || name.Contains("casing")
+                        || name.Contains("outer") || name.Contains("enclosure") || name.Contains("炉体") || name.Contains("外壳"))
+                    {
+                        shellTargets.Add(target);
+                    }
+                }
+            }
+
+            var shellRenderers = new HashSet<Renderer>();
+            foreach (var target in shellTargets)
+            {
+                foreach (var renderer in target.GetComponentsInChildren<Renderer>(true)) shellRenderers.Add(renderer);
+            }
+            foreach (var renderer in shellRenderers)
+            {
+                runtime.ShellRenderers.Add(new InspectionRendererState
+                {
+                    Renderer = renderer,
+                    OriginalMaterials = renderer.sharedMaterials ?? Array.Empty<Material>(),
+                    OriginalEnabled = renderer.enabled,
+                    OriginalShadowCastingMode = renderer.shadowCastingMode,
+                    OriginalReceiveShadows = renderer.receiveShadows
+                });
+            }
+
+            var parts = runtime.Config.Parts ?? new List<DeviceInspectionPartDto>();
+            for (var index = 0; index < parts.Count; index += 1)
+            {
+                var config = parts[index];
+                if (config == null) continue;
+                var target = ResolveInspectionTransform(pathMap, transforms, config.NodePath, config.NodeName);
+                if (target == null) continue;
+
+                // The offset wrapper is identity-only, so ModelBindingDriver can
+                // keep animating the original node while inspection moves the
+                // wrapper independently.
+                var wrapperObject = new GameObject($"__InspectionOffset_{config.Id}");
+                var wrapper = wrapperObject.transform;
+                wrapper.SetParent(target.parent, false);
+                wrapper.localPosition = Vector3.zero;
+                wrapper.localRotation = Quaternion.identity;
+                wrapper.localScale = Vector3.one;
+                target.SetParent(wrapper, false);
+
+                var offset = InspectionVector(config.ExplodeOffset);
+                if (offset.sqrMagnitude < .0001f && parts.Count > 1)
+                {
+                    var spread = index - (parts.Count - 1) * .5f;
+                    offset = new Vector3(spread * 1.45f, (index % 2) * .25f, (index % 3 - 1) * .35f);
+                }
+                runtime.Parts.Add(new InspectionPartState
+                {
+                    Config = config,
+                    Target = target,
+                    OffsetRoot = wrapper,
+                    StartOffset = Vector3.zero,
+                    ExplodeOffset = offset,
+                    TargetOffset = offset,
+                    Renderers = target.GetComponentsInChildren<Renderer>(true),
+                    WorldBounds = CalculateBounds(target.gameObject)
+                });
+            }
+            runtime.TransitionDuration = runtime.Config.AnimationDuration;
+            runtime.Stage = InspectionStage.Solid;
+            runtime.SelectedPart = null;
+        }
+
+        private static Dictionary<string, Transform> BuildTransformPathMap(Transform root)
+        {
+            var result = new Dictionary<string, Transform>(StringComparer.Ordinal);
+            AddTransformChildren(root, string.Empty, result);
+            return result;
+        }
+
+        private static void AddTransformChildren(Transform parent, string parentPath, IDictionary<string, Transform> result)
+        {
+            for (var index = 0; index < parent.childCount; index += 1)
+            {
+                var child = parent.GetChild(index);
+                var segment = $"{(child.name ?? string.Empty).Replace("/", "_")}#{index}";
+                var path = string.IsNullOrEmpty(parentPath) ? segment : $"{parentPath}/{segment}";
+                result[path] = child;
+                AddTransformChildren(child, path, result);
+            }
+        }
+
+        private static Transform ResolveInspectionTransform(
+            IReadOnlyDictionary<string, Transform> pathMap,
+            IEnumerable<Transform> transforms,
+            string path,
+            string name)
+        {
+            if (!string.IsNullOrWhiteSpace(path) && pathMap.TryGetValue(path, out var byPath)) return byPath;
+            if (!string.IsNullOrWhiteSpace(name)) return transforms.FirstOrDefault(item => string.Equals(item.name, name, StringComparison.OrdinalIgnoreCase));
+            return null;
+        }
+
+        private static Vector3 InspectionVector(IEnumerable<float> values)
+        {
+            var array = (values ?? Enumerable.Empty<float>()).Take(3).ToArray();
+            return new Vector3(
+                array.Length > 0 ? array[0] : 0f,
+                array.Length > 1 ? array[1] : 0f,
+                array.Length > 2 ? array[2] : 0f);
+        }
+
+        private void ResetInspection(DeviceView device, bool dispose)
+        {
+            var runtime = device?.Inspection;
+            if (runtime == null) return;
+            runtime.TransitionActive = false;
+            ClearInspectionHighlight(runtime);
+            RestoreShellVisuals(runtime);
+            foreach (var part in runtime.Parts)
+            {
+                if (part?.OffsetRoot == null) continue;
+                part.OffsetRoot.localPosition = Vector3.zero;
+                part.StartOffset = Vector3.zero;
+                part.TargetOffset = Vector3.zero;
+                if (!dispose) continue;
+                var parent = part.OffsetRoot.parent;
+                if (part.Target != null) part.Target.SetParent(parent, false);
+                Destroy(part.OffsetRoot.gameObject);
+            }
+            runtime.SelectedPart = null;
+            runtime.Stage = InspectionStage.Solid;
+            if (!dispose) return;
+            runtime.Parts.Clear();
+            runtime.ShellRenderers.Clear();
+            device.Inspection = null;
+        }
+
+        private void SetInspectionStage(DeviceView device, InspectionStage stage, bool immediate = false, string partId = "")
+        {
+            if (device?.Root == null) return;
+            device.Inspection ??= new DeviceInspectionRuntime { Config = ResolveInspectionConfig(device.Device) };
+            if (device.Inspection.Parts.Count == 0 && device.Inspection.ShellRenderers.Count == 0) PrepareInspection(device);
+            var runtime = device.Inspection;
+            if (!runtime.Config.Enabled && stage != InspectionStage.Solid) stage = InspectionStage.Solid;
+            if (stage == InspectionStage.PartDetail)
+            {
+                runtime.SelectedPart = runtime.Parts.FirstOrDefault(part => string.Equals(part.Config.Id, partId, StringComparison.OrdinalIgnoreCase));
+                if (runtime.SelectedPart == null) stage = InspectionStage.Exploded;
+            }
+            else runtime.SelectedPart = null;
+
+            runtime.Stage = stage;
+            runtime.TransitionDuration = runtime.Config.AnimationDuration;
+            ClearInspectionHighlight(runtime);
+            RestoreShellVisuals(runtime);
+            if (stage == InspectionStage.Xray)
+            {
+                ApplyShellXray(runtime);
+                StartInspectionTransition(runtime, false, immediate);
+            }
+            else if (stage == InspectionStage.Exploded || stage == InspectionStage.PartDetail)
+            {
+                HideShell(runtime);
+                StartInspectionTransition(runtime, true, immediate);
+                if (stage == InspectionStage.PartDetail) ApplyInspectionHighlight(runtime, runtime.SelectedPart);
+            }
+            else
+            {
+                StartInspectionTransition(runtime, false, true);
+            }
+
+            var viewId = InspectionViewId(runtime, stage, runtime.SelectedPart);
+            _activeViewId = viewId;
+            FocusInspectionCamera(device, stage, viewId, immediate);
+            _uiBlend = 0f;
+            PublishInspectionContext(device);
+        }
+
+        private void StartInspectionTransition(DeviceInspectionRuntime runtime, bool exploded, bool immediate)
+        {
+            runtime.TransitionElapsed = 0f;
+            runtime.TransitionDuration = Mathf.Max(.05f, runtime.Config.AnimationDuration);
+            runtime.TransitionActive = !immediate;
+            foreach (var part in runtime.Parts)
+            {
+                if (part?.OffsetRoot == null) continue;
+                part.StartOffset = part.OffsetRoot.localPosition;
+                part.TargetOffset = exploded ? InspectionExplosionOffset(part, runtime.Parts.Count) : Vector3.zero;
+                if (immediate) part.OffsetRoot.localPosition = part.TargetOffset;
+            }
+        }
+
+        private static Vector3 InspectionExplosionOffset(InspectionPartState part, int count)
+        {
+            if (part != null && part.ExplodeOffset.sqrMagnitude > .0001f) return part.ExplodeOffset;
+            return Vector3.zero;
+        }
+
+        private void UpdateInspectionTransition()
+        {
+            var runtime = _selected?.Inspection;
+            if (_mode != DashboardMode.Detail || runtime == null || !runtime.TransitionActive) return;
+            runtime.TransitionElapsed += Time.unscaledDeltaTime;
+            var progress = Mathf.Clamp01(runtime.TransitionElapsed / Mathf.Max(.05f, runtime.TransitionDuration));
+            var eased = progress * progress * (3f - 2f * progress);
+            foreach (var part in runtime.Parts)
+            {
+                if (part?.OffsetRoot == null) continue;
+                part.OffsetRoot.localPosition = Vector3.Lerp(part.StartOffset, part.TargetOffset, eased);
+            }
+            if (progress < 1f) return;
+            runtime.TransitionActive = false;
+            FocusInspectionCamera(_selected, runtime.Stage, _activeViewId, false);
+        }
+
+        private void ApplyShellXray(DeviceInspectionRuntime runtime)
+        {
+            foreach (var state in runtime.ShellRenderers)
+            {
+                if (state?.Renderer == null) continue;
+                state.Renderer.enabled = state.OriginalEnabled;
+                state.RuntimeMaterials = CloneMaterials(state.OriginalMaterials);
+                state.Renderer.sharedMaterials = state.RuntimeMaterials;
+                state.Renderer.shadowCastingMode = ShadowCastingMode.Off;
+                state.Renderer.receiveShadows = false;
+                foreach (var material in state.RuntimeMaterials)
+                {
+                    if (material != null) ConfigureInspectionMaterial(material, runtime.Config.Shell.Opacity, runtime.Config.Shell.Wireframe);
+                }
+            }
+        }
+
+        private static void HideShell(DeviceInspectionRuntime runtime)
+        {
+            foreach (var state in runtime.ShellRenderers)
+            {
+                if (state?.Renderer != null) state.Renderer.enabled = false;
+            }
+        }
+
+        private static Material[] CloneMaterials(Material[] originals)
+        {
+            return (originals ?? Array.Empty<Material>())
+                .Select(material => material == null ? null : new Material(material))
+                .ToArray();
+        }
+
+        private static void ConfigureInspectionMaterial(Material material, float opacity, bool wireframe)
+        {
+            var baseColor = material.HasProperty("_BaseColor") ? material.GetColor("_BaseColor")
+                : material.HasProperty("_Color") ? material.GetColor("_Color") : Color.white;
+            baseColor.a = opacity;
+            if (wireframe) baseColor = Color.Lerp(baseColor, new Color(.15f, .75f, 1f, opacity), .7f);
+            if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", baseColor);
+            if (material.HasProperty("_Color")) material.SetColor("_Color", baseColor);
+            if (material.HasProperty("_Surface")) material.SetFloat("_Surface", 1f);
+            if (material.HasProperty("_Blend")) material.SetFloat("_Blend", 0f);
+            if (material.HasProperty("_ZWrite")) material.SetFloat("_ZWrite", 0f);
+            if (material.HasProperty("_SrcBlend")) material.SetFloat("_SrcBlend", (float)BlendMode.SrcAlpha);
+            if (material.HasProperty("_DstBlend")) material.SetFloat("_DstBlend", (float)BlendMode.OneMinusSrcAlpha);
+            material.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+            material.renderQueue = (int)RenderQueue.Transparent;
+            material.SetOverrideTag("RenderType", "Transparent");
+        }
+
+        private static void RestoreShellVisuals(DeviceInspectionRuntime runtime)
+        {
+            foreach (var state in runtime?.ShellRenderers ?? Enumerable.Empty<InspectionRendererState>())
+            {
+                if (state?.Renderer == null) continue;
+                state.Renderer.sharedMaterials = state.OriginalMaterials;
+                state.Renderer.enabled = state.OriginalEnabled;
+                state.Renderer.shadowCastingMode = state.OriginalShadowCastingMode;
+                state.Renderer.receiveShadows = state.OriginalReceiveShadows;
+                DestroyMaterials(state.RuntimeMaterials);
+                state.RuntimeMaterials = Array.Empty<Material>();
+            }
+        }
+
+        private static void DestroyMaterials(IEnumerable<Material> materials)
+        {
+            foreach (var material in materials ?? Enumerable.Empty<Material>())
+            {
+                if (material != null) Destroy(material);
+            }
+        }
+
+        private void ApplyInspectionHighlight(DeviceInspectionRuntime runtime, InspectionPartState part)
+        {
+            if (part == null) return;
+            foreach (var renderer in part.Renderers ?? Array.Empty<Renderer>())
+            {
+                if (renderer == null) continue;
+                var state = new InspectionRendererState
+                {
+                    Renderer = renderer,
+                    OriginalMaterials = renderer.sharedMaterials ?? Array.Empty<Material>(),
+                    OriginalEnabled = renderer.enabled,
+                    OriginalShadowCastingMode = renderer.shadowCastingMode,
+                    OriginalReceiveShadows = renderer.receiveShadows,
+                    RuntimeMaterials = CloneMaterials(renderer.sharedMaterials)
+                };
+                renderer.sharedMaterials = state.RuntimeMaterials;
+                foreach (var material in state.RuntimeMaterials)
+                {
+                    if (material == null) continue;
+                    var color = material.HasProperty("_BaseColor") ? material.GetColor("_BaseColor")
+                        : material.HasProperty("_Color") ? material.GetColor("_Color") : Color.white;
+                    color = Color.Lerp(color, new Color(1f, .56f, .05f, 1f), .72f);
+                    if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", color);
+                    if (material.HasProperty("_Color")) material.SetColor("_Color", color);
+                    if (material.HasProperty("_EmissionColor")) material.SetColor("_EmissionColor", new Color(1f, .22f, .02f, 1f) * 1.8f);
+                    material.EnableKeyword("_EMISSION");
+                }
+                runtime.HighlightRenderers.Add(state);
+            }
+        }
+
+        private static void ClearInspectionHighlight(DeviceInspectionRuntime runtime)
+        {
+            foreach (var state in runtime?.HighlightRenderers ?? Enumerable.Empty<InspectionRendererState>())
+            {
+                if (state?.Renderer == null) continue;
+                state.Renderer.sharedMaterials = state.OriginalMaterials;
+                DestroyMaterials(state.RuntimeMaterials);
+            }
+            runtime?.HighlightRenderers.Clear();
+        }
+
+        private void SelectInspectionTarget(Ray ray)
+        {
+            var device = _selected;
+            var runtime = device?.Inspection;
+            if (device == null || runtime == null) return;
+            if (runtime.Stage == InspectionStage.Solid || runtime.Stage == InspectionStage.Xray)
+            {
+                if (device.WorldBounds.IntersectRay(ray, out _))
+                {
+                    SetInspectionStage(device, runtime.Stage == InspectionStage.Solid ? InspectionStage.Xray : InspectionStage.Exploded);
+                }
+                return;
+            }
+
+            InspectionPartState closest = null;
+            var distance = float.PositiveInfinity;
+            foreach (var part in runtime.Parts)
+            {
+                foreach (var renderer in part.Renderers ?? Array.Empty<Renderer>())
+                {
+                    if (renderer == null || !renderer.enabled || !renderer.bounds.IntersectRay(ray, out var hitDistance) || hitDistance >= distance) continue;
+                    closest = part;
+                    distance = hitDistance;
+                }
+            }
+            if (closest != null) SetInspectionStage(device, InspectionStage.PartDetail, false, closest.Config.Id);
+        }
+
+        private string InspectionViewId(DeviceInspectionRuntime runtime, InspectionStage stage, InspectionPartState part)
+        {
+            if (stage == InspectionStage.PartDetail && !string.IsNullOrWhiteSpace(part?.Config?.DetailViewId)) return part.Config.DetailViewId;
+            var configured = stage == InspectionStage.Xray ? runtime.Config.Xray
+                : stage == InspectionStage.Exploded ? runtime.Config.Exploded : runtime.Config.Solid;
+            if (!string.IsNullOrWhiteSpace(configured?.ViewId)) return configured.ViewId;
+            return stage == InspectionStage.Xray ? "device_xray"
+                : stage == InspectionStage.Exploded ? "device_exploded"
+                : stage == InspectionStage.PartDetail ? "device_part" : "device_detail";
+        }
+
+        private void FocusInspectionCamera(DeviceView device, InspectionStage stage, string viewId, bool immediate)
+        {
+            if (device?.Root == null || _orbit == null) return;
+            var runtime = device.Inspection;
+            var configuredView = ResolveView(viewId, "device");
+            var stageConfig = stage == InspectionStage.Xray ? runtime.Config.Xray
+                : stage == InspectionStage.Exploded ? runtime.Config.Exploded : runtime.Config.Solid;
+            var useAuthoredView = stage != InspectionStage.Solid && stageConfig != null && !string.IsNullOrWhiteSpace(stageConfig.ViewId);
+            var camera = stageConfig?.Camera ?? new DeviceInspectionCameraDto();
+            var yaw = useAuthoredView ? configuredView?.Yaw ?? camera.Yaw : camera.Yaw;
+            var pitch = useAuthoredView ? configuredView?.Pitch ?? camera.Pitch : camera.Pitch;
+            var distance = useAuthoredView ? configuredView?.DistanceScale ?? camera.DistanceScale : camera.DistanceScale;
+            var targetOffset = useAuthoredView ? configuredView?.TargetOffset ?? InspectionVector(camera.TargetOffset) : InspectionVector(camera.TargetOffset);
+            if (stage == InspectionStage.Solid && configuredView != null)
+            {
+                yaw = configuredView.RelativeToTarget
+                    ? Mathf.DeltaAngle(0f, device.Root.transform.eulerAngles.y + configuredView.Yaw)
+                    : configuredView.Yaw;
+                pitch = configuredView.Pitch;
+                distance = configuredView.DistanceScale;
+                targetOffset = configuredView.TargetOffset;
+            }
+            else yaw = Mathf.DeltaAngle(0f, device.Root.transform.eulerAngles.y + yaw);
+
+            var bounds = stage == InspectionStage.PartDetail && runtime.SelectedPart != null
+                ? CalculateBounds(runtime.SelectedPart.Target.gameObject)
+                : CalculateBounds(device.Root);
+            _activeViewId = viewId;
+            _orbit.SetTransitionDuration(useAuthoredView ? configuredView.TransitionSeconds : runtime.Config.AnimationDuration);
+            _orbit.SetTargetOffset(targetOffset);
+            _orbit.FocusBounds(bounds, yaw, pitch, distance, immediate);
+        }
+
+        private void PublishInspectionContext(DeviceView device)
+        {
+            if (device?.Inspection == null) return;
+            var runtime = device.Inspection;
+            var part = runtime.SelectedPart?.Config;
+            var payload = new JObject
+            {
+                ["viewId"] = _activeViewId ?? string.Empty,
+                ["viewMode"] = "device",
+                ["deviceId"] = device.Device?.Id ?? string.Empty,
+                ["inspectionStage"] = InspectionStageKey(runtime.Stage),
+                ["partId"] = part?.Id ?? string.Empty,
+                ["partName"] = part?.Name ?? string.Empty,
+                ["partDescription"] = part?.Description ?? string.Empty,
+                ["partPointIds"] = new JArray(part?.PointIds ?? new List<string>()),
+                ["partPointKeys"] = new JArray(part?.PointKeys ?? new List<string>()),
+                ["partDetailViewId"] = part?.DetailViewId ?? string.Empty
+            };
+            InspectionContextChanged?.Invoke(payload);
+        }
+
+        private static string InspectionStageKey(InspectionStage stage)
+        {
+            return stage == InspectionStage.Xray ? "xray"
+                : stage == InspectionStage.Exploded ? "exploded"
+                : stage == InspectionStage.PartDetail ? "part" : "solid";
+        }
+
+        private static string InspectionStageLabel(InspectionStage stage)
+        {
+            return stage == InspectionStage.Xray ? "设备透视"
+                : stage == InspectionStage.Exploded ? "设备拆解"
+                : stage == InspectionStage.PartDetail ? "部件详情" : "设备运行详情";
+        }
+
+        private static InspectionStage ParseInspectionStage(string value)
+        {
+            return string.Equals(value, "xray", StringComparison.OrdinalIgnoreCase) ? InspectionStage.Xray
+                : string.Equals(value, "exploded", StringComparison.OrdinalIgnoreCase) ? InspectionStage.Exploded
+                : string.Equals(value, "part", StringComparison.OrdinalIgnoreCase) || string.Equals(value, "partDetail", StringComparison.OrdinalIgnoreCase) ? InspectionStage.PartDetail
+                : InspectionStage.Solid;
         }
 
         private bool IsPointerOverDashboard(Vector2 pointer)

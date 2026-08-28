@@ -16,6 +16,7 @@ namespace HeatTreatment.DigitalTwin.Rendering
         public GameObject Root { get; internal set; }
         public ModelAssetDto Asset { get; internal set; }
         public IReadOnlyList<PartBindingDto> Bindings { get; internal set; }
+        public DeviceInspectionConfigDto Inspection { get; internal set; }
         public RuntimeModelOptimizationReport OptimizationReport { get; internal set; }
         public bool IsFallback { get; internal set; }
     }
@@ -31,6 +32,7 @@ namespace HeatTreatment.DigitalTwin.Rendering
             public ModelAssetDto Asset;
             public GameObject Root;
             public List<PartBindingDto> Bindings;
+            public DeviceInspectionConfigDto Inspection;
             public RuntimeModelOptimizationReport OptimizationReport;
             public GltfImport Importer;
             public bool IsFallback;
@@ -90,6 +92,7 @@ namespace HeatTreatment.DigitalTwin.Rendering
                 Root = clone,
                 Asset = template.Asset,
                 Bindings = template.Bindings,
+                Inspection = InspectionConfigResolver.Resolve(template.Asset, device),
                 OptimizationReport = template.OptimizationReport,
                 IsFallback = template.IsFallback
             };
@@ -161,10 +164,11 @@ namespace HeatTreatment.DigitalTwin.Rendering
             }
 
             var bindings = ReadBindings(asset.MetadataObject);
+            var inspection = InspectionConfigResolver.Resolve(asset, null);
             var options = ModelOptimizationOptions.FromMetadata(asset.MetadataObject);
             var report = RuntimeModelOptimizer.Optimize(
                 root,
-                bindings.Select(binding => binding.NodeName),
+                ProtectedNodeNames(bindings, inspection),
                 options
             );
             root.SetActive(false);
@@ -174,6 +178,7 @@ namespace HeatTreatment.DigitalTwin.Rendering
                 Asset = asset,
                 Root = root,
                 Bindings = bindings,
+                Inspection = inspection,
                 OptimizationReport = report,
                 Importer = importer,
                 IsFallback = false
@@ -208,6 +213,7 @@ namespace HeatTreatment.DigitalTwin.Rendering
                 Asset = effectiveAsset,
                 Root = root,
                 Bindings = ReadBindings(effectiveAsset.MetadataObject),
+                Inspection = InspectionConfigResolver.Resolve(effectiveAsset, null),
                 OptimizationReport = new RuntimeModelOptimizationReport(),
                 IsFallback = true
             };
@@ -256,6 +262,40 @@ namespace HeatTreatment.DigitalTwin.Rendering
                 Debug.LogWarning($"[RuntimeModelLibrary] Invalid part bindings: {exception.Message}");
                 return new List<PartBindingDto>();
             }
+        }
+
+        private static IEnumerable<string> ProtectedNodeNames(
+            IEnumerable<PartBindingDto> bindings,
+            DeviceInspectionConfigDto inspection)
+        {
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var binding in bindings ?? Enumerable.Empty<PartBindingDto>())
+            {
+                AddNodeName(names, binding?.NodeName);
+                AddPathLeafName(names, binding?.NodePath);
+            }
+            foreach (var name in inspection?.Shell?.NodeNames ?? new List<string>()) AddNodeName(names, name);
+            foreach (var path in inspection?.Shell?.NodePaths ?? new List<string>()) AddPathLeafName(names, path);
+            foreach (var part in inspection?.Parts ?? new List<DeviceInspectionPartDto>())
+            {
+                AddNodeName(names, part?.NodeName);
+                AddPathLeafName(names, part?.NodePath);
+            }
+            return names;
+        }
+
+        private static void AddNodeName(ISet<string> names, string value)
+        {
+            if (!string.IsNullOrWhiteSpace(value)) names.Add(value.Trim());
+        }
+
+        private static void AddPathLeafName(ISet<string> names, string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return;
+            var leaf = path.Split('/').LastOrDefault() ?? string.Empty;
+            var marker = leaf.LastIndexOf('#');
+            if (marker > 0) leaf = leaf.Substring(0, marker);
+            AddNodeName(names, leaf);
         }
 
         private static void ApplyDeviceTransform(Transform target, DeviceDto device, ModelAssetDto asset)

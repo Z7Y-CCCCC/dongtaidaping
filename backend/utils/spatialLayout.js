@@ -84,6 +84,7 @@ function defaultLineLayout() {
     return {
         version: LINE_LAYOUT_VERSION,
         coordinateSpace: 'workshop_local',
+        placementPending: false,
         transform: { x: 0, y: 0, z: 0, rotationY: 0 },
         flowDirection: 'right',
         lanes: [makeDefaultLineItem('lane', 0)],
@@ -115,6 +116,7 @@ function normalizeLineLayout(value, transformFallback = null) {
     return {
         version: LINE_LAYOUT_VERSION,
         coordinateSpace: 'workshop_local',
+        placementPending: source.placementPending === true,
         transform: normalizeSpatialTransform(source.transform, transformFallback || defaults.transform),
         flowDirection: ['right', 'left', 'none'].includes(source.flowDirection)
             ? source.flowDirection

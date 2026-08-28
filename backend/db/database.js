@@ -2004,28 +2004,6 @@ async function seedPlatformDefaults(db) {
         }
     }
 
-    const configWidgets = [
-        ['widget_device_label_config', 'device_label', '设备浮标配置', JSON.stringify({ enabled: true, showTitle: true, titleTemplate: '{name}', rows: [{ key: 'temperature', label: '温度', path: 'analog.actual_temp', fallbackPaths: ['analog.rear_temp'], unit: '°C' }, { key: 'carbon', label: '碳势', path: 'analog.actual_carbon', fallbackPaths: ['analog.carbon'], unit: '%' }], style: { minWidth: '132px', padding: '8px 10px', fontSize: '12px', background: 'rgba(18, 22, 24, .84)', borderColor: 'rgba(242, 184, 91, .35)', titleColor: '#f2b85b', textColor: '#d7dedb', valueColor: '#ffffff' } }), '{}', 0, 0, 1, 1, 98, 1],
-        ['widget_diagnostics_config', 'diagnostics', '诊断面板配置', '{}', '{}', 0, 0, 1, 1, 99, 0],
-        ['widget_line_overview_cards_config', 'line_overview_cards', '产线设备卡片配置', '{}', '{}', 0, 0, 1, 1, 100, 1]
-    ];
-    for (const [id, widget_type, title, config_json, binding_json, x, y, w, h, sort_order, visible] of configWidgets) {
-        await db.insertIgnore('widgets', {
-            id,
-            scene_id: 'scene_factory_overview',
-            widget_type,
-            title,
-            config_json,
-            binding_json,
-            x,
-            y,
-            w,
-            h,
-            sort_order,
-            visible
-        }, 'id');
-    }
-
     await mergeWidgetDefaultConfig(db, 'widget_marquee', { speed: 30, limit: 20, eventWindowHours: 24 });
 
     const platformProject = await db.get('SELECT * FROM projects WHERE id = ?', ['project_default']);

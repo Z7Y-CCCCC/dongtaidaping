@@ -6,9 +6,11 @@ import { applyVisibilityAction, widgetRuntimeVisible } from '../../../runtime/da
 import ColorField from './ColorField.vue'
 import {
   DASHBOARD_WIDGET_LIBRARY,
+  DASHBOARD_WIDGET_PRESETS,
   DASHBOARD_VIEW_MODES,
   SYSTEM_WIDGET_TYPES,
   createDashboardWidget,
+  createDashboardWidgetPreset,
   createDefaultDashboardViews,
   SYSTEM_WIDGET_LIBRARY,
   deepClone,
@@ -44,7 +46,24 @@ const databaseMetadataLoading = ref(false)
 const databasePreviewValues = reactive({})
 const databaseTablesByDataset = reactive({})
 const databaseColumnsByDataset = reactive({})
-const previewContext = reactive({ viewId: 'factory_overview', viewMode: 'factory', workshopId: '', lineId: '', deviceId: '' })
+const previewContext = reactive({
+  viewId: 'factory_overview', viewMode: 'factory', workshopId: '', lineId: '', deviceId: '',
+  inspectionStage: '', partId: 'front_door_open', partName: '前门组件', partDescription: '部件参数与运行状态预览',
+  partPointIds: [], partPointKeys: ['analog.temperature', 'doors.front_door_open']
+})
+const previewPartPoints = [
+  { id: 'preview_temperature', label: '当前温度', name: '当前温度', value: 836.4, unit: '°C', quality: 'good' },
+  { id: 'preview_speed', label: '运行转速', name: '运行转速', value: 1280, unit: 'rpm', quality: 'good' },
+  { id: 'preview_interlock', label: '联锁状态', name: '联锁状态', value: '正常', unit: '', quality: 'good' }
+]
+const previewSelectedPart = computed(() => ({
+  id: previewContext.partId,
+  name: previewContext.partName,
+  description: previewContext.partDescription,
+  points: previewPartPoints,
+  pointMap: Object.fromEntries(previewPartPoints.map(point => [point.id, point])),
+  stage: previewContext.inspectionStage
+}))
 const previewGroupVisibility = reactive({})
 const previewWidgetVisibility = reactive({})
 const pointValues = ref({})
@@ -317,6 +336,13 @@ function syncPreviewContextFromView() {
   if (view.targetType === 'device') previewContext.deviceId = view.targetId || previewContext.deviceId || ''
   if (view.targetType === 'line') previewContext.lineId = view.targetId || previewContext.lineId || ''
   if (view.targetType === 'workshop') previewContext.workshopId = view.targetId || previewContext.workshopId || ''
+  previewContext.inspectionStage = view.metadata?.inspectionStage || (view.id === 'device_detail' ? 'solid' : '')
+  if (previewContext.viewMode !== 'device') previewContext.partId = ''
+  if (previewContext.inspectionStage === 'part' && !previewContext.partId) {
+    previewContext.partId = 'front_door_open'
+    previewContext.partName = '前门组件'
+    previewContext.partDescription = '前室升降门与驱动组件；运行时会替换为 Unity 当前选中的真实部件。'
+  }
 }
 
 function selectView(viewId, { enterPreview = false } = {}) {
@@ -446,6 +472,10 @@ function previewValueForWidget(widget) {
   const binding = widget.data || {}
   if (binding.mode === 'database') return databasePreviewValues[widget.id]?.value
   if (binding.mode === 'plc') return pointValues.value[binding.pointId]?.value
+  if (binding.mode === 'runtime') {
+    const context = { context: previewContext, selectedPart: previewSelectedPart.value }
+    return String(binding.path || '').split('.').reduce((current, key) => current?.[key], context)
+  }
   return widget.content?.value
 }
 
@@ -502,6 +532,56 @@ function addWidget(type, position = {}) {
   selectedIds.value = [widget.id]
   inspectorTab.value = 'content'
   commitHistory(`添加${widgetTypeLabel(type)}`)
+}
+
+function addWidgetPreset(preset) {
+  if (!preset?.id) return
+  const groupId = preset.id === 'device_part_detail' ? 'group_device_part_detail' : `group_${preset.id}`
+  const existing = documentModel.value.widgets.filter(widget => widget.groupId === groupId)
+  const partViews = views.value.filter(view => view.id === 'device_part' || view.metadata?.inspectionStage === 'part')
+  const targetViewId = partViews[0]?.id || 'device_part'
+  if (existing.length) {
+    selectView(targetViewId)
+    selectedIds.value = existing.map(widget => widget.id)
+    setStatus('部件详情面板已经存在，已为你定位到该组件组', 'warning')
+    return
+  }
+
+  const previousOverlayIds = overlayWidgets.value.map(widget => widget.id)
+  const baseZ = Math.max(0, ...documentModel.value.widgets.map(widget => Number(widget.zIndex || 0))) + 1
+  const widgets = createDashboardWidgetPreset(preset.id, {
+    canvas: canvas.value,
+    baseZ,
+    groupId,
+    viewIds: partViews.map(view => view.id)
+  })
+  if (!widgets.length) return
+
+  documentModel.value.widgets.push(...widgets)
+  const createdIds = new Set(widgets.map(widget => widget.id))
+  const detailView = views.value.find(view => view.id === 'device_detail')
+  const inheritedState = detailView?.componentState ? deepClone(detailView.componentState) : { show: [], hide: [], hideNonTargetDevices: true }
+
+  views.value.filter(view => ['device_xray', 'device_exploded'].includes(view.id)).forEach(view => {
+    const state = view.componentState || (view.componentState = { show: [], hide: [], hideNonTargetDevices: false })
+    if (!(state.show || []).length && !(state.hide || []).length) {
+      view.componentState = { ...deepClone(inheritedState), hideNonTargetDevices: true }
+    }
+  })
+
+  partViews.forEach(view => {
+    const state = view.componentState || (view.componentState = { show: [], hide: [], hideNonTargetDevices: false })
+    const inheritedHide = state.hide?.length ? state.hide : (inheritedState.hide || [])
+    state.hide = [...new Set([...inheritedHide, ...previousOverlayIds])].filter(id => !createdIds.has(id))
+    state.show = (state.show || []).filter(id => !createdIds.has(id))
+    state.hideNonTargetDevices = true
+  })
+
+  selectView(targetViewId)
+  selectedIds.value = widgets.map(widget => widget.id)
+  inspectorTab.value = 'content'
+  commitHistory(`加入${preset.label}`)
+  setStatus('已生成部件详情面板：名称、说明和实时参数会随 Unity 选中部件自动切换', 'success')
 }
 
 function handleLibraryDragStart(event, type) {
@@ -924,6 +1004,9 @@ function changeBindingMode() {
     widget.data.deviceId = ''
     widget.visibility.matchBoundDevice = false
   }
+  if (widget.data.mode !== 'runtime') {
+    widget.data.path = widget.data.mode === 'static' ? '' : widget.data.path
+  }
   if (widget.data.mode !== 'plc') {
     widget.data.pointId = ''
   }
@@ -941,6 +1024,7 @@ function changeBindingMode() {
     }
     datasets.forEach((dataset, index) => loadDatasetTables(dataset, index))
   }
+  if (widget.data.mode === 'runtime' && !widget.data.path) widget.data.path = 'selectedPart.description'
   commitHistory('修改数据源')
 }
 
@@ -1243,7 +1327,15 @@ onBeforeUnmount(() => {
           </button>
           <div class="view-list-actions"><button type="button" @click="addView">＋ 新视角</button><button type="button" :disabled="!currentView" @click="duplicateView">复制</button></div>
         </div>
-        <div class="designer-panel-heading"><strong>组件库</strong><small>拖入画布或单击添加</small></div>
+        <div class="designer-panel-heading"><strong>场景组件组</strong><small>一次加入完整交互区域</small></div>
+        <div class="scene-preset-list">
+          <button v-for="preset in DASHBOARD_WIDGET_PRESETS" :key="preset.id" type="button" @click="addWidgetPreset(preset)">
+            <span>{{ preset.icon }}</span>
+            <div><strong>{{ preset.label }}</strong><small>{{ preset.description }}</small></div>
+            <em>{{ documentModel.widgets.some(widget => widget.groupId === `group_${preset.id}` || (preset.id === 'device_part_detail' && widget.groupId === 'group_device_part_detail')) ? '已加入' : '一键加入' }}</em>
+          </button>
+        </div>
+        <div class="designer-panel-heading"><strong>单个组件</strong><small>拖入画布或单击添加</small></div>
         <div class="component-library">
           <section v-for="group in libraryGroups" :key="group.name">
             <h4>{{ group.name }}</h4>
@@ -1282,10 +1374,10 @@ onBeforeUnmount(() => {
           <p v-if="!overlayWidgets.length">从上方组件库添加第一个组件</p>
         </div>
         <details v-if="systemWidgetCards.length" class="system-widget-list" open>
-          <summary>Unity 原生组件（{{ systemWidgetCards.length }}）</summary>
+          <summary>系统导航（{{ systemWidgetCards.length }}）</summary>
           <div v-for="card in systemWidgetCards" :key="card.widget.id" class="system-widget-card">
             <div class="system-widget-preview" :class="`preview-${card.definition.preview}`"><span>{{ card.definition.icon }}</span><i></i><b></b></div>
-            <div><strong>{{ card.label }}</strong><small>{{ card.definition.description }}</small><em>{{ card.widget.runtimeTarget === 'both' ? 'Unity + Web' : 'Unity 运行时' }}</em></div>
+            <div><strong>{{ card.label }}</strong><small>{{ card.definition.description }}</small><em>大屏运行时</em></div>
           </div>
         </details>
       </aside>
@@ -1321,6 +1413,8 @@ onBeforeUnmount(() => {
                   :device-status-map="mockDeviceStatus"
                   :point-values="pointValues"
                   :database-values="databasePreviewValues"
+                  :runtime-context="previewContext"
+                  :selected-part="previewSelectedPart"
                   preview
                   @action="handlePreviewWidgetAction"
                 />
@@ -1426,7 +1520,7 @@ onBeforeUnmount(() => {
 
             <section v-else-if="inspectorTab === 'data'" class="inspector-section">
               <div class="readonly-banner"><span>只读</span>所有外部数据源和 PLC 点位只用于展示，发布校验会拦截任何写入配置。</div>
-              <label>数据来源<select v-model="selectedWidget.data.mode" @change="changeBindingMode"><option value="static">静态 / 组件默认数据</option><option value="plc">PLC 只读点位</option><option value="database">数据库连接</option></select></label>
+              <label>数据来源<select v-model="selectedWidget.data.mode" @change="changeBindingMode"><option value="static">静态 / 组件默认数据</option><option value="plc">PLC 只读点位</option><option value="database">数据库连接</option><option value="runtime">设备检查上下文</option></select></label>
               <template v-if="selectedWidget.data.mode === 'plc'">
                 <label>设备<select v-model="selectedWidget.data.deviceId" @change="selectedWidget.data.pointId=''; recordProperty('选择设备')"><option value="">请选择设备</option><option v-for="device in devices" :key="device.id" :value="String(device.id)">{{ device.name }}（{{ device.id }}）</option></select></label>
                 <label>READ 点位<select v-model="selectedWidget.data.pointId" :disabled="!selectedWidget.data.deviceId" @change="bindSelectedPoint"><option value="">请选择只读点位</option><option v-for="point in selectedDevicePoints" :key="point.id" :value="String(point.id)">{{ point.label || point.name }} · {{ point.plc_tag || `DB${point.db_number}.${point.db_byte_offset}` }}</option></select></label>
@@ -1445,7 +1539,7 @@ onBeforeUnmount(() => {
                     <label>读取方式<select v-model="dataset.valueMode" @change="recordProperty('修改读取方式'); previewDatabaseBinding()"><option value="latest">最新一条</option><option value="first">第一条</option><option value="list">序列（图表 / 列表）</option><option value="count">记录数量</option><option value="sum">合计</option><option value="avg">平均值</option><option value="min">最小值</option><option value="max">最大值</option></select></label>
                     <template v-if="['latest','first','list'].includes(dataset.valueMode)"><label>时间 / 排序字段<select v-model="dataset.orderBy" @change="dataset.timeField=dataset.orderBy; recordProperty('修改排序')"><option value="">不指定</option><option v-for="column in datasetColumns(datasetIndex)" :key="`order-${column.name}`" :value="column.name">{{ column.name }}</option></select></label><label>排序方向<select v-model="dataset.orderDirection" @change="recordProperty('修改排序')"><option value="desc">新到旧</option><option value="asc">旧到新</option></select></label></template>
                     <div class="property-grid two"><label v-if="dataset.valueMode === 'list'">读取行数<input v-model.number="dataset.rowLimit" type="number" min="1" max="500" @change="recordProperty('修改读取行数')" /></label><label>刷新周期（秒）<input :value="Math.round(dataset.refreshMs/1000)" type="number" min="1" max="3600" @change="dataset.refreshMs=Math.max(1000,Number($event.target.value||5)*1000);recordProperty('修改刷新周期')" /></label></div>
-                    <div class="dataset-context"><label>按当前对象过滤<select v-model="dataset.contextKey" @change="recordProperty('修改上下文过滤')"><option value="">不过滤</option><option value="deviceId">当前设备 ID</option><option value="lineId">当前产线 ID</option><option value="workshopId">当前车间 ID</option><option value="viewId">当前视角 ID</option></select></label><label v-if="dataset.contextKey">表中对应字段<select v-model="dataset.contextField" @change="recordProperty('修改上下文字段')"><option value="">请选择</option><option v-for="column in datasetColumns(datasetIndex)" :key="`context-${column.name}`" :value="column.name">{{ column.name }}</option></select></label></div>
+                    <div class="dataset-context"><label>按当前对象过滤<select v-model="dataset.contextKey" @change="recordProperty('修改上下文过滤')"><option value="">不过滤</option><option value="deviceId">当前设备 ID</option><option value="partId">当前部件 ID</option><option value="lineId">当前产线 ID</option><option value="workshopId">当前车间 ID</option><option value="viewId">当前视角 ID</option></select></label><label v-if="dataset.contextKey">表中对应字段<select v-model="dataset.contextField" @change="recordProperty('修改上下文字段')"><option value="">请选择</option><option v-for="column in datasetColumns(datasetIndex)" :key="`context-${column.name}`" :value="column.name">{{ column.name }}</option></select></label></div>
                     <button v-if="ensureDatabaseDatasets(selectedWidget).length > 1" type="button" class="danger-link" @click="removeDatabaseDataset(datasetIndex)">删除这个数据项</button>
                   </div>
                 </details>
@@ -1454,6 +1548,10 @@ onBeforeUnmount(() => {
                 <label>设备详情适用范围<select v-model="selectedWidget.data.deviceId" @change="bindDatabaseToDevice"><option value="">所有设备通用</option><option v-for="device in devices" :key="`db-${device.id}`" :value="String(device.id)">仅 {{ device.name }}（{{ device.id }}）</option></select><small class="field-hint">不同设备参数来自不同表时，复制组件后分别选择设备和表即可。</small></label>
                 <button type="button" class="inspector-preview-button" :disabled="databaseMetadataLoading" @click="previewDatabaseBinding()">刷新数据预览</button>
                 <div v-if="databasePreviewValues[selectedWidget.id]" class="binding-summary"><span>预览值</span><strong>{{ databasePreviewValues[selectedWidget.id]?.value ?? '--' }} {{ selectedWidget.data.unit }}</strong><span>数据项</span><code>{{ databasePreviewValues[selectedWidget.id]?.series?.map(item => `${item.label}: ${item.value ?? '--'}`).join(' · ') || '--' }}</code><span>状态</span><strong>{{ databasePreviewValues[selectedWidget.id]?.error || '读取正常' }}</strong></div>
+              </template>
+              <template v-else-if="selectedWidget.data.mode === 'runtime'">
+                <label>上下文路径<input v-model="selectedWidget.data.path" class="input" placeholder="selectedPart.description / selectedPart.name / context.inspectionStage" @change="recordProperty('修改检查上下文路径')" /></label>
+                <p class="field-hint">可用字段：selectedPart.name、selectedPart.description、selectedPart.stage、selectedPart.points.0.value，以及 context.deviceId / context.inspectionStage。</p>
               </template>
               <div class="property-grid two">
                 <label>单位<input v-model="selectedWidget.data.unit" @change="recordProperty('修改单位')" /></label>
@@ -1473,7 +1571,7 @@ onBeforeUnmount(() => {
               <div class="section-action-heading"><div><strong>显隐规则</strong><small>可按当前对象或数据值决定组件出现 / 消失</small></div><button @click="addVisibilityRule">＋ 添加</button></div>
               <label v-if="selectedWidget.visibility.rules.length">多条规则<select v-model="selectedWidget.visibility.ruleMode" @change="recordProperty('修改显隐规则')"><option value="all">全部满足</option><option value="any">任意满足</option></select></label>
               <div v-for="(rule, index) in selectedWidget.visibility.rules" :key="`visible-${index}`" class="condition-card">
-                <div class="property-grid two"><label>来源<select v-model="rule.source" @change="rule.path = rule.source === 'data' ? 'value' : 'viewMode'; recordProperty()"><option value="context">Unity 上下文</option><option value="data">组件数据值</option></select></label><label>字段<select v-if="rule.source === 'context'" v-model="rule.path" @change="recordProperty()"><option value="viewMode">当前视角</option><option value="viewId">当前视角 ID</option><option value="workshopId">车间 ID</option><option value="lineId">产线 ID</option><option value="deviceId">设备 ID</option></select><input v-else v-model="rule.path" placeholder="value" @change="recordProperty()" /></label></div>
+                <div class="property-grid two"><label>来源<select v-model="rule.source" @change="rule.path = rule.source === 'data' ? 'value' : 'viewMode'; recordProperty()"><option value="context">Unity 上下文</option><option value="data">组件数据值</option></select></label><label>字段<select v-if="rule.source === 'context'" v-model="rule.path" @change="recordProperty()"><option value="viewMode">当前视角</option><option value="viewId">当前视角 ID</option><option value="workshopId">车间 ID</option><option value="lineId">产线 ID</option><option value="deviceId">设备 ID</option><option value="inspectionStage">检查阶段</option><option value="partId">部件 ID</option><option value="partName">部件名称</option></select><input v-else v-model="rule.path" placeholder="value" @change="recordProperty()" /></label></div>
                 <div class="property-grid two"><label>判断<select v-model="rule.operator" @change="recordProperty()"><option value="==">等于</option><option value="!=">不等于</option><option value=">">大于</option><option value=">=">大于等于</option><option value="<">小于</option><option value="<=">小于等于</option><option value="truthy">为真</option><option value="falsy">为假</option><option value="contains">包含</option></select></label><label>目标值<input v-model="rule.value" @change="recordProperty()" /></label></div>
                 <button class="danger-link" @click="removeVisibilityRule(index)">删除显隐规则</button>
               </div>
@@ -1532,10 +1630,11 @@ onBeforeUnmount(() => {
           <div class="inspector-body">
             <section v-if="viewInspectorTab === 'camera'" class="inspector-section">
               <label>视角名称<input v-model="currentView.name" @change="commitHistory('修改视角名称')" /></label>
-              <div class="property-grid two"><label>类型<select v-model="currentView.mode" @change="commitHistory('修改视角类型'); syncPreviewContextFromView()"><option v-for="mode in DASHBOARD_VIEW_MODES" :key="mode.id" :value="mode.id">{{ mode.label }}</option></select></label><label>目标类型<select v-model="currentView.targetType" @change="updateViewTarget(currentView)"><option value="factory">全厂</option><option value="workshop">车间</option><option value="line">产线</option><option value="device">设备</option></select></label></div>
+              <div class="property-grid two"><label>类型<select v-model="currentView.mode" @change="commitHistory('修改视角类型'); syncPreviewContextFromView()"><option v-for="mode in DASHBOARD_VIEW_MODES" :key="mode.id" :value="mode.id">{{ mode.label }}</option></select></label><label>目标类型<select v-model="currentView.targetType" @change="updateViewTarget(currentView)"><option value="factory">全厂</option><option value="workshop">车间</option><option value="line">产线</option><option value="device">设备</option><option value="device_part">指定部件</option></select></label></div>
               <label v-if="currentView.targetType === 'workshop'">目标车间<select v-model="currentView.targetId" @change="updateViewTarget(currentView)"><option value="">自动按当前上下文</option><option v-for="workshop in workshops" :key="workshop.id" :value="String(workshop.id)">{{ workshop.name || workshop.id }}</option></select></label>
               <label v-if="currentView.targetType === 'line'">目标产线<select v-model="currentView.targetId" @change="updateViewTarget(currentView)"><option value="">自动按当前上下文</option><option v-for="line in lines" :key="line.id" :value="String(line.id)">{{ line.name || line.id }}</option></select></label>
               <label v-if="currentView.targetType === 'device'">目标设备<select v-model="currentView.targetId" @change="updateViewTarget(currentView)"><option value="">自动按当前上下文</option><option v-for="device in devices" :key="device.id" :value="String(device.id)">{{ device.name || device.id }}</option></select></label>
+              <label v-if="currentView.targetType === 'device_part'">部件 ID<input v-model="currentView.targetId" placeholder="如 front_door_open" @change="commitHistory('修改目标部件')" /></label>
               <div class="property-grid two"><label>水平角（°）<input v-model.number="currentView.camera.yaw" type="number" min="-360" max="360" step="1" @change="commitHistory('修改视角水平角')" /></label><label>俯仰角（°）<input v-model.number="currentView.camera.pitch" type="number" min="-89" max="89" step="1" @change="commitHistory('修改视角俯仰角')" /></label><label>距离比例<input v-model.number="currentView.camera.distanceScale" type="number" min=".1" max="10" step=".01" @change="commitHistory('修改视角距离')" /></label><label>过渡时间（秒）<input v-model.number="currentView.camera.transitionSeconds" type="number" min="0" max="10" step=".1" @change="commitHistory('修改视角过渡')" /></label></div>
               <div class="property-grid two"><label>目标偏移 X<input v-model.number="currentView.camera.targetOffset[0]" type="number" step=".1" @change="commitHistory('修改视角目标')" /></label><label>目标偏移 Y<input v-model.number="currentView.camera.targetOffset[1]" type="number" step=".1" @change="commitHistory('修改视角目标')" /></label><label>目标偏移 Z<input v-model.number="currentView.camera.targetOffset[2]" type="number" step=".1" @change="commitHistory('修改视角目标')" /></label></div>
               <label class="visibility-bound-device"><input v-model="currentView.camera.relativeToTarget" type="checkbox" @change="commitHistory('修改相机朝向参考')" /> 设备视角跟随设备朝向（适合不同设备旋转角度）</label>
@@ -1544,7 +1643,7 @@ onBeforeUnmount(() => {
             <section v-else-if="viewInspectorTab === 'components'" class="inspector-section">
               <div class="readonly-banner"><span>所见即所得</span>当前画布显示的是这个视角会出现的组件；点击复选框即可配置进入/离开视角时的显隐。</div>
               <label class="visibility-bound-device"><input v-model="currentView.componentState.hideNonTargetDevices" type="checkbox" @change="commitHistory('修改目标设备显隐')" /> 只显示目标范围内的设备</label>
-              <div class="view-component-list"><label v-for="item in viewComponents" :key="item.id"><input type="checkbox" :checked="!currentView.componentState.hide?.includes(item.id)" @change="toggleViewComponent(currentView, item.id, $event.target.checked)" /><span>{{ item.label }}</span><small>{{ SYSTEM_WIDGET_TYPES.has(item.type) ? 'Unity 原生' : widgetTypeLabel(item.type) }}</small></label></div>
+              <div class="view-component-list"><label v-for="item in viewComponents" :key="item.id"><input type="checkbox" :checked="!currentView.componentState.hide?.includes(item.id)" @change="toggleViewComponent(currentView, item.id, $event.target.checked)" /><span>{{ item.label }}</span><small>{{ item.type === 'navigation' ? '系统导航' : widgetTypeLabel(item.type) }}</small></label></div>
             </section>
             <section v-else class="inspector-section">
               <label>返回上一级视角<select v-model="currentView.returnViewId" @change="commitHistory('修改返回视角')"><option value="">不返回</option><option v-for="view in views.filter(item => item.id !== currentView.id)" :key="view.id" :value="view.id">{{ view.name }}</option></select></label>
@@ -1601,6 +1700,7 @@ onBeforeUnmount(() => {
 .designer-main { flex:1; min-width:1180px; min-height:0; display:grid; grid-template-columns:236px minmax(680px,1fr) 310px; overflow:hidden; }
 .designer-left-panel,.designer-right-panel { min-height:0; overflow:auto; background:linear-gradient(180deg,#0d1927,#0a1420); scrollbar-color:#29445e transparent; }.designer-left-panel{border-right:1px solid var(--line)}.designer-right-panel{border-left:1px solid var(--line)}
 .designer-panel-heading,.selected-widget-heading { display:flex; align-items:center; justify-content:space-between; gap:10px; min-height:54px; padding:10px 14px; border-bottom:1px solid var(--line); }.designer-panel-heading strong{font-size:13px}.designer-panel-heading small{color:var(--muted);font-size:10px}
+.scene-preset-list{padding:9px 10px;border-bottom:1px solid var(--line)}.scene-preset-list>button{display:grid;grid-template-columns:34px minmax(0,1fr) auto;gap:9px;align-items:center;width:100%;padding:10px;border:1px solid rgba(89,178,238,.24);border-radius:10px;color:#e8f5ff;background:linear-gradient(145deg,rgba(27,70,102,.66),rgba(13,32,49,.72));text-align:left;cursor:pointer;transition:.15s}.scene-preset-list>button:hover{border-color:rgba(91,196,255,.52);transform:translateY(-1px);box-shadow:0 8px 24px rgba(0,10,20,.18)}.scene-preset-list>button>span{display:grid;place-items:center;width:34px;height:34px;border-radius:9px;color:#bceaff;background:rgba(80,179,239,.18);font-size:17px}.scene-preset-list strong,.scene-preset-list small{display:block}.scene-preset-list strong{font-size:11px}.scene-preset-list small{display:-webkit-box;margin-top:3px;overflow:hidden;color:#7f9bb1;font-size:8px;line-height:1.35;-webkit-box-orient:vertical;-webkit-line-clamp:2}.scene-preset-list em{padding:3px 6px;border-radius:99px;color:#8ed8ff;background:rgba(73,167,224,.14);font-size:8px;font-style:normal;white-space:nowrap}
 .component-library{padding:10px}.component-library section+section{margin-top:13px}.component-library h4{margin:0 0 7px;color:#718aa1;font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}.component-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}.component-grid button{display:grid;grid-template-columns:28px 1fr;grid-template-rows:auto auto;gap:1px 7px;align-items:center;min-height:56px;padding:8px;border:1px solid rgba(112,168,213,.15);border-radius:9px;text-align:left;color:#dbeaf6;background:rgba(20,38,56,.58);cursor:grab;transition:.15s}.component-grid button:hover{border-color:rgba(75,183,255,.48);transform:translateY(-1px);background:rgba(34,79,112,.46)}.component-grid button>span{grid-row:1/3;display:grid;place-items:center;width:28px;height:28px;border-radius:7px;color:#75cdfc;background:rgba(54,155,220,.14);font-weight:800}.component-grid strong{font-size:11px}.component-grid small{overflow:hidden;color:#6f879d;font-size:8px;white-space:nowrap;text-overflow:ellipsis}
 .layer-heading{display:flex;justify-content:space-between;padding:10px 13px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);color:#a9c0d4;font-size:11px;cursor:pointer}.layer-heading span{color:#668198}.layer-list{padding:7px}.layer-list>button{display:grid;grid-template-columns:24px minmax(0,1fr) 20px 20px;align-items:center;width:100%;min-height:34px;padding:3px 6px;border:1px solid transparent;border-radius:7px;color:#b9cada;background:transparent;text-align:left;cursor:pointer}.layer-list>button:hover{background:rgba(50,88,119,.22)}.layer-list>button.active{border-color:rgba(66,165,245,.36);background:rgba(47,128,188,.24);color:#fff}.layer-list>button.hidden{opacity:.52}.layer-type{display:grid;place-items:center;width:20px;height:20px;border-radius:5px;color:#75cdfc;background:#142a3d;font-size:10px;font-weight:800}.layer-name{overflow:hidden;font-size:10px;white-space:nowrap;text-overflow:ellipsis}.layer-list i{font-style:normal;color:#7891a7;text-align:center}.layer-list p{padding:8px;color:#60788e;font-size:10px;text-align:center}.system-widget-list{margin:7px;border:1px solid var(--line);border-radius:8px;color:#8da5b9;font-size:10px}.system-widget-list summary{padding:8px;cursor:pointer}.system-widget-list>.system-widget-card{border-top:1px solid var(--line)}.system-widget-list small{color:#5e758a}
 .designer-canvas{position:relative;min-width:0;min-height:0;overflow:hidden;background:#050b12}.designer-canvas-scroll{position:absolute;inset:0;overflow:auto;padding:42px;scrollbar-color:#28445f #08111b;scrollbar-width:thin}.designer-canvas-spacer{position:relative;margin:auto}.designer-canvas-stage{position:absolute;left:0;top:0;overflow:hidden;transform-origin:0 0;box-shadow:0 0 0 1px rgba(110,185,235,.24),0 24px 90px rgba(0,0,0,.52);background-size:40px 40px!important}.designer-canvas-stage::before{content:"";position:absolute;inset:0;pointer-events:none;background-image:linear-gradient(rgba(118,174,216,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(118,174,216,.04) 1px,transparent 1px);background-size:var(--grid,10px) var(--grid,10px)}.canvas-safe-area{position:absolute;border:1px dashed rgba(83,194,255,.18);pointer-events:none}.alignment-guide{position:absolute;z-index:9998;background:#ff4dca;box-shadow:0 0 8px rgba(255,77,202,.65);pointer-events:none}.alignment-guide.vertical{top:0;bottom:0;width:1px}.alignment-guide.horizontal{left:0;right:0;height:1px}
@@ -1621,6 +1721,7 @@ onBeforeUnmount(() => {
 .designer-toolbar button:hover:not(:disabled),.designer-toolbar button.active{color:#000;border-color:#8e8e93;background:#f2f2f4}.designer-toolbar .save-button{border-color:#b7d8c4;color:#176b3a;background:#f5fbf7}.designer-toolbar .publish-button{border-color:#1d1d1f;color:#fff;background:#1d1d1f}.toolbar-divider{background:#dedee3}
 .designer-left-panel,.designer-right-panel{background:#fff;scrollbar-color:#c5c5ca transparent}.designer-left-panel{border-right-color:#dedee3}.designer-right-panel{border-left-color:#dedee3}
 .designer-panel-heading,.layer-heading,.selected-widget-heading,.inspector-tabs{border-color:#e5e5e7;background:#fff}.designer-panel-heading strong,.layer-heading strong,.selected-widget-heading strong{color:#1d1d1f}.designer-panel-heading strong{font-size:14px}.designer-panel-heading small,.layer-heading span,.selected-widget-heading span,.selected-widget-heading small{color:#8e8e93;font-size:11px}
+.scene-preset-list{border-bottom-color:#e5e5e7;background:#fff}.scene-preset-list>button{border-color:#d8d8dd;color:#1d1d1f;background:linear-gradient(145deg,#f7f9fb,#eef3f7)}.scene-preset-list>button:hover{border-color:#8e8e93;box-shadow:0 8px 22px rgba(0,0,0,.08)}.scene-preset-list>button>span{color:#fff;background:#1d1d1f}.scene-preset-list small{color:#8e8e93;font-size:9px}.scene-preset-list em{color:#176b3a;background:#e7f4ec;font-size:9px}
 .component-library section h4{color:#8e8e93;font-size:11px}.component-grid button{min-height:62px;border-color:#e2e2e5;color:#1d1d1f;background:#f8f8fa}.component-grid button:hover{border-color:#8e8e93;background:#fff;box-shadow:0 7px 20px rgba(0,0,0,.07)}.component-grid button>span{color:#fff;background:#1d1d1f}.component-grid strong{font-size:12px}.component-grid button small{color:#8e8e93;font-size:10px}
 .layer-heading{font-size:12px}.layer-list>button{min-height:38px}.layer-list button{color:#515154;background:transparent}.layer-list button:hover{background:#f5f5f7}.layer-list button.active{color:#1d1d1f;background:#ededf0;border-color:#d7d7dc}.layer-type{color:#fff;background:#3a3a3c;font-size:11px}.layer-name{font-size:12px}.layer-list i{color:#6e6e73}.system-widget-list{border-color:#e5e5e7;color:#515154;background:#f8f8fa;font-size:11px}.system-widget-list summary{color:#515154}.system-widget-list small{color:#8e8e93;font-size:10px}
 .designer-canvas{background:#e9e9ec}.designer-canvas-scroll{box-sizing:border-box;width:100%;height:100%;overflow:auto;padding:12px 16px;overscroll-behavior:contain;scrollbar-color:#a9a9af #e1e1e4}.designer-canvas-spacer{position:relative;flex:0 0 auto;margin:0 auto;box-shadow:0 18px 46px rgba(0,0,0,.18)}.designer-canvas-stage{transform-origin:top left;border:1px solid rgba(0,0,0,.36)}

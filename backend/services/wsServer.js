@@ -13,6 +13,16 @@
 
 const { WebSocketServer } = require('ws');
 
+function shortText(value, maxLength = 160) {
+    return String(value || '').trim().slice(0, maxLength);
+}
+
+function shortTextArray(value, maxItems = 64, maxLength = 128) {
+    return Array.isArray(value)
+        ? value.slice(0, maxItems).map(item => shortText(item, maxLength)).filter(Boolean)
+        : [];
+}
+
 class WsServer {
     constructor() {
         this.wss = null;
@@ -63,17 +73,26 @@ class WsServer {
                         const source = data.payload && typeof data.payload === 'object' ? data.payload : {};
                         const mode = ['factory', 'workshop', 'line', 'device', 'custom'].includes(source.viewMode) ? source.viewMode : 'factory';
                         this.dashboardContext = {
-                            viewId: String(source.viewId || '').slice(0, 128),
+                            viewId: shortText(source.viewId, 128),
                             // 新版 Unity 在模型/数据准备完成前明确发送 false；旧版客户端
                             // 没有该字段时按已就绪兼容，避免透明层永久隐藏。
                             sceneReady: Object.prototype.hasOwnProperty.call(source, 'sceneReady')
                                 ? source.sceneReady !== false
                                 : true,
                             viewMode: mode,
-                            sceneId: String(source.sceneId || '').slice(0, 128),
-                            workshopId: String(source.workshopId || '').slice(0, 128),
-                            lineId: String(source.lineId || '').slice(0, 128),
-                            deviceId: String(source.deviceId || '').slice(0, 128),
+                            sceneId: shortText(source.sceneId, 128),
+                            workshopId: shortText(source.workshopId, 128),
+                            lineId: shortText(source.lineId, 128),
+                            deviceId: shortText(source.deviceId, 128),
+                            inspectionStage: ['solid', 'xray', 'exploded', 'part'].includes(shortText(source.inspectionStage, 32))
+                                ? shortText(source.inspectionStage, 32)
+                                : '',
+                            partId: shortText(source.partId, 128),
+                            partName: shortText(source.partName, 180),
+                            partDescription: shortText(source.partDescription, 2000),
+                            partPointIds: shortTextArray(source.partPointIds),
+                            partPointKeys: shortTextArray(source.partPointKeys),
+                            partDetailViewId: shortText(source.partDetailViewId, 128),
                             timestamp: Date.now()
                         };
                         this.broadcastToRole('dashboard_context_changed', this.dashboardContext, 'web');

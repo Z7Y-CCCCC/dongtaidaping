@@ -22,6 +22,7 @@ export function defaultLineLayout() {
     return {
         version: 2,
         coordinateSpace: 'workshop_local',
+        placementPending: false,
         transform: { x: 0, y: 0, z: 0, rotationY: 0 },
         flowDirection: 'right',
         lanes: [{ ...makeLineLayoutItem('lane', 0), id: 'lane_1' }],
@@ -52,6 +53,7 @@ export function normalizeLineLayout(value) {
     return {
         version: 2,
         coordinateSpace: 'workshop_local',
+        placementPending: source.placementPending === true,
         transform: normalizeSpatialTransform(source.transform),
         flowDirection,
         lanes,

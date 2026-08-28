@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using System.Linq;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -130,6 +132,205 @@ namespace HeatTreatment.DigitalTwin.Backend
                 }
                 return new JObject();
             }
+        }
+    }
+
+    /// <summary>
+    /// Configuration shared by the admin model library, the Unity native
+    /// presenter and the transparent dashboard overlay.  The JSON is kept
+    /// intentionally small so a model can carry a sensible default while a
+    /// device instance may override only the fields it needs.
+    /// </summary>
+    public sealed class DeviceInspectionCameraDto
+    {
+        [JsonProperty("yaw")] public float Yaw { get; set; } = 238f;
+        [JsonProperty("pitch")] public float Pitch { get; set; } = 19f;
+        [JsonProperty("distance_scale")] public float DistanceScale { get; set; } = 1.12f;
+        [JsonProperty("target_offset")] public List<float> TargetOffset { get; set; } = new List<float> { 0f, 0f, 0f };
+
+        public void Normalize(float fallbackYaw, float fallbackPitch, float fallbackDistance)
+        {
+            if (!float.IsFinite(Yaw)) Yaw = fallbackYaw;
+            if (!float.IsFinite(Pitch)) Pitch = fallbackPitch;
+            if (!float.IsFinite(DistanceScale) || DistanceScale <= 0f) DistanceScale = fallbackDistance;
+            Yaw = Math.Max(-360f, Math.Min(360f, Yaw));
+            Pitch = Math.Max(6f, Math.Min(82f, Pitch));
+            DistanceScale = Math.Max(.1f, Math.Min(10f, DistanceScale));
+            TargetOffset = NormalizeVector(TargetOffset);
+        }
+
+        public static List<float> NormalizeVector(IEnumerable<float> values)
+        {
+            var result = (values ?? Enumerable.Empty<float>()).Take(3).ToList();
+            while (result.Count < 3) result.Add(0f);
+            return result.Select(value => float.IsFinite(value) ? Math.Max(-10000f, Math.Min(10000f, value)) : 0f).ToList();
+        }
+    }
+
+    public sealed class DeviceInspectionStageDto
+    {
+        [JsonProperty("view_id")] public string ViewId { get; set; } = string.Empty;
+        [JsonProperty("camera")] public DeviceInspectionCameraDto Camera { get; set; } = new DeviceInspectionCameraDto();
+        [JsonProperty("transition_seconds")] public float TransitionSeconds { get; set; } = .65f;
+
+        public void Normalize(float fallbackYaw, float fallbackPitch, float fallbackDistance)
+        {
+            Camera ??= new DeviceInspectionCameraDto();
+            Camera.Normalize(fallbackYaw, fallbackPitch, fallbackDistance);
+            if (!float.IsFinite(TransitionSeconds)) TransitionSeconds = .65f;
+            TransitionSeconds = Math.Max(0f, Math.Min(10f, TransitionSeconds));
+            ViewId ??= string.Empty;
+        }
+    }
+
+    public sealed class DeviceInspectionShellDto
+    {
+        [JsonProperty("node_paths")] public List<string> NodePaths { get; set; } = new List<string>();
+        [JsonProperty("node_names")] public List<string> NodeNames { get; set; } = new List<string>();
+        [JsonProperty("opacity")] public float Opacity { get; set; } = .18f;
+        [JsonProperty("wireframe")] public bool Wireframe { get; set; }
+
+        public void Normalize()
+        {
+            NodePaths = NormalizeStrings(NodePaths);
+            NodeNames = NormalizeStrings(NodeNames);
+            Opacity = Math.Max(.03f, Math.Min(.95f, float.IsFinite(Opacity) ? Opacity : .18f));
+        }
+
+        private static List<string> NormalizeStrings(IEnumerable<string> values)
+        {
+            return (values ?? Enumerable.Empty<string>())
+                .Select(value => (value ?? string.Empty).Trim())
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(100)
+                .ToList();
+        }
+    }
+
+    public sealed class DeviceInspectionPartDto
+    {
+        [JsonProperty("id")] public string Id { get; set; } = string.Empty;
+        [JsonProperty("name")] public string Name { get; set; } = string.Empty;
+        [JsonProperty("node_path")] public string NodePath { get; set; } = string.Empty;
+        [JsonProperty("node_name")] public string NodeName { get; set; } = string.Empty;
+        [JsonProperty("explode_offset")] public List<float> ExplodeOffset { get; set; } = new List<float> { 0f, 0f, 0f };
+        [JsonProperty("label_offset")] public List<float> LabelOffset { get; set; } = new List<float> { 0f, .35f, 0f };
+        [JsonProperty("description")] public string Description { get; set; } = string.Empty;
+        [JsonProperty("point_ids")] public List<string> PointIds { get; set; } = new List<string>();
+        [JsonProperty("point_keys")] public List<string> PointKeys { get; set; } = new List<string>();
+        [JsonProperty("detail_view_id")] public string DetailViewId { get; set; } = string.Empty;
+
+        public void Normalize(int index)
+        {
+            Id = string.IsNullOrWhiteSpace(Id) ? $"part_{index + 1}" : Id.Trim();
+            Name = string.IsNullOrWhiteSpace(Name) ? (NodeName ?? Id) : Name.Trim();
+            NodePath = (NodePath ?? string.Empty).Trim();
+            NodeName = (NodeName ?? string.Empty).Trim();
+            ExplodeOffset = DeviceInspectionCameraDto.NormalizeVector(ExplodeOffset);
+            LabelOffset = DeviceInspectionCameraDto.NormalizeVector(LabelOffset);
+            Description ??= string.Empty;
+            DetailViewId ??= string.Empty;
+            PointIds = NormalizeStrings(PointIds);
+            PointKeys = NormalizeStrings(PointKeys);
+        }
+
+        private static List<string> NormalizeStrings(IEnumerable<string> values)
+        {
+            return (values ?? Enumerable.Empty<string>())
+                .Select(value => (value ?? string.Empty).Trim())
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(64)
+                .ToList();
+        }
+    }
+
+    public sealed class DeviceInspectionConfigDto
+    {
+        [JsonProperty("enabled")] public bool Enabled { get; set; } = true;
+        [JsonProperty("shell")] public DeviceInspectionShellDto Shell { get; set; } = new DeviceInspectionShellDto();
+        [JsonProperty("solid")] public DeviceInspectionStageDto Solid { get; set; } = new DeviceInspectionStageDto();
+        [JsonProperty("xray")] public DeviceInspectionStageDto Xray { get; set; } = new DeviceInspectionStageDto
+        {
+            Camera = new DeviceInspectionCameraDto { Yaw = 238f, Pitch = 19f, DistanceScale = 1.08f }
+        };
+        [JsonProperty("exploded")] public DeviceInspectionStageDto Exploded { get; set; } = new DeviceInspectionStageDto
+        {
+            Camera = new DeviceInspectionCameraDto { Yaw = 238f, Pitch = 22f, DistanceScale = 1.22f }
+        };
+        [JsonProperty("animation_duration")] public float AnimationDuration { get; set; } = .65f;
+        [JsonProperty("parts")] public List<DeviceInspectionPartDto> Parts { get; set; } = new List<DeviceInspectionPartDto>();
+
+        public void Normalize()
+        {
+            Shell ??= new DeviceInspectionShellDto();
+            Shell.Normalize();
+            Solid ??= new DeviceInspectionStageDto();
+            Xray ??= new DeviceInspectionStageDto();
+            Exploded ??= new DeviceInspectionStageDto();
+            Solid.Normalize(238f, 19f, 1.12f);
+            Xray.Normalize(238f, 19f, 1.08f);
+            Exploded.Normalize(238f, 22f, 1.22f);
+            AnimationDuration = Math.Max(.05f, Math.Min(5f, float.IsFinite(AnimationDuration) ? AnimationDuration : .65f));
+            Parts ??= new List<DeviceInspectionPartDto>();
+            Parts = Parts.Take(64).ToList();
+            for (var index = 0; index < Parts.Count; index += 1) Parts[index]?.Normalize(index);
+        }
+    }
+
+    public static class InspectionConfigResolver
+    {
+        public static DeviceInspectionConfigDto Resolve(ModelAssetDto asset, DeviceDto device)
+        {
+            var source = asset?.MetadataObject?["inspection"] as JObject ?? new JObject();
+            var overrideToken = device?.InstanceConfigObject?["inspection"] as JObject;
+            var merged = (JObject)source.DeepClone();
+            if (overrideToken != null)
+            {
+                merged.Merge(overrideToken, new JsonMergeSettings
+                {
+                    MergeArrayHandling = MergeArrayHandling.Replace,
+                    MergeNullValueHandling = MergeNullValueHandling.Ignore
+                });
+            }
+
+            DeviceInspectionConfigDto result;
+            try { result = merged.ToObject<DeviceInspectionConfigDto>() ?? new DeviceInspectionConfigDto(); }
+            catch { result = new DeviceInspectionConfigDto(); }
+
+            result.Normalize();
+            if (result.Parts.Count == 0)
+            {
+                result.Parts = FallbackParts(asset?.MetadataObject);
+                for (var index = 0; index < result.Parts.Count; index += 1) result.Parts[index].Normalize(index);
+            }
+            return result;
+        }
+
+        private static List<DeviceInspectionPartDto> FallbackParts(JObject metadata)
+        {
+            var result = new List<DeviceInspectionPartDto>();
+            foreach (var binding in metadata?["partBindings"]?.OfType<JObject>() ?? Enumerable.Empty<JObject>())
+            {
+                var nodeName = binding.Value<string>("node_name") ?? binding.Value<string>("nodeName") ?? string.Empty;
+                var nodePath = binding.Value<string>("node_path") ?? binding.Value<string>("nodePath") ?? string.Empty;
+                var sourceGroup = binding.Value<string>("source_group") ?? binding.Value<string>("sourceGroup") ?? string.Empty;
+                var sourceKey = binding.Value<string>("source_key") ?? binding.Value<string>("sourceKey") ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(nodeName) && string.IsNullOrWhiteSpace(nodePath)) continue;
+                result.Add(new DeviceInspectionPartDto
+                {
+                    Id = binding.Value<string>("id") ?? $"part_{result.Count + 1}",
+                    Name = binding.Value<string>("name") ?? nodeName,
+                    NodeName = nodeName,
+                    NodePath = nodePath,
+                    Description = binding.Value<string>("description") ?? string.Empty,
+                    PointKeys = string.IsNullOrWhiteSpace(sourceKey)
+                        ? new List<string>()
+                        : new List<string> { $"{sourceGroup}.{sourceKey}" }
+                });
+            }
+            return result;
         }
     }
 

@@ -169,6 +169,14 @@ function showUnityAdmin() {
     requestUnityHostAction('show_admin')
 }
 
+function reloadAdminPage() {
+    if (isUnityEmbedded && window.chrome?.webview) {
+        requestUnityHostAction('reload_page')
+        return
+    }
+    window.location.reload()
+}
+
 function loadAdminUiState() {
     try {
         return JSON.parse(localStorage.getItem(ADMIN_UI_STATE_KEY) || '{}')
@@ -182,8 +190,7 @@ const storedAdminUiState = loadAdminUiState()
 const PLATFORM_SUBPAGES = [
     { key: 'designer', label: '大屏设计器', description: '拖拽组件、绑定数据并发布画面' },
     { key: 'scene', label: '项目与场景', description: '项目归属与场景基础信息' },
-    { key: 'environment', label: '场景与光效', description: 'Unity 灯光、后处理、围墙与空间' },
-    { key: 'native-dashboard', label: 'Unity 原生组件', description: '总览、详情栏与设备点位展示' }
+    { key: 'environment', label: '场景与光效', description: 'Unity 灯光、后处理、围墙与空间' }
 ]
 const SETTINGS_SUBPAGES = [
     { key: 'runtime', label: '运行与投屏', description: '自启动、电视投屏与本地运行服务' },
@@ -253,11 +260,6 @@ const {
     saveNativeEnvironmentSettings,
     applyNativeEnvironmentPreset,
     resetNativeEnvironmentConfig,
-    nativeDashboardConfig,
-    nativeDashboardSaving,
-    nativeDashboardMessage,
-    saveNativeDashboardSettings,
-    resetNativeDashboardConfig,
     runtimeSettings,
     runtimeStatus,
     runtimeSaving,
@@ -384,10 +386,17 @@ const workshopManagementStep = ref(
         : 'list'
 )
 const workshopMapStageRef = ref(null)
+const workshopMapPendingGhostRef = ref(null)
 const workshopMapSelectedLineId = ref(storedAdminUiState.workshopMapSelectedLineId || '')
 const workshopMapDraggingLineId = ref('')
+const workshopMapPendingDragLineId = ref('')
+const workshopMapPendingDropReady = ref(false)
+const workshopMapPlacementHintLineId = ref('')
 const workshopMapSaving = ref(false)
 let workshopMapDragState = null
+let workshopMapPendingDragState = null
+let workshopMapPendingGhostFrame = 0
+let workshopMapPendingGhostPosition = { x: 0, y: 0 }
 
 function normalizeWorkshopRecord(workshop) {
     const layout = normalizeWorkshopLayout(workshop?.layout || workshop?.layout_json)
@@ -536,6 +545,9 @@ async function saveWorkshopSpatialLayout(workshop = selectedWorkshopEditor.value
 const lines = ref([])
 const newLine = reactive({ id: '', name: '', workshop_id: '' })
 const selectedLineEditorId = ref(storedAdminUiState.selectedLineEditorId || '')
+const savedLineLayoutSnapshots = ref({})
+const savedLinePlacementSnapshots = ref({})
+const placedLines = computed(() => lines.value.filter(line => !isLinePlacementPending(line)))
 const isLinePlannerEditorCollapsed = ref(!!storedAdminUiState.isLinePlannerEditorCollapsed)
 const isLineDevicePoolCollapsed = ref(!!storedAdminUiState.isLineDevicePoolCollapsed)
 const lineDevicePoolDock = reactive({
@@ -662,11 +674,21 @@ function buildNativePreviewFocus(source = activeTab.value) {
 
 function buildNativePreviewDevices(source, override = null) {
     const sourceDevices = source === 'composer' ? composerPreviewDevices.value : devices.value
-    return sourceDevices.map(device => nativePreviewDevicePayload(device, override))
+    const pendingLineIds = new Set(
+        lines.value.filter(isLinePlacementPending).map(line => String(line.id))
+    )
+    return sourceDevices
+        .filter(device => {
+            const config = parseInstanceConfig(device?.instance_config)
+            return !pendingLineIds.has(String(device?.line_id || ''))
+                && !pendingLineIds.has(String(config.laneLineId || ''))
+                && !pendingLineIds.has(String(config.railLineId || ''))
+        })
+        .map(device => nativePreviewDevicePayload(device, override))
 }
 
 function buildNativePreviewLines() {
-    return lines.value.map(line => ({
+    return placedLines.value.map(line => ({
         id: line.id,
         workshop_id: line.workshop_id,
         layout: normalizeLineLayout(getLineLayout(line))
@@ -807,7 +829,14 @@ function ensureSelectedLineEditor() {
 
 async function loadLines() {
     const result = await adminApi.getLines()
-    lines.value = (Array.isArray(result) ? result : []).map(normalizeLineRecord)
+    const normalizedLines = (Array.isArray(result) ? result : []).map(normalizeLineRecord)
+    lines.value = normalizedLines
+    savedLineLayoutSnapshots.value = Object.fromEntries(
+        normalizedLines.map(line => [line.id, lineLayoutSnapshot(line)])
+    )
+    savedLinePlacementSnapshots.value = Object.fromEntries(
+        normalizedLines.map(line => [line.id, linePlacementSnapshot(line)])
+    )
     if (lines.value.length === 0 && workshops.value.length > 0) {
         newLine.workshop_id = workshops.value[0].id
     }
@@ -818,10 +847,7 @@ async function createLine() {
     if (!newLine.id || !newLine.name || !newLine.workshop_id) return alert('请填写产线ID、名称和所属车间')
     const layout = defaultLineLayout()
     const siblingLines = sortByOrder(lines.value.filter(line => line.workshop_id === newLine.workshop_id))
-    const lastSibling = siblingLines[siblingLines.length - 1]
-    layout.transform.z = lastSibling
-        ? numberOrDefault(getLineLayout(lastSibling).transform.z, 0) - 16
-        : 0
+    layout.placementPending = siblingLines.length > 0
     const result = await adminApi.createLine({
         id: newLine.id,
         name: newLine.name,
@@ -832,11 +858,17 @@ async function createLine() {
     if (result?.error) return alert(result.error, { title: '新增产线失败', type: 'danger' })
     if (!result?.success) return alert('新增产线失败：后端没有返回成功状态', { title: '新增产线失败', type: 'danger' })
     const createdName = newLine.name
+    const placementPending = layout.placementPending
     selectedLineEditorId.value = newLine.id
     newLine.id = ''
     newLine.name = ''
     await loadLines()
-    await alert(`产线「${createdName}」已创建`, { title: '新增成功', type: 'success' })
+    await alert(
+        placementPending
+            ? `产线「${createdName}」已创建，位置暂定。请点击“产线在车间中的位置”前往布局画布手动放置。`
+            : `产线「${createdName}」已创建，并已默认放置在车间中心。`,
+        { title: '新增成功', type: 'success' }
+    )
 }
 
 async function deleteLine(id) {
@@ -857,91 +889,7 @@ async function deleteLine(id) {
 
 // ============ 设备管理 ============
 const devices = ref([])
-const nativeDashboardSelectedDeviceId = ref('')
-const nativeDashboardDevicePoints = ref([])
-const nativeDashboardPointsLoading = ref(false)
-const nativeDashboardPointsMessage = ref('')
-const nativeDashboardAnalogPoints = computed(() => nativeDashboardDevicePoints.value.filter(point => (
-    String(point.category || '').toLowerCase() === 'analog'
-)))
-const nativeDashboardStatusPoints = computed(() => nativeDashboardDevicePoints.value.filter(point => (
-    String(point.category || '').toLowerCase() !== 'analog'
-)))
-
-function ensureNativeDashboardDeviceSelection() {
-    if (nativeDashboardSelectedDeviceId.value && devices.value.some(device => device.id === nativeDashboardSelectedDeviceId.value)) return
-    nativeDashboardSelectedDeviceId.value = (
-        devices.value.find(device => !isAuxiliaryDeviceConfig(device))
-        || devices.value[0]
-    )?.id || ''
-}
-
-async function loadNativeDashboardDevicePoints() {
-    const deviceId = nativeDashboardSelectedDeviceId.value
-    nativeDashboardDevicePoints.value = []
-    nativeDashboardPointsMessage.value = ''
-    if (!deviceId) return
-    nativeDashboardPointsLoading.value = true
-    try {
-        const points = await adminApi.getDataPoints(deviceId)
-        if (!Array.isArray(points)) throw new Error(points?.error || '点位接口返回格式不正确')
-        nativeDashboardDevicePoints.value = points
-    } catch (error) {
-        nativeDashboardPointsMessage.value = `点位读取失败：${error.message || error}`
-    } finally {
-        nativeDashboardPointsLoading.value = false
-    }
-}
-
-function nativeDashboardDeviceOverride(create = false) {
-    const deviceId = nativeDashboardSelectedDeviceId.value
-    if (!deviceId) return null
-    if (!nativeDashboardConfig.deviceOverrides || typeof nativeDashboardConfig.deviceOverrides !== 'object') {
-        if (!create) return null
-        nativeDashboardConfig.deviceOverrides = {}
-    }
-    let override = nativeDashboardConfig.deviceOverrides[deviceId]
-    if (!override && create) {
-        override = { analogPointIds: [], statusPointIds: [], trendPointIds: [] }
-        nativeDashboardConfig.deviceOverrides[deviceId] = override
-    }
-    if (override && create) {
-        for (const key of ['analogPointIds', 'statusPointIds', 'trendPointIds']) {
-            if (!Array.isArray(override[key])) override[key] = []
-        }
-    }
-    return override || null
-}
-
-function nativeDashboardPointSelected(kind, pointId) {
-    const override = nativeDashboardDeviceOverride(false)
-    return Array.isArray(override?.[kind]) && override[kind].includes(String(pointId))
-}
-
-async function toggleNativeDashboardPoint(kind, pointId, checked) {
-    const override = nativeDashboardDeviceOverride(true)
-    if (!override) return
-    const id = String(pointId)
-    const index = override[kind].indexOf(id)
-    if (checked && index < 0) override[kind].push(id)
-    if (!checked && index >= 0) override[kind].splice(index, 1)
-    await saveNativeDashboardSettings({ silent: true })
-}
-
-async function clearNativeDashboardPointSelection(kind) {
-    const override = nativeDashboardDeviceOverride(true)
-    if (!override) return
-    override[kind] = []
-    await saveNativeDashboardSettings({ silent: true })
-}
-
-function nativeDashboardPointText(point) {
-    const label = point.label || point.name || `点位 ${point.id}`
-    const address = point.plc_tag || [point.db_number, point.db_byte_offset, point.bit_offset]
-        .filter(value => value !== null && value !== undefined && value !== '')
-        .join('.')
-    return address ? `${label} · ${address}` : label
-}
+const savedDeviceLayoutSnapshots = ref({})
 const showDeviceForm = ref(false)
 const editingDeviceWorkshopId = ref('')
 function defaultPlcConnectionConfig() {
@@ -963,6 +911,8 @@ const editingDevice = reactive({
     pos_x: 0, pos_y: 0, pos_z: 0, rotation_y: 0, scale: 1.0, coordinate_space: 'line_local', sort_order: 0,
     ...defaultPlcConnectionConfig()
 })
+const editingDeviceInspectionMode = ref('inherit')
+const editingDeviceInspectionJson = ref('{}')
 const isEditMode = ref(false)
 const plcProtocolOptions = PLC_PROTOCOL_OPTIONS
 const editingPlcProtocolDefinition = computed(() => getPlcProtocolDefinition(editingDevice.plc_protocol))
@@ -998,19 +948,49 @@ function setPlcOption(key, value) {
     editingDevice.plc_options = { ...editingPlcOptions.value, [key]: value }
 }
 
+function syncEditingDeviceInspectionState() {
+    const inspection = parseInstanceConfig(editingDevice.instance_config).inspection
+    if (!inspection || typeof inspection !== 'object' || Array.isArray(inspection)) {
+        editingDeviceInspectionMode.value = 'inherit'
+        editingDeviceInspectionJson.value = '{}'
+        return
+    }
+    if (inspection.enabled === false && Object.keys(inspection).length === 1) {
+        editingDeviceInspectionMode.value = 'disabled'
+        editingDeviceInspectionJson.value = JSON.stringify(inspection, null, 2)
+        return
+    }
+    editingDeviceInspectionMode.value = 'override'
+    editingDeviceInspectionJson.value = JSON.stringify(inspection, null, 2)
+}
+
+function copyModelInspectionToDevice() {
+    const model = models.value.find(item => item.id === editingDevice.model_type)
+    const inspection = parseModelMetadata(model).inspection
+    if (!inspection || typeof inspection !== 'object') {
+        return alert('当前模型还没有拆解检查配置，请先到“模型库 → 拆解检查”中配置')
+    }
+    editingDeviceInspectionMode.value = 'override'
+    editingDeviceInspectionJson.value = JSON.stringify(normalizeModelInspection(inspection), null, 2)
+}
+
 async function loadDevices() {
     devices.value = await adminApi.getDevices()
+    savedDeviceLayoutSnapshots.value = Object.fromEntries(
+        devices.value.map(device => [device.id, deviceLayoutSnapshot(device)])
+    )
 }
 
 function openCreateDevice() {
     isEditMode.value = false
     editingDeviceWorkshopId.value = workshops.value[0]?.id || ''
     Object.assign(editingDevice, { 
-        id: '', name: '', line_id: lines.value[0]?.id || '', 
+        id: '', name: '', line_id: placedLines.value[0]?.id || '',
         model_type: 'builtin_furnace', model_file: '', template_id: '', instance_config: '{}',
         pos_x: 0, pos_y: 0, pos_z: 0, rotation_y: 0, scale: 1.0, coordinate_space: 'line_local', sort_order: devices.value.length,
         ...defaultPlcConnectionConfig()
     })
+    syncEditingDeviceInspectionState()
     showDeviceForm.value = true
 }
 
@@ -1019,6 +999,7 @@ function openEditDevice(d) {
     const normalized = normalizeDeviceConfig(d)
     Object.assign(editingDevice, { ...defaultPlcConnectionConfig(), ...normalized, line_id: normalized.line_id || '' })
     editingDeviceWorkshopId.value = getDeviceWorkshopId(editingDevice) || workshops.value[0]?.id || ''
+    syncEditingDeviceInspectionState()
     showDeviceForm.value = true
 }
 
@@ -1039,6 +1020,24 @@ async function saveDevice() {
         parsedInstanceConfig = parseEditableInstanceConfig(editingDevice.instance_config)
     } catch (e) {
         return alert('实例配置 JSON 格式不正确')
+    }
+    if (!isAuxiliary) {
+        if (editingDeviceInspectionMode.value === 'inherit') {
+            delete parsedInstanceConfig.inspection
+        } else if (editingDeviceInspectionMode.value === 'disabled') {
+            parsedInstanceConfig.inspection = { enabled: false }
+        } else {
+            let inspectionOverride
+            try {
+                inspectionOverride = JSON.parse(editingDeviceInspectionJson.value || '{}')
+            } catch (e) {
+                return alert('设备拆解覆盖 JSON 格式不正确')
+            }
+            if (!inspectionOverride || typeof inspectionOverride !== 'object' || Array.isArray(inspectionOverride)) {
+                return alert('设备拆解覆盖必须是 JSON 对象')
+            }
+            parsedInstanceConfig.inspection = inspectionOverride
+        }
     }
     const payload = buildDevicePayloadForSave({ ...editingDevice, instance_config: parsedInstanceConfig }, editingDeviceWorkshopId.value)
     let result
@@ -1201,6 +1200,7 @@ const MODEL_LIBRARY_STEPS = [
     { key: 'library', label: '模型资产', description: '选择已有模型并查看交付状态' },
     { key: 'import', label: '导入模型', description: '上传 GLB / GLTF 并填写基础信息' },
     { key: 'optimization', label: '优化与验收', description: '优化材质、规范并发布模型' },
+    { key: 'inspection', label: '拆解检查', description: '配置外壳、关键部件、镜头与点位上下文' },
     { key: 'bindings', label: '部位绑定', description: '把模型节点绑定到实时点位' }
 ]
 const modelLibraryStep = ref(
@@ -1235,6 +1235,15 @@ const defaultModelOptimization = {
     contactShadow: true,
     environmentIntensity: 0.85
 }
+const defaultModelInspection = {
+    enabled: true,
+    shell: { node_paths: [], node_names: [], opacity: 0.18, wireframe: false },
+    solid: { view_id: '', camera: { yaw: 238, pitch: 19, distance_scale: 1.12, target_offset: [0, 0, 0] } },
+    xray: { view_id: '', camera: { yaw: 238, pitch: 19, distance_scale: 1.08, target_offset: [0, .2, 0] } },
+    exploded: { view_id: '', camera: { yaw: 238, pitch: 22, distance_scale: 1.22, target_offset: [0, .35, 0] } },
+    animation_duration: .72,
+    parts: []
+}
 const modelWorkflowStepLabels = {
     imported: '导入',
     parsed: '解析',
@@ -1248,6 +1257,7 @@ function createDefaultModelMetadata() {
     return {
         batchable: true,
         optimization: { ...defaultModelOptimization },
+        inspection: JSON.parse(JSON.stringify(defaultModelInspection)),
         assetSpec: { ...defaultModelAssetSpec },
         partBindings: [],
         acceptance: {
@@ -1314,6 +1324,32 @@ const modelPreviewStats = reactive({
 const modelPartBindings = ref([])
 const modelAssetSpec = reactive({ ...defaultModelAssetSpec })
 const modelOptimization = reactive({ ...defaultModelOptimization })
+const modelInspection = reactive(JSON.parse(JSON.stringify(defaultModelInspection)))
+const modelInspectionParts = ref([])
+const selectedInspectionPartIndex = ref(-1)
+const inspectionPreviewStage = ref('solid')
+const inspectionPreviewState = ref(null)
+const inspectionShellNodePath = ref('')
+const inspectionShellEntries = computed(() => {
+    const paths = Array.isArray(modelInspection.shell?.node_paths) ? modelInspection.shell.node_paths : []
+    const names = Array.isArray(modelInspection.shell?.node_names) ? modelInspection.shell.node_names : []
+    const entries = paths.map((path, index) => ({
+        key: `path:${path}`,
+        path,
+        name: names[index] || ''
+    }))
+    const representedNames = new Set(entries.map(entry => entry.name).filter(Boolean))
+    names.forEach((name) => {
+        if (!name || representedNames.has(name)) return
+        entries.push({ key: `name:${name}`, path: '', name })
+    })
+    return entries
+})
+const inspectionPartForm = reactive({
+    id: '', name: '', node_path: '', node_name: '', description: '',
+    explode_x: 0, explode_y: 0, explode_z: 0,
+    point_keys_text: '', detail_view_id: ''
+})
 const selectedModelNodePath = ref('')
 const modelNodeSearchText = ref('')
 const showOnlyBindableNodes = ref(true)
@@ -1472,10 +1508,12 @@ function countUnresolvedModelBindings() {
 }
 
 const activePreviewModel = computed(() => getActivePreviewModel())
-const canEditModelBindings = computed(() => !!activePreviewModel.value?.file_path && !activePreviewModel.value?.is_builtin)
+// A packaged built-in GLB is still a real configurable asset. Only procedural
+// placeholders (which have no model file) must remain read-only.
+const canEditModelBindings = computed(() => !!activePreviewModel.value?.file_path)
 
 function modelLibraryStepRequiresModel(step) {
-    return step === 'optimization' || step === 'bindings'
+    return step === 'optimization' || step === 'inspection' || step === 'bindings'
 }
 
 async function selectModelLibraryStep(step) {
@@ -1772,6 +1810,7 @@ function disposeThreeObject(object) {
 }
 
 function disposeModelPreview(options = {}) {
+    restoreInspectionPreviewStage()
     clearModelPreviewAnimation()
     if (modelPreviewRuntime) {
         cancelAnimationFrame(modelPreviewRuntime.frameId)
@@ -1938,6 +1977,86 @@ function restoreModelPreviewHighlight() {
         material.needsUpdate = true
     })
     modelPreviewHighlightState = null
+}
+
+function restoreInspectionPreviewStage() {
+    const state = inspectionPreviewState.value
+    if (!state) return
+    restorePreviewAnimationMaterials(state.materials || [])
+    ;(state.targets || []).forEach((entry) => {
+        if (!entry.target) return
+        entry.target.position.copy(entry.position)
+        entry.target.visible = entry.visible
+    })
+    inspectionPreviewState.value = null
+}
+
+function resolveInspectionPreviewTarget(part = {}) {
+    if (part.node_path && modelPreviewNodeMap.has(part.node_path)) return modelPreviewNodeMap.get(part.node_path)
+    const name = String(part.node_name || '')
+    if (!name) return null
+    for (const target of modelPreviewNodeMap.values()) {
+        if (target?.name === name) return target
+    }
+    return null
+}
+
+function inspectionShellPreviewTargets() {
+    const targets = []
+    ;(modelInspection.shell?.node_paths || []).forEach((path) => {
+        const target = modelPreviewNodeMap.get(path)
+        if (target && !targets.includes(target)) targets.push(target)
+    })
+    ;(modelInspection.shell?.node_names || []).forEach((name) => {
+        for (const target of modelPreviewNodeMap.values()) {
+            if (target?.name === name && !targets.includes(target)) targets.push(target)
+        }
+    })
+    if (!targets.length) {
+        for (const target of modelPreviewNodeMap.values()) {
+            const name = String(target?.name || '').toLowerCase()
+            if (['shell', 'housing', 'casing', 'outer', 'enclosure', '外壳', '炉体'].some(token => name.includes(token))) targets.push(target)
+        }
+    }
+    return targets
+}
+
+function applyInspectionPreviewStage(stage = 'solid') {
+    inspectionPreviewStage.value = stage
+    if (!modelPreviewRootObject) return
+    clearModelPreviewAnimation()
+    clearModelPreviewSelectionBox()
+    restoreModelPreviewHighlight()
+    restoreInspectionPreviewStage()
+
+    const shellTargets = inspectionShellPreviewTargets()
+    const partTargets = modelInspectionParts.value
+        .map(part => ({ part, target: resolveInspectionPreviewTarget(part) }))
+        .filter(entry => entry.target)
+    const targets = [...new Set([...shellTargets, ...partTargets.map(entry => entry.target)])]
+        .map(target => ({ target, position: target.position.clone(), visible: target.visible }))
+    const materials = previewMaterialEntries(modelPreviewRootObject)
+    inspectionPreviewState.value = { targets, materials }
+
+    if (stage === 'xray') {
+        const opacity = Number(modelInspection.shell?.opacity ?? .18)
+        shellTargets.forEach((target) => collectPreviewMeshes(target).forEach((mesh) => {
+            const list = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+            list.filter(Boolean).forEach((material) => {
+                material.transparent = true
+                material.opacity = opacity
+                material.depthWrite = false
+                material.needsUpdate = true
+            })
+        }))
+    } else if (stage === 'exploded') {
+        shellTargets.forEach(target => { target.visible = false })
+        partTargets.forEach(({ part, target }) => {
+            const offset = normalizeInspectionVector(part.explode_offset)
+            target.position.add(new THREE.Vector3(offset[0], offset[1], offset[2]))
+        })
+    }
+    fitPreviewCamera(modelPreviewRuntime.camera, modelPreviewRuntime.controls, modelPreviewRootObject)
 }
 
 function collectPreviewMeshes(object) {
@@ -2311,6 +2430,7 @@ async function renderModelPreview(source) {
         collectModelPreviewStats(root)
         fitPreviewCamera(runtime.camera, runtime.controls, root)
         if (modelBindingForm.node_path) highlightPreviewNode(modelBindingForm.node_path)
+        if (modelLibraryStep.value === 'inspection') applyInspectionPreviewStage(inspectionPreviewStage.value)
         const box = new THREE.Box3().setFromObject(root)
         const size = box.getSize(new THREE.Vector3())
         modelPreviewStatus.value = `预览：${source.label} | 尺寸 ${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}`
@@ -2366,6 +2486,7 @@ async function renderBuiltinModelPreview(model) {
         collectModelPreviewStats(deviceModel)
         fitPreviewCamera(runtime.camera, runtime.controls, deviceModel)
         if (modelBindingForm.node_path) highlightPreviewNode(modelBindingForm.node_path)
+        if (modelLibraryStep.value === 'inspection') applyInspectionPreviewStage(inspectionPreviewStage.value)
         const box = new THREE.Box3().setFromObject(deviceModel)
         const size = box.getSize(new THREE.Vector3())
         modelPreviewStatus.value = `预览：${source.label} | 尺寸 ${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)} | 内置程序化模型`
@@ -2448,6 +2569,158 @@ function normalizeModelOptimization(optimization = {}) {
     }
 }
 
+function normalizeInspectionVector(value, fallback = [0, 0, 0]) {
+    const source = Array.isArray(value) ? value : fallback
+    return [0, 1, 2].map(index => Number(source[index] ?? fallback[index] ?? 0) || 0)
+}
+
+function normalizeInspectionCamera(camera = {}, fallback = {}) {
+    return {
+        yaw: Number(camera.yaw ?? fallback.yaw ?? 238),
+        pitch: Number(camera.pitch ?? fallback.pitch ?? 19),
+        distance_scale: Number(camera.distance_scale ?? camera.distanceScale ?? fallback.distance_scale ?? 1.12),
+        target_offset: normalizeInspectionVector(camera.target_offset || camera.targetOffset, fallback.target_offset || [0, 0, 0])
+    }
+}
+
+function normalizeInspectionPart(part = {}, index = 0) {
+    const explode = normalizeInspectionVector(part.explode_offset || part.explodeOffset)
+    return {
+        id: String(part.id || `part_${index + 1}`),
+        name: String(part.name || part.node_name || part.nodeName || `部件 ${index + 1}`),
+        node_path: String(part.node_path || part.nodePath || ''),
+        node_name: String(part.node_name || part.nodeName || ''),
+        explode_offset: explode,
+        label_offset: normalizeInspectionVector(part.label_offset || part.labelOffset, [0, .35, 0]),
+        description: String(part.description || ''),
+        point_ids: Array.isArray(part.point_ids || part.pointIds) ? [...(part.point_ids || part.pointIds)].map(String) : [],
+        point_keys: Array.isArray(part.point_keys || part.pointKeys) ? [...(part.point_keys || part.pointKeys)].map(String) : [],
+        detail_view_id: String(part.detail_view_id || part.detailViewId || '')
+    }
+}
+
+function normalizeModelInspection(inspection = {}) {
+    const shell = inspection.shell || {}
+    const normalizeStage = (source, fallback) => ({
+        view_id: String(source?.view_id ?? source?.viewId ?? fallback.view_id ?? ''),
+        camera: normalizeInspectionCamera(source?.camera || {}, fallback.camera)
+    })
+    return {
+        enabled: inspection.enabled !== false,
+        shell: {
+            node_paths: Array.isArray(shell.node_paths || shell.nodePaths) ? [...(shell.node_paths || shell.nodePaths)].map(String) : [],
+            node_names: Array.isArray(shell.node_names || shell.nodeNames) ? [...(shell.node_names || shell.nodeNames)].map(String) : [],
+            opacity: Math.max(.03, Math.min(.95, Number(shell.opacity ?? defaultModelInspection.shell.opacity))),
+            wireframe: !!shell.wireframe
+        },
+        solid: normalizeStage(inspection.solid, defaultModelInspection.solid),
+        xray: normalizeStage(inspection.xray, defaultModelInspection.xray),
+        exploded: normalizeStage(inspection.exploded, defaultModelInspection.exploded),
+        animation_duration: Math.max(.05, Math.min(5, Number(inspection.animation_duration ?? inspection.animationDuration ?? .72))),
+        parts: (Array.isArray(inspection.parts) ? inspection.parts : []).map(normalizeInspectionPart)
+    }
+}
+
+function loadModelInspectionState(model) {
+    const metadata = parseModelMetadata(model)
+    const normalized = normalizeModelInspection(metadata.inspection || {})
+    Object.assign(modelInspection, normalized)
+    modelInspection.shell = normalized.shell
+    modelInspection.solid = normalized.solid
+    modelInspection.xray = normalized.xray
+    modelInspection.exploded = normalized.exploded
+    modelInspectionParts.value = normalized.parts
+    modelInspection.parts = modelInspectionParts.value
+    selectedInspectionPartIndex.value = -1
+    inspectionPreviewStage.value = 'solid'
+    resetInspectionPartForm()
+}
+
+function resetInspectionPartForm() {
+    Object.assign(inspectionPartForm, {
+        id: '', name: '', node_path: selectedModelNodePath.value || '', node_name: '',
+        description: '', explode_x: 0, explode_y: 0, explode_z: 0,
+        point_keys_text: '', detail_view_id: ''
+    })
+    selectedInspectionPartIndex.value = -1
+}
+
+function editInspectionPart(index) {
+    const part = modelInspectionParts.value[index]
+    if (!part) return
+    const explode = normalizeInspectionVector(part.explode_offset)
+    Object.assign(inspectionPartForm, {
+        id: part.id,
+        name: part.name,
+        node_path: part.node_path,
+        node_name: part.node_name,
+        description: part.description,
+        explode_x: explode[0],
+        explode_y: explode[1],
+        explode_z: explode[2],
+        point_keys_text: (part.point_keys || []).join(', '),
+        detail_view_id: part.detail_view_id || ''
+    })
+    selectedInspectionPartIndex.value = index
+    selectPreviewNode(part.node_path)
+}
+
+function saveInspectionPartDraft() {
+    const path = inspectionPartForm.node_path || selectedModelNodePath.value
+    const node = modelPreviewNodes.value.find(item => item.path === path)
+    if (!path && !inspectionPartForm.node_name) return alert('请先选择模型部件节点')
+    const part = normalizeInspectionPart({
+        id: inspectionPartForm.id || `part_${Date.now()}`,
+        name: inspectionPartForm.name || node?.displayName || node?.name,
+        node_path: path,
+        node_name: inspectionPartForm.node_name || node?.name || '',
+        explode_offset: [inspectionPartForm.explode_x, inspectionPartForm.explode_y, inspectionPartForm.explode_z],
+        description: inspectionPartForm.description,
+        point_keys: String(inspectionPartForm.point_keys_text || '').split(/[,，\n]/).map(item => item.trim()).filter(Boolean),
+        detail_view_id: inspectionPartForm.detail_view_id
+    }, selectedInspectionPartIndex.value)
+    if (selectedInspectionPartIndex.value >= 0) modelInspectionParts.value.splice(selectedInspectionPartIndex.value, 1, part)
+    else modelInspectionParts.value.push(part)
+    modelInspection.parts = modelInspectionParts.value
+    resetInspectionPartForm()
+    applyInspectionPreviewStage('exploded')
+}
+
+function removeInspectionPart(index) {
+    modelInspectionParts.value.splice(index, 1)
+    modelInspection.parts = modelInspectionParts.value
+    resetInspectionPartForm()
+    applyInspectionPreviewStage(inspectionPreviewStage.value)
+}
+
+function addInspectionShellNode() {
+    const path = inspectionShellNodePath.value || selectedModelNodePath.value
+    const node = modelPreviewNodes.value.find(item => item.path === path)
+    if (!path || !node) return alert('请先选择外壳节点')
+    modelInspection.shell.node_paths = [...new Set([...(modelInspection.shell.node_paths || []), path])]
+    modelInspection.shell.node_names = [...new Set([...(modelInspection.shell.node_names || []), node.name])]
+    inspectionShellNodePath.value = ''
+    applyInspectionPreviewStage('xray')
+}
+
+function removeInspectionShellNode(index) {
+    const entry = typeof index === 'number' ? inspectionShellEntries.value[index] : index
+    if (!entry) return
+    const pathIndex = entry.path ? modelInspection.shell.node_paths.indexOf(entry.path) : -1
+    const nameIndex = entry.name ? modelInspection.shell.node_names.indexOf(entry.name) : -1
+    if (pathIndex >= 0) modelInspection.shell.node_paths.splice(pathIndex, 1)
+    if (nameIndex >= 0) modelInspection.shell.node_names.splice(nameIndex, 1)
+    applyInspectionPreviewStage(inspectionPreviewStage.value)
+}
+
+function selectInspectionShellNode(entry) {
+    const node = modelPreviewNodes.value.find(item => (
+        (entry?.path && item.path === entry.path)
+        || (entry?.name && item.name === entry.name)
+    ))
+    selectPreviewNode(node?.path || entry?.path || '')
+}
+
 function loadModelAssetSpec(model) {
     const metadata = parseModelMetadata(model)
     Object.assign(modelAssetSpec, normalizeModelAssetSpec(metadata.assetSpec || metadata.asset_spec || {}))
@@ -2506,6 +2779,7 @@ function buildCurrentModelMetadata(model, overrides = {}) {
         schema_version: 1,
         batchable: metadata.batchable ?? true,
         optimization: normalizeModelOptimization(modelOptimization),
+        inspection: normalizeModelInspection(modelInspection),
         assetSpec,
         partBindings: normalizedPartBindings,
         acceptance: overrides.acceptance || makeAcceptanceSnapshot(assetSpec.delivery_status),
@@ -2621,6 +2895,7 @@ function resetModelBindingForm() {
 
 function loadModelBindingState(model) {
     loadModelAssetSpec(model)
+    loadModelInspectionState(model)
     const metadata = parseModelMetadata(model)
     const rawBindings = Array.isArray(metadata.partBindings)
         ? metadata.partBindings.map(normalizeModelBinding)
@@ -2638,6 +2913,11 @@ function selectPreviewNode(path) {
     modelBindingForm.node_path = path || ''
     const node = modelPreviewNodes.value.find(item => item.path === path)
     if (node && !modelBindingForm.name) modelBindingForm.name = node.displayName || node.name
+    if (modelLibraryStep.value === 'inspection') {
+        inspectionPartForm.node_path = path || ''
+        inspectionPartForm.node_name = node?.name || ''
+        if (node && !inspectionPartForm.name) inspectionPartForm.name = node.displayName || node.name
+    }
     highlightPreviewNode(path)
 }
 
@@ -2742,6 +3022,26 @@ async function saveModelPartBindings(options = {}) {
     }
 }
 
+async function saveModelInspection() {
+    const model = activePreviewModel.value
+    if (!model?.id || !canEditModelBindings.value) return false
+    modelBindingSaving.value = true
+    modelBindingStatus.value = '正在保存拆解检查配置...'
+    try {
+        modelInspection.parts = modelInspectionParts.value.map(normalizeInspectionPart)
+        const metadata = buildCurrentModelMetadata(model)
+        await persistModelMetadata(model, metadata, `已保存 ${modelInspectionParts.value.length} 个关键部件和 ${inspectionShellEntries.value.length} 个外壳节点`)
+        await alert('拆解检查配置已保存，Unity 重新加载后生效', { title: '保存成功', type: 'success' })
+        return true
+    } catch (e) {
+        modelBindingStatus.value = `保存失败：${e.message || e}`
+        await alert(modelBindingStatus.value, { title: '保存失败', type: 'danger' })
+        return false
+    } finally {
+        modelBindingSaving.value = false
+    }
+}
+
 async function saveModelAssetSpec(overrides = {}) {
     overrides = normalizeSaveOverrides(overrides)
     const model = activePreviewModel.value
@@ -2808,6 +3108,7 @@ async function publishModelAsset() {
                 schema_version: metadata.schema_version,
                 assetSpec: metadata.assetSpec,
                 optimization: metadata.optimization,
+                inspection: metadata.inspection,
                 partBindings: metadata.partBindings,
                 acceptance: metadata.acceptance,
                 runtime: metadata.runtime
@@ -2841,11 +3142,13 @@ async function restoreModelRelease(record) {
             delivery_status: 'released'
         })
         const restoredOptimization = normalizeModelOptimization(snapshot.optimization || current.optimization || {})
+        const restoredInspection = normalizeModelInspection(snapshot.inspection || current.inspection || {})
         const metadata = {
             ...current,
             schema_version: snapshot.schema_version || 1,
             assetSpec: restoredSpec,
             optimization: restoredOptimization,
+            inspection: restoredInspection,
             partBindings: restoredBindings,
             acceptance: snapshot.acceptance || makeAcceptanceSnapshot('released'),
             runtime: {
@@ -2874,6 +3177,8 @@ async function restoreModelRelease(record) {
         }
         Object.assign(modelAssetSpec, restoredSpec)
         Object.assign(modelOptimization, restoredOptimization)
+        Object.assign(modelInspection, restoredInspection)
+        modelInspectionParts.value = restoredInspection.parts
         modelPartBindings.value = restoredBindings
         await persistModelMetadata(model, metadata, `已恢复发布版本：${metadata.release.version}`)
     } catch (e) {
@@ -2892,6 +3197,8 @@ function resetModelImportForm(file) {
     metadata.assetSpec.device_family = modelImportForm.name
     Object.assign(modelAssetSpec, metadata.assetSpec)
     Object.assign(modelOptimization, metadata.optimization)
+    Object.assign(modelInspection, normalizeModelInspection(metadata.inspection))
+    modelInspectionParts.value = []
     modelImportForm.metadata = JSON.stringify(metadata, null, 2)
 }
 
@@ -2902,6 +3209,7 @@ async function selectModelFile(event) {
     selectedPreviewModelId.value = ''
     modelPreviewModel = null
     modelPartBindings.value = []
+    modelInspectionParts.value = []
     modelBindingStatus.value = '待上传模型可先预览节点，上传入库后再保存部位绑定'
     resetModelBindingForm()
     selectedModelFile.value = file
@@ -3509,6 +3817,8 @@ async function deleteWidget(id) {
 
 // ============ 左编辑 / 右预览现场编排器 ============
 const composerPreviewRef = ref(null)
+const composerPreviewShellRef = ref(null)
+const composerLayoutPanelRef = ref(null)
 const selectedComposerLineId = ref('')
 const selectedComposerDeviceId = ref('')
 const composerPreviewMode = ref('line')
@@ -3518,6 +3828,7 @@ const composerBulkSaving = ref(false)
 const isComposerPreviewWide = ref(false)
 const composerRotationPresets = [0, 90, 180, 270]
 const composerRotationNudges = [-5, -1, 1, 5]
+const composerLayoutPanelPosition = reactive({ left: null, top: 76 })
 const composerDraft = reactive({
     id: '',
     name: '',
@@ -3545,6 +3856,7 @@ let composerPreviewQueued = false
 let composerPreviewWatchdogTimer = null
 let composerPreviewRetryTimer = null
 let composerPreviewFailureCount = 0
+let composerLayoutPanelDrag = null
 
 function getDeviceDefaultInstanceConfig(device = {}) {
     const config = parseInstanceConfig(device.instance_config)
@@ -3626,8 +3938,11 @@ function normalizeDeviceConfig(device) {
     }
 }
 
-const selectedComposerLine = computed(() => lines.value.find(line => line.id === selectedComposerLineId.value))
+const selectedComposerLine = computed(() => placedLines.value.find(line => line.id === selectedComposerLineId.value))
 const selectedComposerDevice = computed(() => devices.value.find(device => device.id === selectedComposerDeviceId.value))
+const composerLayoutPanelStyle = computed(() => composerLayoutPanelPosition.left === null
+    ? { right: '18px', top: `${composerLayoutPanelPosition.top}px` }
+    : { left: `${composerLayoutPanelPosition.left}px`, top: `${composerLayoutPanelPosition.top}px` })
 const composerPreviewDevices = computed(() => devices.value.map(device => {
     const source = device.id === composerDraft.id ? { ...device, ...composerDraft } : device
     return normalizeDeviceConfig(source)
@@ -3641,7 +3956,7 @@ const selectedComposerAuxDevices = computed(() => sortByOrder(composerPreviewDev
 })))
 const composerStats = computed(() => ({
     workshops: workshops.value.length,
-    lines: lines.value.length,
+    lines: placedLines.value.length,
     devices: devices.value.length,
     selectedLineDevices: selectedComposerDevices.value.length
 }))
@@ -3652,7 +3967,7 @@ const composerWorkshops = computed(() => sortByOrder(workshops.value).map(worksh
     devices: sortByOrder(composerPreviewDevices.value.filter(device => {
         return isAuxiliaryDeviceConfig(device) && getDeviceWorkshopId(device) === workshop.id
     })),
-    lines: sortByOrder(lines.value.filter(line => line.workshop_id === workshop.id)).map(line => ({
+    lines: sortByOrder(placedLines.value.filter(line => line.workshop_id === workshop.id)).map(line => ({
         ...line,
         devices: sortByOrder(composerPreviewDevices.value.filter(device => {
             return device.line_id === line.id && !isAuxiliaryDeviceConfig(device)
@@ -3676,17 +3991,17 @@ function getComposerWorkshopIndex(workshopId) {
 }
 
 function ensureComposerSelection() {
-    if (!lines.value.length) {
+    if (!placedLines.value.length) {
         selectedComposerLineId.value = ''
         selectedComposerDeviceId.value = ''
         return
     }
-    if (!selectedComposerLineId.value || !lines.value.some(line => line.id === selectedComposerLineId.value)) {
-        selectedComposerLineId.value = sortByOrder(lines.value)[0]?.id || ''
+    if (!selectedComposerLineId.value || !placedLines.value.some(line => line.id === selectedComposerLineId.value)) {
+        selectedComposerLineId.value = sortByOrder(placedLines.value)[0]?.id || ''
     }
     const selectableDevices = [...selectedComposerDevices.value, ...selectedComposerAuxDevices.value]
     if (!selectableDevices.some(device => device.id === selectedComposerDeviceId.value)) {
-        selectedComposerDeviceId.value = selectedComposerDevices.value[0]?.id || selectedComposerAuxDevices.value[0]?.id || ''
+        selectedComposerDeviceId.value = ''
     }
 }
 
@@ -3716,14 +4031,71 @@ function syncComposerDraftFromSelection() {
 
 function selectComposerLine(lineId) {
     selectedComposerLineId.value = lineId
-    const firstDevice = sortByOrder(devices.value.filter(device => device.line_id === lineId && !isAuxiliaryDeviceConfig(device)))[0]
-    selectedComposerDeviceId.value = firstDevice?.id || ''
+    selectedComposerDeviceId.value = ''
     composerPreviewMode.value = 'line'
 }
 
 function selectComposerDevice(deviceId) {
+    if (selectedComposerDeviceId.value === deviceId) {
+        clearComposerDeviceSelection()
+        return
+    }
     selectedComposerDeviceId.value = deviceId
     composerPreviewMode.value = 'device'
+}
+
+function selectComposerDeviceFromPreview(deviceId) {
+    if (!devices.value.some(device => device.id === deviceId)) return
+    selectedComposerDeviceId.value = deviceId
+    composerPreviewMode.value = 'device'
+}
+
+function clearComposerDeviceSelection() {
+    selectedComposerDeviceId.value = ''
+    if (composerPreviewMode.value === 'device') composerPreviewMode.value = 'line'
+    composerPreviewStatus.value = '已取消设备选择'
+}
+
+function moveComposerLayoutPanel(event) {
+    if (!composerLayoutPanelDrag) return
+    event.preventDefault()
+    const shell = composerPreviewShellRef.value
+    const panel = composerLayoutPanelRef.value
+    if (!shell || !panel) return
+    const shellRect = shell.getBoundingClientRect()
+    const panelRect = panel.getBoundingClientRect()
+    const minimumTop = 66
+    const maximumLeft = Math.max(8, shellRect.width - panelRect.width - 8)
+    const maximumTop = Math.max(minimumTop, shellRect.height - panelRect.height - 46)
+    composerLayoutPanelPosition.left = Math.max(8, Math.min(maximumLeft, event.clientX - shellRect.left - composerLayoutPanelDrag.offsetX))
+    composerLayoutPanelPosition.top = Math.max(minimumTop, Math.min(maximumTop, event.clientY - shellRect.top - composerLayoutPanelDrag.offsetY))
+}
+
+function finishComposerLayoutPanelDrag() {
+    composerLayoutPanelDrag = null
+    window.removeEventListener('pointermove', moveComposerLayoutPanel)
+    window.removeEventListener('pointerup', finishComposerLayoutPanelDrag)
+    window.removeEventListener('pointercancel', finishComposerLayoutPanelDrag)
+}
+
+function startComposerLayoutPanelDrag(event) {
+    if (event.button !== 0) return
+    const shell = composerPreviewShellRef.value
+    const panel = composerLayoutPanelRef.value
+    if (!shell || !panel) return
+    event.preventDefault()
+    event.stopPropagation()
+    const shellRect = shell.getBoundingClientRect()
+    const panelRect = panel.getBoundingClientRect()
+    composerLayoutPanelPosition.left = panelRect.left - shellRect.left
+    composerLayoutPanelPosition.top = panelRect.top - shellRect.top
+    composerLayoutPanelDrag = {
+        offsetX: event.clientX - panelRect.left,
+        offsetY: event.clientY - panelRect.top
+    }
+    window.addEventListener('pointermove', moveComposerLayoutPanel, { passive: false })
+    window.addEventListener('pointerup', finishComposerLayoutPanelDrag)
+    window.addEventListener('pointercancel', finishComposerLayoutPanelDrag)
 }
 
 function nudgeComposerDevice(dx, dz) {
@@ -4047,10 +4419,7 @@ async function renderComposerPreview() {
             },
             onLevelChange: () => {},
             onDeviceSelect: deviceId => {
-                if (devices.value.some(device => device.id === deviceId)) {
-                    selectedComposerDeviceId.value = deviceId
-                    composerPreviewMode.value = 'device'
-                }
+                selectComposerDeviceFromPreview(deviceId)
             },
             onDeviceRegistered: () => {},
             interactionOptions: {
@@ -4212,9 +4581,6 @@ watch([workshops, lines, devices, models], () => {
     scheduleComposerPreview()
 }, { deep: true })
 
-watch(devices, ensureNativeDashboardDeviceSelection)
-watch(nativeDashboardSelectedDeviceId, loadNativeDashboardDevicePoints)
-
 watch(activeTab, async (tab) => {
     if (tab === 'composer') {
         ensureComposerSelection()
@@ -4314,9 +4680,9 @@ watch([
 
 // ============ 生命周期 ============
 onMounted(async () => {
+    window.addEventListener('beforeunload', handleUnsavedCanvasBeforeUnload)
     await loadWorkshops()
     await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform()])
-    ensureNativeDashboardDeviceSelection()
     startRuntimeRefresh()
     loadCastDevices({ silent: true })
     startCastRefresh()
@@ -4345,6 +4711,7 @@ onMounted(async () => {
         ensureWorkshopMapLineSelection()
         scheduleNativeScenePreview({ source: 'spatial', includeLayout: true })
     }
+    if (activeTab.value === 'models') await renderSelectedModelPreview()
 })
 
 onActivated(async () => {
@@ -4366,14 +4733,17 @@ onDeactivated(() => {
     nativeScenePreviewStatusTimer = null
     finishLinePreviewDrag()
     finishWorkshopMapLineDrag()
+    finishWorkshopPendingLineDrag()
     cancelLineDeviceDrag()
     cancelLineDevicePoolMove()
+    finishComposerLayoutPanelDrag()
     stopPointMonitor()
     disposeComposerPreview()
     disposeModelPreview()
 })
 
 onUnmounted(() => {
+    window.removeEventListener('beforeunload', handleUnsavedCanvasBeforeUnload)
     if (nativeScenePreviewTimer) clearTimeout(nativeScenePreviewTimer)
     if (nativeScenePreviewStatusTimer) clearInterval(nativeScenePreviewStatusTimer)
     nativeScenePreviewTimer = null
@@ -4382,8 +4752,10 @@ onUnmounted(() => {
     stopCastRefresh()
     finishLinePreviewDrag()
     finishWorkshopMapLineDrag()
+    finishWorkshopPendingLineDrag()
     cancelLineDeviceDrag()
     cancelLineDevicePoolMove()
+    finishComposerLayoutPanelDrag()
     stopPointMonitor()
     disposeComposerPreview()
     disposeModelPreview({ revokeObjectUrl: true })
@@ -4485,6 +4857,88 @@ function getLineLayout(line) {
     line.layout = layout
     line.layout_json = JSON.stringify(layout)
     return layout
+}
+
+function stableSnapshotValue(value) {
+    if (Array.isArray(value)) return value.map(stableSnapshotValue)
+    if (!value || typeof value !== 'object') return value
+    return Object.fromEntries(
+        Object.keys(value).sort().map(key => [key, stableSnapshotValue(value[key])])
+    )
+}
+
+function snapshotJson(value) {
+    return JSON.stringify(stableSnapshotValue(value))
+}
+
+function isLinePlacementPending(line) {
+    return !!line && getLineLayout(line).placementPending === true
+}
+
+function lineLayoutSnapshot(line) {
+    return snapshotJson(normalizeLineLayout(getLineLayout(line)))
+}
+
+function linePlacementSnapshot(line) {
+    const layout = normalizeLineLayout(getLineLayout(line))
+    return snapshotJson({
+        placementPending: layout.placementPending,
+        transform: layout.transform
+    })
+}
+
+function deviceLayoutSnapshot(device) {
+    const config = parseInstanceConfig(device?.instance_config)
+    const lineIds = [
+        device?.line_id,
+        config.laneLineId,
+        config.railLineId
+    ].filter(Boolean).map(String)
+    return {
+        lineIds: [...new Set(lineIds)].sort(),
+        serialized: snapshotJson({
+            id: device?.id || '',
+            line_id: device?.line_id || '',
+            pos_x: numberOrDefault(device?.pos_x, 0),
+            pos_y: numberOrDefault(device?.pos_y, 0),
+            pos_z: numberOrDefault(device?.pos_z, 0),
+            rotation_y: numberOrDefault(device?.rotation_y, 0),
+            scale: numberOrDefault(device?.scale, 1),
+            coordinate_space: device?.coordinate_space || '',
+            instance_config: config
+        })
+    }
+}
+
+function lineHasUnsavedDeviceLayout(line) {
+    if (!line?.id) return false
+    const lineId = String(line.id)
+    const currentSnapshots = Object.fromEntries(devices.value.map(device => [device.id, deviceLayoutSnapshot(device)]))
+    const candidateIds = new Set()
+    Object.entries(currentSnapshots).forEach(([deviceId, snapshot]) => {
+        if (snapshot.lineIds.includes(lineId)) candidateIds.add(deviceId)
+    })
+    Object.entries(savedDeviceLayoutSnapshots.value).forEach(([deviceId, snapshot]) => {
+        if (snapshot?.lineIds?.includes(lineId)) candidateIds.add(deviceId)
+    })
+    return [...candidateIds].some(deviceId => (
+        currentSnapshots[deviceId]?.serialized !== savedDeviceLayoutSnapshots.value[deviceId]?.serialized
+    ))
+}
+
+function lineHasUnsavedLayout(line) {
+    if (!line?.id) return false
+    return lineLayoutSnapshot(line) !== savedLineLayoutSnapshots.value[line.id]
+        || lineHasUnsavedDeviceLayout(line)
+}
+
+const dirtyLineIds = computed(() => lines.value.filter(lineHasUnsavedLayout).map(line => line.id))
+const lineLayoutDirty = computed(() => lineHasUnsavedLayout(selectedLineEditor.value))
+
+function handleUnsavedCanvasBeforeUnload(event) {
+    if (!dirtyLineIds.value.length) return
+    event.preventDefault()
+    event.returnValue = ''
 }
 
 function syncLineLayout(line, layout) {
@@ -4671,6 +5125,17 @@ async function saveSelectedLineLayout() {
     } finally {
         lineLayoutSaving.value = false
     }
+}
+
+async function resetSelectedLineLayout() {
+    const selectedId = selectedLineEditor.value?.id || ''
+    finishLinePreviewDrag()
+    cancelLineDeviceDrag()
+    await Promise.all([loadLines(), loadDevices()])
+    if (selectedId && lines.value.some(line => line.id === selectedId)) {
+        selectedLineEditorId.value = selectedId
+    }
+    await reloadSavedNativeScenePreview('lines')
 }
 
 function getLineBaseZ(lineId) {
@@ -5379,14 +5844,31 @@ const selectedWorkshopMapLines = computed(() => sortByOrder(
     lines.value.filter(line => line.workshop_id === selectedWorkshopEditor.value?.id)
 ))
 
+const placedWorkshopMapLines = computed(() => (
+    selectedWorkshopMapLines.value.filter(line => !isLinePlacementPending(line))
+))
+
+const pendingWorkshopMapLines = computed(() => (
+    selectedWorkshopMapLines.value.filter(isLinePlacementPending)
+))
+
+const activePendingWorkshopMapLine = computed(() => (
+    pendingWorkshopMapLines.value.find(line => line.id === workshopMapPendingDragLineId.value)
+    || null
+))
+
+const workshopMapDirty = computed(() => selectedWorkshopMapLines.value.some(line => (
+    linePlacementSnapshot(line) !== savedLinePlacementSnapshots.value[line.id]
+)))
+
 const selectedWorkshopMapLine = computed(() => (
-    selectedWorkshopMapLines.value.find(line => line.id === workshopMapSelectedLineId.value)
-    || selectedWorkshopMapLines.value[0]
+    placedWorkshopMapLines.value.find(line => line.id === workshopMapSelectedLineId.value)
+    || placedWorkshopMapLines.value[0]
     || null
 ))
 
 function ensureWorkshopMapLineSelection() {
-    const available = selectedWorkshopMapLines.value
+    const available = placedWorkshopMapLines.value
     if (!available.some(line => line.id === workshopMapSelectedLineId.value)) {
         workshopMapSelectedLineId.value = available[0]?.id || ''
     }
@@ -5452,7 +5934,7 @@ function workshopMapTrackStyle(track, line) {
 
 function workshopMapLineOutside(line) {
     const workshop = selectedWorkshopEditor.value
-    if (!workshop) return false
+    if (!workshop || isLinePlacementPending(line)) return false
     const size = getWorkshopLayout(workshop).size
     const transform = getLineLayout(line).transform
     const bounds = workshopLineRotatedBounds(line)
@@ -5475,7 +5957,7 @@ const selectedWorkshopMapMetrics = computed(() => {
         top: centerZ - bounds.depth / 2 + numberOrDefault(size.depth, 80) / 2,
         bottom: numberOrDefault(size.depth, 80) / 2 - centerZ - bounds.depth / 2
     }
-    const nearest = selectedWorkshopMapLines.value
+    const nearest = placedWorkshopMapLines.value
         .filter(item => item.id !== line.id)
         .map(item => {
             const otherTransform = getLineLayout(item).transform
@@ -5492,13 +5974,143 @@ const selectedWorkshopMapMetrics = computed(() => {
 })
 
 function selectWorkshopMapLine(line) {
-    if (!line?.id) return
+    if (!line?.id || isLinePlacementPending(line)) return
     workshopMapSelectedLineId.value = line.id
     selectedLineEditorId.value = line.id
 }
 
+function finishWorkshopPendingLineDrag() {
+    const state = workshopMapPendingDragState
+    workshopMapPendingDragState = null
+    workshopMapPendingDragLineId.value = ''
+    workshopMapPendingDropReady.value = false
+    if (workshopMapPendingGhostFrame) cancelAnimationFrame(workshopMapPendingGhostFrame)
+    workshopMapPendingGhostFrame = 0
+    window.removeEventListener('pointermove', moveWorkshopPendingLineDrag)
+    window.removeEventListener('pointerup', endWorkshopPendingLineDrag)
+    window.removeEventListener('pointercancel', finishWorkshopPendingLineDrag)
+    document.body.classList.remove('workshop-pending-line-dragging')
+    if (state?.captureTarget?.hasPointerCapture?.(state.pointerId)) {
+        state.captureTarget.releasePointerCapture(state.pointerId)
+    }
+    return state
+}
+
+function updateWorkshopPendingLineGhost(clientX, clientY) {
+    workshopMapPendingGhostPosition = { x: clientX, y: clientY }
+    if (workshopMapPendingGhostFrame) return
+    workshopMapPendingGhostFrame = requestAnimationFrame(() => {
+        workshopMapPendingGhostFrame = 0
+        const ghost = workshopMapPendingGhostRef.value
+        if (!ghost) return
+        const { x, y } = workshopMapPendingGhostPosition
+        ghost.style.transform = `translate3d(${Math.round(x + 14)}px, ${Math.round(y + 14)}px, 0)`
+    })
+}
+
+function isWorkshopPendingLineDropPoint(clientX, clientY) {
+    const stage = workshopMapStageRef.value
+    if (!stage || !Number.isFinite(clientX) || !Number.isFinite(clientY)) return false
+    const rect = stage.getBoundingClientRect()
+    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return false
+    const hitTarget = document.elementFromPoint(clientX, clientY)
+    return !hitTarget?.closest?.('.workshop-line-placement-dock')
+}
+
+function moveWorkshopPendingLineDrag(event) {
+    const state = workshopMapPendingDragState
+    if (!state || event.pointerId !== state.pointerId) return
+    const distance = Math.hypot(event.clientX - state.startClientX, event.clientY - state.startClientY)
+    if (distance >= 8) state.moved = true
+    workshopMapPendingDropReady.value = state.moved && isWorkshopPendingLineDropPoint(event.clientX, event.clientY)
+    updateWorkshopPendingLineGhost(event.clientX, event.clientY)
+    event.preventDefault()
+}
+
+function placePendingWorkshopMapLine(lineId, clientX, clientY) {
+    const line = pendingWorkshopMapLines.value.find(item => item.id === lineId)
+    const stage = workshopMapStageRef.value
+    const workshop = selectedWorkshopEditor.value
+    if (!line || !stage || !workshop) return false
+
+    const rect = stage.getBoundingClientRect()
+    const workshopSize = getWorkshopLayout(workshop).size
+    const workshopWidth = Math.max(10, numberOrDefault(workshopSize.width, 100))
+    const workshopDepth = Math.max(10, numberOrDefault(workshopSize.depth, 80))
+    const bounds = workshopLineRotatedBounds(line)
+    if (bounds.width > workshopWidth || bounds.depth > workshopDepth) {
+        alert(
+            `「${line.name}」占地 ${roundLineLayoutValue(bounds.width, 0.1)} × ${roundLineLayoutValue(bounds.depth, 0.1)} 米，超过当前车间边界。请先缩短产线结构或扩大车间。`,
+            { title: '暂时无法放置', type: 'danger' }
+        )
+        return false
+    }
+
+    const pointerX = Number.isFinite(clientX) ? clientX : rect.left + rect.width / 2
+    const pointerY = Number.isFinite(clientY) ? clientY : rect.top + rect.height / 2
+    const rawX = ((pointerX - rect.left) / Math.max(1, rect.width) - 0.5) * workshopWidth
+    const rawZ = ((pointerY - rect.top) / Math.max(1, rect.height) - 0.5) * workshopDepth
+    const limitX = Math.max(0, (workshopWidth - bounds.width) / 2)
+    const limitZ = Math.max(0, (workshopDepth - bounds.depth) / 2)
+    const layout = getLineLayout(line)
+    layout.transform.x = roundLineLayoutValue(Math.min(limitX, Math.max(-limitX, rawX)), 0.5)
+    layout.transform.z = roundLineLayoutValue(Math.min(limitZ, Math.max(-limitZ, rawZ)), 0.5)
+    layout.placementPending = false
+    touchLineLayout(line)
+    workshopMapPlacementHintLineId.value = ''
+    selectWorkshopMapLine(line)
+    scheduleNativeScenePreview({ source: 'spatial', includeLayout: true })
+    return true
+}
+
+function endWorkshopPendingLineDrag(event) {
+    const state = workshopMapPendingDragState
+    if (!state || event.pointerId !== state.pointerId) return
+    const canDrop = state.moved && isWorkshopPendingLineDropPoint(event.clientX, event.clientY)
+    const lineId = state.lineId
+    const clientX = event.clientX
+    const clientY = event.clientY
+    finishWorkshopPendingLineDrag()
+    if (canDrop) placePendingWorkshopMapLine(lineId, clientX, clientY)
+}
+
+function startWorkshopPendingLineDrag(event, line) {
+    if (event.button !== 0 || !line?.id || !isLinePlacementPending(line)) return
+    finishWorkshopPendingLineDrag()
+    event.preventDefault()
+    event.stopPropagation()
+    const captureTarget = event.currentTarget
+    workshopMapPendingDragState = {
+        lineId: line.id,
+        pointerId: event.pointerId,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        moved: false,
+        captureTarget
+    }
+    workshopMapPendingDragLineId.value = line.id
+    workshopMapPlacementHintLineId.value = line.id
+    workshopMapPendingDropReady.value = false
+    document.body.classList.add('workshop-pending-line-dragging')
+    captureTarget?.setPointerCapture?.(event.pointerId)
+    window.addEventListener('pointermove', moveWorkshopPendingLineDrag, { passive: false })
+    window.addEventListener('pointerup', endWorkshopPendingLineDrag)
+    window.addEventListener('pointercancel', finishWorkshopPendingLineDrag)
+    updateWorkshopPendingLineGhost(event.clientX, event.clientY)
+}
+
+async function openLinePlacement(line) {
+    if (!line?.id || !line.workshop_id) return
+    selectedWorkshopEditorId.value = line.workshop_id
+    workshopMapPlacementHintLineId.value = line.id
+    selectAdminTab('workshops')
+    selectWorkshopManagementStep('layout')
+    await nextTick()
+    adminContentRef.value?.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
 function previewWorkshopMapLine(line = selectedWorkshopMapLine.value) {
-    if (!line) return
+    if (!line || isLinePlacementPending(line)) return
     touchLineLayout(line)
     scheduleNativeScenePreview({ source: 'spatial', includeLayout: true })
 }
@@ -5530,7 +6142,7 @@ function finishWorkshopMapLineDrag() {
 }
 
 function startWorkshopMapLineDrag(event, line) {
-    if (event.button !== 0 || !line) return
+    if (event.button !== 0 || !line || isLinePlacementPending(line)) return
     const stage = workshopMapStageRef.value
     const workshop = selectedWorkshopEditor.value
     if (!stage || !workshop) return
@@ -5560,7 +6172,7 @@ function startWorkshopMapLineDrag(event, line) {
 
 async function saveWorkshopMapLayout() {
     const workshop = selectedWorkshopEditor.value
-    const targetLines = selectedWorkshopMapLines.value
+    const targetLines = placedWorkshopMapLines.value
     if (!workshop || !targetLines.length) return
     workshopMapSaving.value = true
     try {
@@ -5588,6 +6200,8 @@ async function saveWorkshopMapLayout() {
 
 async function resetWorkshopMapLayout() {
     finishWorkshopMapLineDrag()
+    finishWorkshopPendingLineDrag()
+    workshopMapPlacementHintLineId.value = ''
     await loadLines()
     ensureWorkshopMapLineSelection()
     await reloadSavedNativeScenePreview('spatial')
@@ -5617,6 +6231,32 @@ const mainTabs = [
     { key: 'platform', label: '组件配置', icon: 'platform' },
     { key: 'settings', label: '系统设置', icon: 'settings' }
 ]
+
+const adminSetupFlow = [
+    { key: 'system', label: '系统', tab: 'settings', settingsSubpage: 'database', description: '确认数据库、运行服务与数据通路' },
+    { key: 'workshop', label: '车间', tab: 'workshops', description: '建立车间并确定空间范围' },
+    { key: 'line', label: '产线', tab: 'lines', description: '创建产线、设备线与导轨结构' },
+    { key: 'model', label: '模型', tab: 'models', description: '导入并验收设备 3D 模型' },
+    { key: 'device', label: '设备', tab: 'devices', description: '创建设备并关联产线和模型' },
+    { key: 'composer', label: '编排', tab: 'composer', description: '调整设备位置、朝向与缩放' },
+    { key: 'points', label: '点位', tab: 'points', description: '配置 PLC 点位名称、地址与周期' },
+    { key: 'screen', label: '画面', tab: 'platform', platformSubpage: 'designer', description: '设计组件、绑定数据并发布画面' },
+    { key: 'verify', label: '验收', tab: 'point-monitor', description: '检查实时值、数据质量与连接状态' }
+]
+
+async function openAdminSetupStep(step) {
+    if (!step?.tab) return
+    if (factoryTabKeys.includes(step.tab)) isFactoryMenuOpen.value = true
+    if (dataTabKeys.includes(step.tab)) isDataMenuOpen.value = true
+    if (step.settingsSubpage) settingsSubpage.value = step.settingsSubpage
+    if (step.platformSubpage) platformSubpage.value = step.platformSubpage
+    selectAdminTab(step.tab)
+    await nextTick()
+    adminContentRef.value?.scrollTo({ top: 0, behavior: 'smooth' })
+    if (step.tab === 'platform' && step.platformSubpage === 'designer') {
+        requestAnimationFrame(() => window.dispatchEvent(new Event('resize')))
+    }
+}
 </script>
 
 <template>
@@ -5684,6 +6324,18 @@ const mainTabs = [
                 <button
                     type="button"
                     class="unity-window-action"
+                    title="刷新页面"
+                    aria-label="刷新页面"
+                    @click="reloadAdminPage"
+                >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M19 8a7.5 7.5 0 1 0 .8 6.8" />
+                        <path d="M19 4v4h-4" />
+                    </svg>
+                </button>
+                <button
+                    type="button"
+                    class="unity-window-action"
                     title="最小化"
                     aria-label="最小化窗口"
                     @click="requestUnityHostAction('minimize')"
@@ -5732,6 +6384,26 @@ const mainTabs = [
                 </span>
                 <h1>数字孪生后台配置管理</h1>
             </div>
+            <nav class="admin-setup-flow" aria-label="推荐配置顺序">
+                <span class="admin-setup-flow-title">配置顺序</span>
+                <div class="admin-setup-flow-track">
+                    <template v-for="(step, index) in adminSetupFlow" :key="step.key">
+                        <button
+                            type="button"
+                            class="admin-setup-step"
+                            :class="{ active: activeTab === step.tab }"
+                            :aria-current="activeTab === step.tab ? 'step' : undefined"
+                            :aria-label="`第 ${index + 1} 步：${step.label}，${step.description}`"
+                            :title="`${index + 1}. ${step.label} · ${step.description}`"
+                            @click="openAdminSetupStep(step)"
+                        >
+                            <span class="admin-setup-step-index">{{ index + 1 }}</span>
+                            <span class="admin-setup-step-label">{{ step.label }}</span>
+                        </button>
+                        <span v-if="index < adminSetupFlow.length - 1" class="admin-setup-flow-connector" aria-hidden="true"></span>
+                    </template>
+                </div>
+            </nav>
             <div class="admin-connection-strip" aria-label="系统连接状态" aria-live="polite">
                 <span
                     class="admin-connection-pill"
@@ -5897,13 +6569,13 @@ const mainTabs = [
                         <div class="composer-section">
                             <h3>产线选择</h3>
                             <select v-model="selectedComposerLineId" class="input composer-select">
-                                <option v-for="line in lines" :key="line.id" :value="line.id">
+                                <option v-for="line in placedLines" :key="line.id" :value="line.id">
                                     {{ workshops.find(w => w.id === line.workshop_id)?.name || line.workshop_id }} / {{ line.name }}
                                 </option>
                             </select>
                             <div class="composer-line-list">
                                 <button
-                                    v-for="line in lines"
+                                    v-for="line in placedLines"
                                     :key="line.id"
                                     class="line-pill"
                                     :class="{ active: selectedComposerLineId === line.id }"
@@ -5928,10 +6600,12 @@ const mainTabs = [
                                     :key="device.id"
                                     class="device-pill"
                                     :class="{ active: selectedComposerDeviceId === device.id }"
+                                    :aria-pressed="selectedComposerDeviceId === device.id"
+                                    :title="selectedComposerDeviceId === device.id ? '点击取消选中' : '选择并编辑设备'"
                                     @click="selectComposerDevice(device.id)"
                                 >
                                     <strong>{{ device.name }}</strong>
-                                    <span>X {{ device.pos_x }} / Z {{ device.pos_z }}</span>
+                                    <span>X {{ device.pos_x }} / Z {{ device.pos_z }} <i v-if="selectedComposerDeviceId === device.id" class="device-pill-cancel">×</i></span>
                                 </button>
                             </div>
                             <div v-else class="composer-empty">当前产线还没有设备</div>
@@ -5945,16 +6619,23 @@ const mainTabs = [
                                     :key="device.id"
                                     class="device-pill"
                                     :class="{ active: selectedComposerDeviceId === device.id }"
+                                    :aria-pressed="selectedComposerDeviceId === device.id"
+                                    :title="selectedComposerDeviceId === device.id ? '点击取消选中' : '选择并编辑设备'"
                                     @click="selectComposerDevice(device.id)"
                                 >
                                     <strong>{{ device.name }}</strong>
-                                    <span>X {{ device.pos_x }} / Z {{ device.pos_z }}</span>
+                                    <span>X {{ device.pos_x }} / Z {{ device.pos_z }} <i v-if="selectedComposerDeviceId === device.id" class="device-pill-cancel">×</i></span>
                                 </button>
                             </div>
                         </div>
 
-                        <div class="composer-section composer-form" v-if="composerDraft.id">
-                            <h3>设备布局</h3>
+                        <Teleport defer to="#composer-preview-floating-host">
+                        <div ref="composerLayoutPanelRef" class="composer-section composer-form composer-device-layout-float" v-if="composerDraft.id" :style="composerLayoutPanelStyle" @pointerdown.stop>
+                            <div class="composer-device-layout-float-header" @pointerdown="startComposerLayoutPanelDrag">
+                                <div><span>设备布局</span><strong>{{ composerDraft.name }}</strong></div>
+                                <button type="button" title="取消选中" aria-label="取消选中设备" @pointerdown.stop @click.stop="clearComposerDeviceSelection">×</button>
+                            </div>
+                            <div class="composer-device-layout-float-body">
                             <label>设备名称<input v-model="composerDraft.name" class="input" /></label>
                             <label>{{ isAuxiliaryDeviceConfig(composerDraft) ? '参考产线' : '所属产线' }}
                                 <select v-model="composerDraft.line_id" class="input">
@@ -6033,10 +6714,12 @@ const mainTabs = [
                                 {{ composerSaving ? '保存中...' : '保存设备布局' }}
                             </button>
                             <small class="native-live-help">位置、朝向、缩放、镜像和模型切换会先实时显示在 Unity；点击保存后才写入数据库。</small>
+                            </div>
                         </div>
+                        </Teleport>
                     </section>
 
-                    <section class="composer-preview">
+                    <section ref="composerPreviewShellRef" class="composer-preview">
                         <div class="composer-preview-toolbar">
                             <div>
                                 <strong>{{ selectedComposerWorkshop?.name || '未选择车间' }}</strong>
@@ -6046,7 +6729,7 @@ const mainTabs = [
                                 <button class="btn btn-sm" :class="{ active: composerPreviewMode === 'factory' }" @click="composerPreviewMode = 'factory'">总览</button>
                                 <button class="btn btn-sm" :class="{ active: composerPreviewMode === 'workshop' }" @click="composerPreviewMode = 'workshop'">车间</button>
                                 <button class="btn btn-sm" :class="{ active: composerPreviewMode === 'line' }" @click="composerPreviewMode = 'line'">产线</button>
-                                <button class="btn btn-sm" :class="{ active: composerPreviewMode === 'device' }" @click="composerPreviewMode = 'device'">设备</button>
+                                <button class="btn btn-sm" :class="{ active: composerPreviewMode === 'device' }" :disabled="!selectedComposerDeviceId" @click="composerPreviewMode = 'device'">设备</button>
                             </div>
                             <div class="preview-camera-buttons">
                                 <button class="btn btn-sm" type="button" title="适配当前视图" @click="fitComposerPreview">适配</button>
@@ -6060,6 +6743,7 @@ const mainTabs = [
                             </div>
                         </div>
                         <div ref="composerPreviewRef" class="composer-preview-stage"></div>
+                        <div id="composer-preview-floating-host" class="composer-preview-floating-host"></div>
                         <div class="composer-preview-footer">
                             <span>{{ composerPreviewStatus }} · Web 操作辅助</span>
                         </div>
@@ -6125,7 +6809,7 @@ const mainTabs = [
                         </table>
                     </template>
 
-                    <template v-else-if="workshopManagementStep === 'space'">
+                    <template v-else-if="workshopManagementStep === 'space' && selectedWorkshopEditor">
                         <div class="workshop-step-context">
                             <button type="button" class="workshop-back-button" title="返回车间列表" @click="selectWorkshopManagementStep('list')">
                                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
@@ -6168,7 +6852,7 @@ const mainTabs = [
                         </section>
                     </template>
 
-                    <template v-else>
+                    <template v-else-if="selectedWorkshopEditor">
                         <div class="workshop-step-context">
                             <button type="button" class="workshop-back-button" title="返回空间设置" @click="selectWorkshopManagementStep('space')">
                                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
@@ -6178,7 +6862,11 @@ const mainTabs = [
                                     <option v-for="workshop in workshops" :key="workshop.id" :value="workshop.id">{{ workshop.name }}</option>
                                 </select>
                             </label>
-                            <span>画布 {{ getWorkshopLayout(selectedWorkshopEditor).size.width }} × {{ getWorkshopLayout(selectedWorkshopEditor).size.depth }} 米 · {{ selectedWorkshopMapLines.length }} 条产线</span>
+                            <span>
+                                画布 {{ getWorkshopLayout(selectedWorkshopEditor).size.width }} × {{ getWorkshopLayout(selectedWorkshopEditor).size.depth }} 米
+                                · {{ placedWorkshopMapLines.length }} 条已放置
+                                <template v-if="pendingWorkshopMapLines.length"> · {{ pendingWorkshopMapLines.length }} 条待放置</template>
+                            </span>
                         </div>
 
                         <section class="workshop-map-shell">
@@ -6188,9 +6876,23 @@ const mainTabs = [
                                     <p>每个产线块按真实长度与宽度同比例绘制。拖动即可调整 X / Z，自动以 0.5 米吸附并限制在车间边界内。</p>
                                 </div>
                                 <div class="line-native-actions">
-                                    <button type="button" class="btn" :disabled="workshopMapSaving" @click="resetWorkshopMapLayout">撤销未保存布局</button>
-                                    <button type="button" class="btn btn-primary" :disabled="workshopMapSaving || !selectedWorkshopMapLines.length" @click="saveWorkshopMapLayout">
+                                    <button type="button" class="btn" :disabled="workshopMapSaving || !workshopMapDirty" @click="resetWorkshopMapLayout">放弃修改</button>
+                                    <button type="button" class="btn btn-primary" :disabled="workshopMapSaving || !workshopMapDirty || !placedWorkshopMapLines.length" @click="saveWorkshopMapLayout">
                                         {{ workshopMapSaving ? '保存中...' : '保存全部产线位置' }}
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div v-if="workshopMapDirty" class="canvas-save-reminder" role="status">
+                                <span class="canvas-save-reminder-dot"></span>
+                                <div>
+                                    <strong>产线布局尚未保存</strong>
+                                    <span>刚才的放置或拖动只在当前画布中生效，请保存后再离开。</span>
+                                </div>
+                                <div class="canvas-save-reminder-actions">
+                                    <button type="button" class="btn btn-sm" :disabled="workshopMapSaving" @click="resetWorkshopMapLayout">放弃修改</button>
+                                    <button type="button" class="btn btn-primary btn-sm" :disabled="workshopMapSaving" @click="saveWorkshopMapLayout">
+                                        {{ workshopMapSaving ? '保存中...' : '立即保存布局' }}
                                     </button>
                                 </div>
                             </div>
@@ -6199,12 +6901,19 @@ const mainTabs = [
                                 <div class="workshop-map-board">
                                     <div class="workshop-map-dimension workshop-map-dimension-x">X 方向 · {{ getWorkshopLayout(selectedWorkshopEditor).size.width }} 米</div>
                                     <div class="workshop-map-dimension workshop-map-dimension-z">Z 方向 · {{ getWorkshopLayout(selectedWorkshopEditor).size.depth }} 米</div>
-                                    <div ref="workshopMapStageRef" class="workshop-map-stage">
+                                    <div
+                                        ref="workshopMapStageRef"
+                                        class="workshop-map-stage"
+                                        :class="{
+                                            'pending-drag-active': workshopMapPendingDragLineId,
+                                            'pending-drop-active': workshopMapPendingDropReady
+                                        }"
+                                    >
                                         <span class="workshop-map-axis workshop-map-axis-x"></span>
                                         <span class="workshop-map-axis workshop-map-axis-z"></span>
                                         <span class="workshop-map-origin">0, 0</span>
                                         <article
-                                            v-for="line in selectedWorkshopMapLines"
+                                            v-for="line in placedWorkshopMapLines"
                                             :key="line.id"
                                             class="workshop-map-line"
                                             :class="{
@@ -6230,10 +6939,40 @@ const mainTabs = [
                                                 :style="workshopMapTrackStyle(track, line)"
                                             ></span>
                                         </article>
-                                        <div v-if="!selectedWorkshopMapLines.length" class="workshop-map-empty">
-                                            <strong>这个车间还没有产线</strong>
-                                            <span>先到产线管理新增产线，再返回这里安排空间位置。</span>
-                                            <button type="button" class="btn btn-primary" @click="selectAdminTab('lines')">前往产线管理</button>
+                                        <aside v-if="pendingWorkshopMapLines.length" class="workshop-line-placement-dock" @click.stop>
+                                            <header>
+                                                <div>
+                                                    <strong>待放置产线</strong>
+                                                    <span>按住卡片拖入画布</span>
+                                                </div>
+                                                <b>{{ pendingWorkshopMapLines.length }}</b>
+                                            </header>
+                                            <div class="workshop-line-placement-list">
+                                                <div
+                                                    v-for="line in pendingWorkshopMapLines"
+                                                    :key="line.id"
+                                                    class="workshop-line-placement-card"
+                                                    :class="{
+                                                        attention: workshopMapPlacementHintLineId === line.id,
+                                                        dragging: workshopMapPendingDragLineId === line.id
+                                                    }"
+                                                    :title="`拖动「${line.name}」到画布中的目标位置`"
+                                                    @pointerdown="startWorkshopPendingLineDrag($event, line)"
+                                                    @lostpointercapture="finishWorkshopPendingLineDrag"
+                                                >
+                                                    <span class="workshop-line-placement-handle">⠿</span>
+                                                    <span class="workshop-line-placement-copy">
+                                                        <strong>{{ line.name }}</strong>
+                                                        <small>{{ workshopLineFootprint(line).length }} × {{ workshopLineFootprint(line).width }} 米</small>
+                                                    </span>
+                                                    <em>拖入</em>
+                                                </div>
+                                            </div>
+                                        </aside>
+                                        <div v-if="!placedWorkshopMapLines.length" class="workshop-map-empty">
+                                            <strong>{{ pendingWorkshopMapLines.length ? '把待放置产线拖进来' : '这个车间还没有产线' }}</strong>
+                                            <span>{{ pendingWorkshopMapLines.length ? '从右上角工具浮标拖动卡片，松手后自动限制在车间边界内。' : '先到产线管理新增产线，再返回这里安排空间位置。' }}</span>
+                                            <button v-if="!pendingWorkshopMapLines.length" type="button" class="btn btn-primary" @click="selectAdminTab('lines')">前往产线管理</button>
                                         </div>
                                     </div>
                                     <div class="workshop-map-legend">
@@ -6247,7 +6986,7 @@ const mainTabs = [
                                     <template v-if="selectedWorkshopMapLine">
                                         <label class="workshop-map-line-select">当前产线
                                             <select v-model="workshopMapSelectedLineId" class="input">
-                                                <option v-for="line in selectedWorkshopMapLines" :key="line.id" :value="line.id">{{ line.name }}</option>
+                                                <option v-for="line in placedWorkshopMapLines" :key="line.id" :value="line.id">{{ line.name }}</option>
                                             </select>
                                         </label>
                                         <div class="workshop-map-footprint-card">
@@ -6282,6 +7021,7 @@ const mainTabs = [
                             </div>
                         </section>
                     </template>
+                    <div v-else class="workshop-loading-state">正在加载车间空间与产线布局...</div>
                 </div>
 
                 <!-- ======== 产线管理 ======== -->
@@ -6293,17 +7033,33 @@ const mainTabs = [
                                 <p class="desc">拖动设备线、导轨和设备时会实时改变 Unity 场景；保存后固化到数据库。</p>
                             </div>
                             <div class="line-native-actions">
-                                <button type="button" class="btn" @click="restoreSavedNativeScenePreview">恢复已保存布局</button>
+                                <button type="button" class="btn" :disabled="!lineLayoutDirty || lineLayoutSaving" @click="resetSelectedLineLayout">放弃画布修改</button>
                                 <button class="btn btn-primary" @click="saveSelectedLineLayout" :disabled="lineLayoutSaving || !selectedLineEditor">
                                     {{ lineLayoutSaving ? '保存中...' : '保存产线结构' }}
                                 </button>
                             </div>
                         </div>
 
-                        <div class="line-planner-steps">
-                            <span class="active">1 选择产线</span>
-                            <span>2 实时调整 Unity 设备线 / 导轨</span>
-                            <span>3 保存并固化现场布局</span>
+                        <div class="line-planner-guidance">
+                            <div class="line-planner-steps">
+                                <span class="active">1 选择产线</span>
+                                <span>2 实时调整 Unity 设备线 / 导轨</span>
+                                <span>3 保存并固化现场布局</span>
+                            </div>
+
+                            <div v-if="lineLayoutDirty" class="canvas-save-reminder line-canvas-save-reminder" role="status">
+                                <span class="canvas-save-reminder-dot"></span>
+                                <div>
+                                    <strong>产线结构尚未保存</strong>
+                                    <span>轨道、设备线或设备位置已经改变；实时预览不等于写入数据库。</span>
+                                </div>
+                                <div class="canvas-save-reminder-actions">
+                                    <button type="button" class="btn btn-sm" :disabled="lineLayoutSaving" @click="resetSelectedLineLayout">放弃修改</button>
+                                    <button type="button" class="btn btn-primary btn-sm" :disabled="lineLayoutSaving" @click="saveSelectedLineLayout">
+                                        {{ lineLayoutSaving ? '保存中...' : '立即保存产线' }}
+                                    </button>
+                                </div>
+                            </div>
                         </div>
 
                         <div class="line-planner-layout" :class="{ 'editor-collapsed': isLinePlannerEditorCollapsed }">
@@ -6338,7 +7094,11 @@ const mainTabs = [
                                         >
                                             <button type="button" class="line-card-select" @click="selectLineEditor(line.id)">
                                                 <strong>{{ line.name }}</strong>
-                                                <span>{{ workshops.find(w => w.id === line.workshop_id)?.name || line.workshop_id }} · {{ (lineMemberDevicesByLine[line.id] || []).length }} 台设备</span>
+                                                <span>
+                                                    {{ workshops.find(w => w.id === line.workshop_id)?.name || line.workshop_id }} · {{ (lineMemberDevicesByLine[line.id] || []).length }} 台设备
+                                                    <em v-if="isLinePlacementPending(line)" class="line-card-status pending">待布局</em>
+                                                    <em v-else-if="dirtyLineIds.includes(line.id)" class="line-card-status dirty">未保存</em>
+                                                </span>
                                             </button>
                                             <div class="line-card-fields" v-if="selectedLineEditorId === line.id">
                                                 <input v-model="line.name" class="input input-sm" placeholder="产线名称" />
@@ -6354,16 +7114,33 @@ const mainTabs = [
 
                                 <div v-if="selectedLineEditor" class="line-structure-editor">
                                     <div class="line-structure-section">
-                                        <div class="line-structure-title">
-                                            <strong>产线在车间中的位置</strong>
-                                            <span class="line-flow-hint">这些值是相对所属车间的局部坐标；车间移动时无需逐台修改设备。</span>
-                                        </div>
-                                        <div class="line-transform-grid">
-                                            <label>相对车间 X<input v-model.number="selectedLineLayout.transform.x" type="number" step="0.5" class="input input-sm" /></label>
-                                            <label>相对车间 Y<input v-model.number="selectedLineLayout.transform.y" type="number" step="0.1" class="input input-sm" /></label>
-                                            <label>相对车间 Z<input v-model.number="selectedLineLayout.transform.z" type="number" step="0.5" class="input input-sm" /></label>
-                                            <label>相对车间朝向（°）<input v-model.number="selectedLineLayout.transform.rotationY" type="number" min="-180" max="180" step="1" class="input input-sm" /></label>
-                                        </div>
+                                        <button
+                                            v-if="isLinePlacementPending(selectedLineEditor)"
+                                            type="button"
+                                            class="line-placement-pending-card"
+                                            @click="openLinePlacement(selectedLineEditor)"
+                                        >
+                                            <span class="line-placement-pending-icon">
+                                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v10H4zM8 12h8M12 8v8" /></svg>
+                                            </span>
+                                            <span class="line-placement-pending-copy">
+                                                <strong>产线在车间中的位置：待定</strong>
+                                                <small>这是该车间的第二条或后续产线。请到车间布局画布中手动决定出生位置。</small>
+                                            </span>
+                                            <span class="line-placement-pending-action">前往放置 <b>→</b></span>
+                                        </button>
+                                        <template v-else>
+                                            <div class="line-structure-title">
+                                                <strong>产线在车间中的位置</strong>
+                                                <span class="line-flow-hint">这些值是相对所属车间的局部坐标；车间移动时无需逐台修改设备。</span>
+                                            </div>
+                                            <div class="line-transform-grid">
+                                                <label>相对车间 X<input v-model.number="selectedLineLayout.transform.x" type="number" step="0.5" class="input input-sm" /></label>
+                                                <label>相对车间 Y<input v-model.number="selectedLineLayout.transform.y" type="number" step="0.1" class="input input-sm" /></label>
+                                                <label>相对车间 Z<input v-model.number="selectedLineLayout.transform.z" type="number" step="0.5" class="input input-sm" /></label>
+                                                <label>相对车间朝向（°）<input v-model.number="selectedLineLayout.transform.rotationY" type="number" min="-180" max="180" step="1" class="input input-sm" /></label>
+                                            </div>
+                                        </template>
                                     </div>
                                     <div class="line-structure-section">
                                         <div class="line-structure-title">
@@ -6653,6 +7430,28 @@ const mainTabs = [
                                         <option v-for="tpl in platform.deviceTemplates || []" :key="tpl.id" :value="tpl.id">{{ tpl.name }}</option>
                                     </select>
                                 </label>
+                                <div v-if="!isAuxiliaryDeviceConfig(editingDevice)" class="form-section wide-form-section">
+                                    <div class="form-section-header">
+                                        <strong>设备逐层检查</strong>
+                                        <span>型号通常共用模型库配置；只有少数设备结构不同或不允许拆解时才需要覆盖。</span>
+                                    </div>
+                                    <label>配置策略
+                                        <select v-model="editingDeviceInspectionMode" class="input">
+                                            <option value="inherit">使用模型默认配置（推荐）</option>
+                                            <option value="disabled">仅此设备禁用逐层检查</option>
+                                            <option value="override">仅此设备使用自定义覆盖</option>
+                                        </select>
+                                    </label>
+                                    <template v-if="editingDeviceInspectionMode === 'override'">
+                                        <div class="device-inspection-override-toolbar">
+                                            <span>覆盖内容会与模型配置合并；数组字段会以本设备内容为准。</span>
+                                            <button class="btn btn-sm" type="button" @click="copyModelInspectionToDevice">复制当前模型配置</button>
+                                        </div>
+                                        <label class="wide-form-section">拆解检查覆盖 JSON
+                                            <textarea v-model="editingDeviceInspectionJson" class="input model-metadata" rows="8" spellcheck="false"></textarea>
+                                        </label>
+                                    </template>
+                                </div>
                                 <div class="form-section wide-form-section">
                                     <div class="form-section-header">
                                         <strong>PLC 连接配置</strong>
@@ -6913,6 +7712,7 @@ const mainTabs = [
                                 <div v-if="activePreviewModel" class="model-selection-actions">
                                     <div><span>当前模型</span><strong>{{ activePreviewModel.name || activePreviewModel.id }}</strong></div>
                                     <button class="btn" type="button" @click="selectModelLibraryStep('optimization')">优化与验收</button>
+                                    <button class="btn" type="button" @click="selectModelLibraryStep('inspection')">拆解检查</button>
                                     <button class="btn btn-primary" type="button" @click="selectModelLibraryStep('bindings')">部位绑定</button>
                                 </div>
                             </section>
@@ -7051,6 +7851,101 @@ const mainTabs = [
                                 </template>
                             </section>
 
+                            <section v-if="activePreviewModel" v-show="modelLibraryStep === 'inspection'" class="model-binding-editor model-library-step-panel model-inspection-editor">
+                                <div class="model-binding-header">
+                                    <div>
+                                        <h3>设备逐层检查配置</h3>
+                                        <p>这里定义实体、透明外壳、拆解部件和部件详情所需的数据；同型号设备默认复用，设备实例仍可覆盖。</p>
+                                    </div>
+                                    <button class="btn btn-primary" type="button" @click="saveModelInspection" :disabled="!canEditModelBindings || modelBindingSaving">
+                                        {{ modelBindingSaving ? '保存中...' : '保存拆解配置' }}
+                                    </button>
+                                </div>
+
+                                <template v-if="canEditModelBindings">
+                                    <div class="inspection-stage-toolbar">
+                                        <label class="inline-check"><input v-model="modelInspection.enabled" type="checkbox" /> 启用逐层设备检查</label>
+                                        <button type="button" :class="{ active: inspectionPreviewStage === 'solid' }" @click="applyInspectionPreviewStage('solid')">1 实体</button>
+                                        <button type="button" :class="{ active: inspectionPreviewStage === 'xray' }" @click="applyInspectionPreviewStage('xray')">2 透视</button>
+                                        <button type="button" :class="{ active: inspectionPreviewStage === 'exploded' }" @click="applyInspectionPreviewStage('exploded')">3 拆解</button>
+                                    </div>
+
+                                    <div class="model-inspection-settings">
+                                        <label>透明外壳浓度<input v-model.number="modelInspection.shell.opacity" type="range" min=".03" max=".8" step=".01" @input="applyInspectionPreviewStage('xray')" /><small>{{ Math.round(modelInspection.shell.opacity * 100) }}%</small></label>
+                                        <label>拆解动画（秒）<input v-model.number="modelInspection.animation_duration" type="number" min=".05" max="5" step=".05" class="input" /></label>
+                                        <label class="inline-check"><input v-model="modelInspection.shell.wireframe" type="checkbox" /> 透视阶段强调线框色</label>
+                                    </div>
+
+                                    <div class="inspection-config-card">
+                                        <div class="model-release-header"><strong>外壳节点</strong><span>只有这些节点会透明或隐藏，内部部件保持不透明</span></div>
+                                        <div class="inspection-node-picker">
+                                            <select v-model="inspectionShellNodePath" class="input">
+                                                <option value="">选择模型节点作为外壳</option>
+                                                <option v-for="node in filteredModelPreviewNodes" :key="'shell-' + node.path" :value="node.path">{{ formatModelNodeOption(node) }}</option>
+                                            </select>
+                                            <button class="btn" type="button" @click="addInspectionShellNode">加入外壳</button>
+                                        </div>
+                                        <div class="inspection-node-chips">
+                                            <button v-for="entry in inspectionShellEntries" :key="entry.key" type="button" @click="selectInspectionShellNode(entry)">
+                                                <span>{{ entry.name || entry.path }}</span><i @click.stop="removeInspectionShellNode(entry)">×</i>
+                                            </button>
+                                            <small v-if="!inspectionShellEntries.length">未指定时运行端会按 shell / housing / 外壳等名称尝试识别。</small>
+                                        </div>
+                                    </div>
+
+                                    <div class="inspection-camera-grid">
+                                        <div v-for="stage in [{key:'solid',label:'实体镜头'},{key:'xray',label:'透视镜头'},{key:'exploded',label:'拆解镜头'}]" :key="stage.key" class="inspection-config-card">
+                                            <div class="model-release-header"><strong>{{ stage.label }}</strong><span>{{ modelInspection[stage.key].view_id || '使用模型默认镜头' }}</span></div>
+                                            <label>低代码视角 ID<input v-model="modelInspection[stage.key].view_id" class="input" :placeholder="stage.key === 'solid' ? 'device_detail' : 'device_' + stage.key" /></label>
+                                            <div class="property-grid three">
+                                                <label>水平角<input v-model.number="modelInspection[stage.key].camera.yaw" type="number" class="input" /></label>
+                                                <label>俯仰角<input v-model.number="modelInspection[stage.key].camera.pitch" type="number" class="input" /></label>
+                                                <label>距离比例<input v-model.number="modelInspection[stage.key].camera.distance_scale" type="number" min=".1" max="10" step=".01" class="input" /></label>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div class="inspection-config-card">
+                                        <div class="model-release-header"><strong>关键部件</strong><span>拆解后可以点击，并把部件上下文交给右侧低代码组件</span></div>
+                                        <div class="model-binding-form inspection-part-form">
+                                            <label class="model-node-picker">模型节点
+                                                <select v-model="inspectionPartForm.node_path" class="input" @change="selectPreviewNode(inspectionPartForm.node_path)">
+                                                    <option value="">选择关键部件节点</option>
+                                                    <option v-for="node in filteredModelPreviewNodes" :key="'part-' + node.path" :value="node.path">{{ formatModelNodeOption(node) }}</option>
+                                                </select>
+                                            </label>
+                                            <label>部件 ID<input v-model="inspectionPartForm.id" class="input" placeholder="如 front_door" /></label>
+                                            <label>显示名称<input v-model="inspectionPartForm.name" class="input" placeholder="如 前门驱动组件" /></label>
+                                            <label>详情视角 ID<input v-model="inspectionPartForm.detail_view_id" class="input" placeholder="留空使用 device_part" /></label>
+                                            <label>拆解偏移 X<input v-model.number="inspectionPartForm.explode_x" type="number" step=".1" class="input" /></label>
+                                            <label>拆解偏移 Y<input v-model.number="inspectionPartForm.explode_y" type="number" step=".1" class="input" /></label>
+                                            <label>拆解偏移 Z<input v-model.number="inspectionPartForm.explode_z" type="number" step=".1" class="input" /></label>
+                                            <label class="wide-form-section">部件介绍<textarea v-model="inspectionPartForm.description" class="input" rows="2" placeholder="点击部件后显示在右侧详情中"></textarea></label>
+                                            <label class="wide-form-section">实时点位键<textarea v-model="inspectionPartForm.point_keys_text" class="input" rows="2" placeholder="motors.rear_fan_speed, analog.temperature"></textarea><small class="field-hint">使用“分组.字段”，多个用逗号或换行分隔；运行时会自动匹配当前设备点位。</small></label>
+                                            <div class="model-binding-actions">
+                                                <button class="btn btn-primary" type="button" @click="saveInspectionPartDraft">{{ selectedInspectionPartIndex >= 0 ? '更新部件' : '加入部件' }}</button>
+                                                <button class="btn" type="button" @click="resetInspectionPartForm">清空表单</button>
+                                            </div>
+                                        </div>
+
+                                        <table class="data-table model-binding-table">
+                                            <thead><tr><th>部件</th><th>节点</th><th>拆解偏移</th><th>点位键</th><th>操作</th></tr></thead>
+                                            <tbody>
+                                                <tr v-for="(part, index) in modelInspectionParts" :key="part.id" @click="selectPreviewNode(part.node_path)">
+                                                    <td><strong>{{ part.name }}</strong><small>{{ part.id }}</small></td>
+                                                    <td><code>{{ part.node_name || part.node_path }}</code></td>
+                                                    <td>{{ part.explode_offset.join(' / ') }}</td>
+                                                    <td>{{ (part.point_keys || []).join(', ') || '未绑定' }}</td>
+                                                    <td><button class="btn btn-sm" type="button" @click.stop="editInspectionPart(index)">编辑</button><button class="btn btn-danger btn-sm" type="button" @click.stop="removeInspectionPart(index)">删除</button></td>
+                                                </tr>
+                                                <tr v-if="!modelInspectionParts.length"><td colspan="5" style="text-align:center;color:#888">暂无关键部件；可先从右侧预览解析出的节点中选择。</td></tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </template>
+                                <div class="model-binding-status">{{ modelBindingStatus }}</div>
+                            </section>
+
                             <section v-if="activePreviewModel" v-show="modelLibraryStep === 'bindings'" class="model-binding-editor model-library-step-panel">
                                 <div class="model-binding-header">
                                     <div>
@@ -7161,7 +8056,7 @@ const mainTabs = [
                                     <strong>模型预览</strong>
                                     <span>{{ selectedModelFile ? '待上传模型' : selectedPreviewModelId || '未选择' }}</span>
                                 </div>
-                                <span class="model-preview-mode-badge">{{ modelLibraryStep === 'bindings' ? '绑定预览' : '模型预览' }}</span>
+                                <span class="model-preview-mode-badge">{{ modelLibraryStep === 'inspection' ? '拆解预览' : modelLibraryStep === 'bindings' ? '绑定预览' : '模型预览' }}</span>
                             </div>
                             <div ref="modelPreviewRef" class="model-preview-stage">
                                 <div v-if="!isModelPreviewActive" class="model-preview-empty">选择文件或点击模型列表</div>
@@ -7240,194 +8135,6 @@ const mainTabs = [
                             @apply-preset="applyNativeEnvironmentPreset"
                             @reset="resetNativeEnvironmentConfig"
                         />
-                    </div>
-
-                    <!-- ===== Unity 原生大屏组件 ===== -->
-                    <div v-show="platformSubpage === 'native-dashboard'" class="settings-section native-dashboard-settings secondary-page-panel">
-                        <div class="native-dashboard-heading">
-                            <div>
-                                <h3 class="section-title">Unity 原生大屏组件</h3>
-                                <p>调整总览左右栏、详情参数/状态栏和底部趋势。保存后通过 WebSocket 直接更新正在运行的 Unity，不重载模型。</p>
-                            </div>
-                            <div class="native-dashboard-actions">
-                                <button type="button" class="btn" @click="resetNativeDashboardConfig">恢复默认</button>
-                                <button type="button" class="btn btn-primary" :disabled="nativeDashboardSaving" @click="saveNativeDashboardSettings()">
-                                    {{ nativeDashboardSaving ? '应用中...' : '立即应用到 Unity' }}
-                                </button>
-                            </div>
-                        </div>
-
-                        <div class="native-dashboard-global-grid">
-                            <label>整体界面缩放
-                                <div class="native-dashboard-range-row">
-                                    <input v-model.number="nativeDashboardConfig.uiScale" type="range" min="0.8" max="1.2" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
-                                    <span>{{ Math.round(nativeDashboardConfig.uiScale * 100) }}%</span>
-                                </div>
-                            </label>
-                            <label>左右边距
-                                <input v-model.number="nativeDashboardConfig.sideMargin" type="number" min="8" max="100" step="2" class="input" @change="saveNativeDashboardSettings({ silent: true })" />
-                            </label>
-                            <label class="checkbox-line"><input v-model="nativeDashboardConfig.showHeader" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" /> 显示顶部标题栏</label>
-                            <label class="checkbox-line"><input v-model="nativeDashboardConfig.showWorldLabels" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" /> 显示设备悬浮标签</label>
-                        </div>
-
-                        <div class="native-dashboard-panel-grid">
-                            <section class="native-dashboard-card">
-                                <div class="native-dashboard-card-title">
-                                    <strong>总览左侧统计栏</strong>
-                                    <label class="runtime-toggle-row">
-                                        <input v-model="nativeDashboardConfig.overview.left.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
-                                        <span class="runtime-toggle-track"><span></span></span>
-                                    </label>
-                                </div>
-                                <div class="native-dashboard-card-fields">
-                                    <label>宽度<input v-model.number="nativeDashboardConfig.overview.left.width" class="input" type="number" min="260" max="520" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label>高度<input v-model.number="nativeDashboardConfig.overview.left.height" class="input" type="number" min="800" max="900" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label class="native-dashboard-opacity">透明度
-                                        <div class="native-dashboard-range-row">
-                                            <input v-model.number="nativeDashboardConfig.overview.left.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
-                                            <span>{{ Math.round(nativeDashboardConfig.overview.left.opacity * 100) }}%</span>
-                                        </div>
-                                    </label>
-                                </div>
-                            </section>
-
-                            <section class="native-dashboard-card">
-                                <div class="native-dashboard-card-title">
-                                    <strong>总览右侧设备列表</strong>
-                                    <label class="runtime-toggle-row">
-                                        <input v-model="nativeDashboardConfig.overview.right.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
-                                        <span class="runtime-toggle-track"><span></span></span>
-                                    </label>
-                                </div>
-                                <div class="native-dashboard-card-fields">
-                                    <label>宽度<input v-model.number="nativeDashboardConfig.overview.right.width" class="input" type="number" min="260" max="520" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label>高度<input v-model.number="nativeDashboardConfig.overview.right.height" class="input" type="number" min="420" max="900" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label>最多设备<input v-model.number="nativeDashboardConfig.overview.right.maxDevices" class="input" type="number" min="1" max="100" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label class="native-dashboard-opacity">透明度
-                                        <div class="native-dashboard-range-row">
-                                            <input v-model.number="nativeDashboardConfig.overview.right.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
-                                            <span>{{ Math.round(nativeDashboardConfig.overview.right.opacity * 100) }}%</span>
-                                        </div>
-                                    </label>
-                                </div>
-                            </section>
-
-                            <section class="native-dashboard-card">
-                                <div class="native-dashboard-card-title">
-                                    <strong>详情左侧参数栏</strong>
-                                    <label class="runtime-toggle-row">
-                                        <input v-model="nativeDashboardConfig.detail.left.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
-                                        <span class="runtime-toggle-track"><span></span></span>
-                                    </label>
-                                </div>
-                                <div class="native-dashboard-card-fields">
-                                    <label>宽度<input v-model.number="nativeDashboardConfig.detail.left.width" class="input" type="number" min="260" max="520" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label>高度<input v-model.number="nativeDashboardConfig.detail.left.height" class="input" type="number" min="520" max="830" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label>参数数量<input v-model.number="nativeDashboardConfig.detail.left.maxPoints" class="input" type="number" min="1" max="12" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label class="native-dashboard-opacity">透明度
-                                        <div class="native-dashboard-range-row">
-                                            <input v-model.number="nativeDashboardConfig.detail.left.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
-                                            <span>{{ Math.round(nativeDashboardConfig.detail.left.opacity * 100) }}%</span>
-                                        </div>
-                                    </label>
-                                </div>
-                            </section>
-
-                            <section class="native-dashboard-card">
-                                <div class="native-dashboard-card-title">
-                                    <strong>详情右侧状态 / 联锁栏</strong>
-                                    <label class="runtime-toggle-row">
-                                        <input v-model="nativeDashboardConfig.detail.right.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
-                                        <span class="runtime-toggle-track"><span></span></span>
-                                    </label>
-                                </div>
-                                <div class="native-dashboard-card-fields">
-                                    <label>宽度<input v-model.number="nativeDashboardConfig.detail.right.width" class="input" type="number" min="260" max="520" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label>高度<input v-model.number="nativeDashboardConfig.detail.right.height" class="input" type="number" min="420" max="830" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label>状态数量<input v-model.number="nativeDashboardConfig.detail.right.maxPoints" class="input" type="number" min="1" max="100" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label class="native-dashboard-opacity">透明度
-                                        <div class="native-dashboard-range-row">
-                                            <input v-model.number="nativeDashboardConfig.detail.right.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
-                                            <span>{{ Math.round(nativeDashboardConfig.detail.right.opacity * 100) }}%</span>
-                                        </div>
-                                    </label>
-                                </div>
-                            </section>
-
-                            <section class="native-dashboard-card native-dashboard-trend-card">
-                                <div class="native-dashboard-card-title">
-                                    <strong>详情底部实时趋势</strong>
-                                    <label class="runtime-toggle-row">
-                                        <input v-model="nativeDashboardConfig.detail.trends.visible" type="checkbox" @change="saveNativeDashboardSettings({ silent: true })" />
-                                        <span class="runtime-toggle-track"><span></span></span>
-                                    </label>
-                                </div>
-                                <div class="native-dashboard-card-fields">
-                                    <label>高度<input v-model.number="nativeDashboardConfig.detail.trends.height" class="input" type="number" min="140" max="320" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label>趋势数量<input v-model.number="nativeDashboardConfig.detail.trends.maxCharts" class="input" type="number" min="1" max="4" @change="saveNativeDashboardSettings({ silent: true })" /></label>
-                                    <label class="native-dashboard-opacity">透明度
-                                        <div class="native-dashboard-range-row">
-                                            <input v-model.number="nativeDashboardConfig.detail.trends.opacity" type="range" min="0.25" max="1" step="0.05" @change="saveNativeDashboardSettings({ silent: true })" />
-                                            <span>{{ Math.round(nativeDashboardConfig.detail.trends.opacity * 100) }}%</span>
-                                        </div>
-                                    </label>
-                                </div>
-                            </section>
-                        </div>
-
-                        <div class="native-dashboard-point-config">
-                            <div class="native-dashboard-point-heading">
-                                <div>
-                                    <strong>按设备指定展示点位</strong>
-                                    <p>不勾选时按后台顺序自动取前 N 个；勾选后按这里的顺序精确展示。</p>
-                                </div>
-                                <label>设备
-                                    <select v-model="nativeDashboardSelectedDeviceId" class="input">
-                                        <option v-for="device in devices" :key="device.id" :value="device.id">{{ device.name }}（{{ device.id }}）</option>
-                                    </select>
-                                </label>
-                            </div>
-                            <p v-if="nativeDashboardPointsLoading" class="native-dashboard-point-message">正在读取点位...</p>
-                            <p v-else-if="nativeDashboardPointsMessage" class="native-dashboard-point-message is-error">{{ nativeDashboardPointsMessage }}</p>
-                            <div v-else class="native-dashboard-point-grid">
-                                <section>
-                                    <div class="native-dashboard-point-list-title">
-                                        <strong>左侧核心参数</strong>
-                                        <button type="button" @click="clearNativeDashboardPointSelection('analogPointIds')">恢复自动</button>
-                                    </div>
-                                    <label v-for="point in nativeDashboardAnalogPoints" :key="`analog-${point.id}`" class="native-dashboard-point-option">
-                                        <input type="checkbox" :checked="nativeDashboardPointSelected('analogPointIds', point.id)" @change="toggleNativeDashboardPoint('analogPointIds', point.id, $event.target.checked)" />
-                                        <span>{{ nativeDashboardPointText(point) }}</span>
-                                    </label>
-                                    <p v-if="nativeDashboardAnalogPoints.length === 0" class="empty-hint">该设备没有模拟量点位</p>
-                                </section>
-                                <section>
-                                    <div class="native-dashboard-point-list-title">
-                                        <strong>右侧状态 / 联锁</strong>
-                                        <button type="button" @click="clearNativeDashboardPointSelection('statusPointIds')">恢复自动</button>
-                                    </div>
-                                    <label v-for="point in nativeDashboardStatusPoints" :key="`status-${point.id}`" class="native-dashboard-point-option">
-                                        <input type="checkbox" :checked="nativeDashboardPointSelected('statusPointIds', point.id)" @change="toggleNativeDashboardPoint('statusPointIds', point.id, $event.target.checked)" />
-                                        <span>{{ nativeDashboardPointText(point) }}</span>
-                                    </label>
-                                    <p v-if="nativeDashboardStatusPoints.length === 0" class="empty-hint">该设备没有状态点位</p>
-                                </section>
-                                <section>
-                                    <div class="native-dashboard-point-list-title">
-                                        <strong>底部趋势</strong>
-                                        <button type="button" @click="clearNativeDashboardPointSelection('trendPointIds')">恢复自动</button>
-                                    </div>
-                                    <label v-for="point in nativeDashboardAnalogPoints" :key="`trend-${point.id}`" class="native-dashboard-point-option">
-                                        <input type="checkbox" :checked="nativeDashboardPointSelected('trendPointIds', point.id)" @change="toggleNativeDashboardPoint('trendPointIds', point.id, $event.target.checked)" />
-                                        <span>{{ nativeDashboardPointText(point) }}</span>
-                                    </label>
-                                    <p v-if="nativeDashboardAnalogPoints.length === 0" class="empty-hint">该设备没有可绘制趋势的点位</p>
-                                </section>
-                            </div>
-                        </div>
-
-                        <p v-if="nativeDashboardMessage" class="native-dashboard-message">{{ nativeDashboardMessage }}</p>
                     </div>
 
                     <div v-if="false" class="settings-section" style="margin-top:24px;">
@@ -8743,6 +9450,23 @@ const mainTabs = [
             </main>
         </div>
 
+        <Teleport to="body">
+            <div
+                v-if="activePendingWorkshopMapLine"
+                ref="workshopMapPendingGhostRef"
+                class="workshop-pending-line-ghost"
+                :class="{ 'can-drop': workshopMapPendingDropReady }"
+                aria-hidden="true"
+            >
+                <span class="workshop-line-placement-handle">⠿</span>
+                <span class="workshop-line-placement-copy">
+                    <strong>{{ activePendingWorkshopMapLine.name }}</strong>
+                    <small>{{ workshopLineFootprint(activePendingWorkshopMapLine).length }} × {{ workshopLineFootprint(activePendingWorkshopMapLine).width }} 米</small>
+                </span>
+                <em>{{ workshopMapPendingDropReady ? '松开放置' : '拖到画布' }}</em>
+            </div>
+        </Teleport>
+
         <Transition name="dialog-fade">
             <div v-if="appDialog.visible" class="app-dialog-overlay" @click.self="appDialog.showCancel ? closeAppDialog(false) : null">
                 <section class="app-dialog" :class="'dialog-' + appDialog.type" role="dialog" aria-modal="true">
@@ -8954,7 +9678,7 @@ const mainTabs = [
 }
 
 .admin-header {
-    display: flex; justify-content: space-between; align-items: center;
+    display: flex; justify-content: space-between; align-items: center; gap: 18px;
     flex: 0 0 auto;
     height: 64px; padding: 0 32px; background: rgba(255, 255, 255, 0.85);
     border-bottom: 1px solid rgba(0, 0, 0, 0.08); z-index: 100;
@@ -8963,6 +9687,7 @@ const mainTabs = [
     display: flex;
     align-items: center;
     gap: 10px;
+    flex: 0 0 auto;
     min-width: 0;
 }
 .header-logo-mark {
@@ -8986,13 +9711,122 @@ const mainTabs = [
     stroke-linejoin: round;
 }
 .admin-header h1 { margin: 0; font-size: 19px; color: #1d1d1f; font-weight: 600; letter-spacing: -0.2px; }
+.admin-setup-flow {
+    display: flex;
+    flex: 1 1 860px;
+    align-items: center;
+    justify-content: center;
+    min-width: 0;
+    max-width: 1080px;
+    min-height: 44px;
+    padding: 4px 9px 4px 13px;
+    gap: 9px;
+    background: rgba(246, 247, 249, .92);
+    border: 1px solid rgba(0, 0, 0, .07);
+    border-radius: 18px;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .85);
+}
+.admin-setup-flow-title {
+    flex: 0 0 auto;
+    color: #86868b;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .06em;
+    white-space: nowrap;
+}
+.admin-setup-flow-track {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    min-width: 0;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+}
+.admin-setup-flow-track::-webkit-scrollbar { display: none; }
+.admin-setup-step {
+    appearance: none;
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    min-height: 36px;
+    padding: 5px 9px;
+    gap: 7px;
+    color: #66686c;
+    background: transparent;
+    border: 0;
+    border-radius: 11px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: color .18s ease, background .18s ease, box-shadow .18s ease, transform .18s ease;
+}
+.admin-setup-step:hover {
+    color: #1d1d1f;
+    background: rgba(255, 255, 255, .9);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, .07);
+    transform: translateY(-1px);
+}
+.admin-setup-step:focus-visible {
+    outline: 2px solid rgba(0, 113, 227, .38);
+    outline-offset: 1px;
+}
+.admin-setup-step.active {
+    color: #005eb8;
+    background: #ffffff;
+    box-shadow: 0 3px 10px rgba(0, 71, 145, .12), 0 0 0 1px rgba(0, 113, 227, .09);
+}
+.admin-setup-step-index {
+    display: inline-grid;
+    width: 23px;
+    height: 23px;
+    flex: 0 0 23px;
+    place-items: center;
+    color: #777a7f;
+    background: #e6e8eb;
+    border-radius: 50%;
+    font-size: 12px;
+    font-weight: 750;
+    line-height: 1;
+}
+.admin-setup-step.active .admin-setup-step-index {
+    color: #ffffff;
+    background: linear-gradient(145deg, #0a84ff, #0066cc);
+    box-shadow: 0 2px 6px rgba(0, 102, 204, .3);
+}
+.admin-setup-step-label {
+    font-size: 14px;
+    font-weight: 650;
+    line-height: 1;
+    white-space: nowrap;
+}
+.admin-setup-flow-connector {
+    position: relative;
+    flex: 1 1 18px;
+    min-width: 6px;
+    max-width: 22px;
+    height: 1px;
+    margin: 0 1px;
+    background: #cfd3d8;
+}
+.admin-setup-flow-connector::after {
+    content: '';
+    position: absolute;
+    right: 0;
+    top: -2px;
+    width: 4px;
+    height: 4px;
+    border-top: 1px solid #aeb4bc;
+    border-right: 1px solid #aeb4bc;
+    transform: rotate(45deg);
+}
 .admin-connection-strip {
     display: flex;
+    flex: 0 0 auto;
     align-items: center;
     justify-content: flex-end;
     gap: 8px;
     min-width: 0;
-    margin-left: 20px;
+    margin-left: 0;
 }
 .admin-connection-pill {
     display: inline-flex;
@@ -9022,6 +9856,13 @@ const mainTabs = [
 .admin-connection-pill.is-partial { color: #8a5a0f; background: #fff7df; border-color: #ead29b; }
 .admin-connection-pill.is-offline { color: #9b3b32; background: #fff0ee; border-color: #efc4bf; }
 .admin-connection-pill.is-unknown { color: #667085; background: #f2f4f7; border-color: #dfe3e8; }
+@media (max-width: 1380px) {
+    .admin-header { gap: 10px; padding-right: 20px; padding-left: 20px; }
+    .admin-setup-flow { padding-left: 7px; gap: 0; }
+    .admin-setup-flow-title { display: none; }
+    .admin-setup-step { padding-right: 7px; padding-left: 7px; }
+    .admin-setup-flow-connector { flex-basis: 8px; max-width: 12px; }
+}
 .admin-body { display: flex; flex: 1; min-height: 0; overflow: hidden; position: relative; }
 .admin-container.line-planner-active .admin-body {
     min-height: 0;
@@ -9362,12 +10203,16 @@ const mainTabs = [
     gap: 10px;
     flex-wrap: wrap;
 }
+.line-planner-guidance {
+    background: #f8fafb;
+    border-bottom: 1px solid rgba(25, 33, 38, 0.07);
+}
 .line-planner-steps {
     display: flex;
     gap: 8px;
     padding: 10px 22px;
     background: #f8fafb;
-    border-bottom: 1px solid rgba(25, 33, 38, 0.07);
+    border-bottom: 0;
 }
 .line-planner-steps span {
     display: inline-flex;
@@ -9501,6 +10346,18 @@ const mainTabs = [
     font-size: 12px;
     white-space: nowrap;
 }
+.line-card-status {
+    display: inline-flex;
+    margin-left: 5px;
+    padding: 2px 6px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-style: normal;
+    font-weight: 800;
+    vertical-align: 1px;
+}
+.line-card-status.pending { color: #9a4f00; background: #fff0d5; }
+.line-card-status.dirty { color: #b42318; background: #fee4e2; }
 .line-card-fields {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr);
@@ -9540,6 +10397,44 @@ const mainTabs = [
     margin-bottom: 0;
     overflow: hidden;
 }
+.line-placement-pending-card {
+    display: flex;
+    width: 100%;
+    min-height: 104px;
+    padding: 16px;
+    align-items: center;
+    gap: 14px;
+    color: #713b00;
+    text-align: left;
+    background: linear-gradient(135deg, #fffaf0, #fff1d2);
+    border: 1px solid #f5b544;
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(181, 105, 0, .11);
+    cursor: pointer;
+    transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+}
+.line-placement-pending-card:hover {
+    border-color: #dc8b00;
+    box-shadow: 0 11px 28px rgba(181, 105, 0, .18);
+    transform: translateY(-1px);
+}
+.line-placement-pending-icon {
+    display: grid;
+    flex: 0 0 46px;
+    width: 46px;
+    height: 46px;
+    place-items: center;
+    color: #fff;
+    background: #e58b00;
+    border-radius: 13px;
+    box-shadow: 0 7px 16px rgba(205, 116, 0, .24);
+}
+.line-placement-pending-icon svg { width: 25px; height: 25px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.line-placement-pending-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 6px; }
+.line-placement-pending-copy strong { color: #6b3500; font-size: 15px; }
+.line-placement-pending-copy small { color: #936222; font-size: 11px; line-height: 1.55; }
+.line-placement-pending-action { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 6px; color: #9a5500; font-size: 12px; font-weight: 800; }
+.line-placement-pending-action b { font-size: 17px; }
 .line-structure-title .btn {
     background: #eef1f4;
     color: #245c7a;
@@ -10275,6 +11170,21 @@ const mainTabs = [
     text-overflow: ellipsis;
 }
 
+.device-pill-cancel {
+    display: inline-grid;
+    width: 18px;
+    height: 18px;
+    margin-left: 6px;
+    place-items: center;
+    color: #ffffff;
+    background: #0071e3;
+    border-radius: 50%;
+    font-size: 14px;
+    font-style: normal;
+    line-height: 1;
+    vertical-align: -2px;
+}
+
 .composer-empty {
     padding: 14px;
     color: #86868b;
@@ -10397,10 +11307,92 @@ const mainTabs = [
 .composer-save { width: 100%; padding: 11px 16px; }
 
 .composer-preview {
+    position: relative;
     min-width: 0;
     display: grid;
     grid-template-rows: auto minmax(0, 1fr) 38px;
     background: #15191b;
+}
+
+.composer-preview-floating-host {
+    position: absolute;
+    inset: 0;
+    z-index: 24;
+    overflow: hidden;
+    pointer-events: none;
+}
+
+.composer-device-layout-float {
+    position: absolute;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    width: min(326px, calc(100% - 36px));
+    max-height: calc(100% - 122px);
+    margin: 0;
+    padding: 0;
+    gap: 0;
+    overflow: hidden;
+    pointer-events: auto;
+    background: rgba(255, 255, 255, .96);
+    border: 1px solid rgba(0, 0, 0, .12);
+    border-radius: 16px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, .24), 0 2px 8px rgba(0, 0, 0, .1);
+    backdrop-filter: blur(20px) saturate(1.15);
+}
+
+.composer-device-layout-float-header {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 54px;
+    padding: 9px 10px 9px 15px;
+    border-bottom: 1px solid rgba(0, 0, 0, .08);
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+}
+
+.composer-device-layout-float-header:active { cursor: grabbing; }
+.composer-device-layout-float-header span {
+    display: block;
+    color: #86868b;
+    font-size: 11px;
+}
+.composer-device-layout-float-header strong {
+    display: block;
+    max-width: 230px;
+    margin-top: 1px;
+    overflow: hidden;
+    color: #1d1d1f;
+    font-size: 14px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+.composer-device-layout-float-header button {
+    display: grid;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    place-items: center;
+    color: #515154;
+    background: #ececf0;
+    border: 0;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 20px;
+    line-height: 1;
+}
+.composer-device-layout-float-header button:hover { color: #ffffff; background: #ff453a; }
+.composer-device-layout-float-body {
+    display: grid;
+    min-height: 0;
+    padding: 14px;
+    gap: 12px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 
 .composer-preview-toolbar {
@@ -12026,6 +13018,65 @@ button:enabled:active {
     font-size: 12px;
     line-height: 1.5;
 }
+.inspection-stage-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 14px;
+    padding: 10px;
+    background: #f7f7f9;
+    border: 1px solid rgba(0, 0, 0, .06);
+    border-radius: 10px;
+}
+.inspection-stage-toolbar .inline-check { margin-right: auto; }
+.inspection-stage-toolbar > button {
+    min-height: 34px;
+    padding: 0 13px;
+    color: #515154;
+    background: #fff;
+    border: 1px solid #d9d9de;
+    border-radius: 8px;
+    cursor: pointer;
+}
+.inspection-stage-toolbar > button.active { color: #fff; background: #1d1d1f; border-color: #1d1d1f; }
+.model-inspection-settings {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin-bottom: 14px;
+}
+.model-inspection-settings > label,
+.inspection-config-card > label,
+.inspection-camera-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    color: #515154;
+    font-size: 12px;
+}
+.model-inspection-settings input[type="range"] { width: 100%; }
+.inspection-config-card {
+    min-width: 0;
+    margin-bottom: 14px;
+    padding: 14px;
+    background: #fbfbfd;
+    border: 1px solid rgba(0, 0, 0, .07);
+    border-radius: 10px;
+}
+.inspection-node-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.inspection-node-chips { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+.inspection-node-chips > button { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; padding: 6px 8px; color: #344054; background: #fff; border: 1px solid #d9d9de; border-radius: 999px; cursor: pointer; }
+.inspection-node-chips span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inspection-node-chips i { color: #d92d20; font-style: normal; }
+.inspection-node-chips small { color: #86868b; }
+.inspection-camera-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.inspection-camera-grid .inspection-config-card { display: grid; gap: 10px; }
+.property-grid.three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.inspection-part-form .wide-form-section { grid-column: 1 / -1; }
+.device-inspection-override-toolbar { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #667085; font-size: 12px; }
+.model-binding-table td > strong,
+.model-binding-table td > small { display: block; }
+.model-binding-table td > small { margin-top: 3px; color: #86868b; }
 .model-binding-form {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -12321,42 +13372,6 @@ button:enabled:active {
 .render-custom-grid { margin-top: 18px; padding-top: 18px; border-top: 1px solid #e5e5e7; }
 .checkbox-line { display: flex; align-items: center; gap: 8px; min-height: 38px; font-weight: 400; }
 .database-production-notice { margin: 16px 0 0; padding: 11px 13px; color: #173f2b; background: #edf8f1; border-left: 3px solid #24834f; font-size: 13px; line-height: 1.55; }
-.native-dashboard-settings { margin-top: 24px; background: linear-gradient(180deg, #f8fbfd 0%, #fbfbfd 100%); }
-.native-dashboard-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
-.native-dashboard-heading .section-title { margin-bottom: 8px; }
-.native-dashboard-heading p { max-width: 720px; margin: 0; color: #6e6e73; font-size: 13px; line-height: 1.6; }
-.native-dashboard-actions { display: flex; flex: 0 0 auto; gap: 10px; }
-.native-dashboard-global-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 20px; margin-top: 22px; padding: 18px; background: #ffffff; border: 1px solid #e5e5e7; border-radius: 10px; }
-.native-dashboard-global-grid > label:not(.checkbox-line) { display: flex; flex-direction: column; gap: 8px; color: #515154; font-size: 13px; font-weight: 500; }
-.native-dashboard-global-grid .checkbox-line { align-self: end; }
-.native-dashboard-range-row { display: grid; grid-template-columns: minmax(120px, 1fr) 52px; align-items: center; gap: 10px; min-height: 38px; }
-.native-dashboard-range-row input[type="range"] { width: 100%; accent-color: #24834f; }
-.native-dashboard-range-row span { color: #1d1d1f; font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
-.native-dashboard-panel-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }
-.native-dashboard-card { padding: 17px; background: #ffffff; border: 1px solid #e5e5e7; border-radius: 10px; }
-.native-dashboard-trend-card { grid-column: 1 / -1; }
-.native-dashboard-card-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.native-dashboard-card-title strong { color: #1d1d1f; font-size: 14px; }
-.native-dashboard-card-title .runtime-toggle-row { min-height: 22px; margin: 0; }
-.native-dashboard-card-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
-.native-dashboard-card-fields > label { display: flex; flex-direction: column; gap: 6px; color: #6e6e73; font-size: 12px; font-weight: 500; }
-.native-dashboard-card-fields .native-dashboard-opacity { grid-column: 1 / -1; }
-.native-dashboard-point-config { margin-top: 18px; padding: 18px; background: #ffffff; border: 1px solid #e5e5e7; border-radius: 10px; }
-.native-dashboard-point-heading { display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 360px); align-items: end; gap: 20px; }
-.native-dashboard-point-heading strong { color: #1d1d1f; font-size: 14px; }
-.native-dashboard-point-heading p { margin: 5px 0 0; color: #6e6e73; font-size: 12px; line-height: 1.55; }
-.native-dashboard-point-heading > label { display: flex; flex-direction: column; gap: 6px; color: #515154; font-size: 12px; font-weight: 500; }
-.native-dashboard-point-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
-.native-dashboard-point-grid > section { max-height: 260px; overflow: auto; padding: 12px; background: #f8f9fa; border: 1px solid #ececef; border-radius: 8px; }
-.native-dashboard-point-list-title { position: sticky; top: -12px; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: -12px -12px 8px; padding: 10px 12px; background: #f8f9fa; border-bottom: 1px solid #e5e5e7; }
-.native-dashboard-point-list-title strong { color: #1d1d1f; font-size: 12px; }
-.native-dashboard-point-list-title button { padding: 0; color: #196b8a; background: transparent; border: 0; font-size: 11px; cursor: pointer; }
-.native-dashboard-point-option { display: flex; flex-direction: row !important; align-items: flex-start; gap: 8px !important; padding: 7px 4px; color: #434345 !important; font-size: 12px !important; font-weight: 400 !important; border-bottom: 1px solid #ededee; cursor: pointer; }
-.native-dashboard-point-option input { margin-top: 2px; accent-color: #24834f; }
-.native-dashboard-point-option span { min-width: 0; overflow-wrap: anywhere; line-height: 1.45; }
-.native-dashboard-point-message { margin: 16px 0 0; color: #515154; font-size: 12px; }
-.native-dashboard-point-message.is-error { color: #b42318; }
-.native-dashboard-message { margin: 14px 0 0; color: #176b3a; font-size: 12px; line-height: 1.5; }
 .external-data-source-manager { margin-top: 24px; padding: 16px; background: #fff; border: 1px solid #e2e2e5; border-radius: 10px; transition: border-color 180ms ease, box-shadow 180ms ease; }
 .external-data-source-manager.open { border-color: #d5d5da; box-shadow: 0 8px 24px #00000008; }
 .external-data-source-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
@@ -12554,11 +13569,6 @@ button:enabled:active {
 
 @media (max-width: 1180px) {
     .secondary-page-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .native-dashboard-heading { flex-direction: column; }
-    .native-dashboard-panel-grid,
-    .native-dashboard-point-grid { grid-template-columns: 1fr; }
-    .native-dashboard-trend-card { grid-column: auto; }
-    .native-dashboard-point-heading { grid-template-columns: 1fr; }
     .runtime-settings-grid { grid-template-columns: 1fr; }
     .runtime-cast-content { grid-template-columns: 1fr; }
     .runtime-qr-block { justify-self: start; }
@@ -12814,6 +13824,16 @@ button:enabled:active {
 .workshop-spatial-grid .workshop-boundary-toggle { flex-direction: row; align-items: center; min-height: 38px; padding: 8px 10px; align-self: end; background: #fff; border: 1px solid #d0d5dd; border-radius: 7px; }
 .workshop-boundary-toggle input { accent-color: #176b8b; }
 .workshop-step-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 18px; padding-top: 16px; color: #667085; border-top: 1px solid #e3e7eb; font-size: 12px; }
+.canvas-save-reminder { position: relative; z-index: 12; display: flex; align-items: center; gap: 12px; margin: 12px 16px; padding: 12px 14px; overflow: hidden; color: #7a2e0e; background: linear-gradient(90deg, #fff4e8, #fff9ef); border: 1px solid #f79009; border-radius: 11px; box-shadow: 0 8px 24px rgba(181, 71, 8, .12); }
+.canvas-save-reminder::before { position: absolute; top: 0; bottom: 0; left: 0; width: 5px; content: ''; background: #f04438; }
+.canvas-save-reminder-dot { flex: 0 0 10px; width: 10px; height: 10px; margin-left: 2px; background: #f04438; border-radius: 50%; box-shadow: 0 0 0 5px rgba(240, 68, 56, .12); animation: canvas-save-pulse 1.8s ease-in-out infinite; }
+.canvas-save-reminder > div:not(.canvas-save-reminder-actions) { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
+.canvas-save-reminder strong { color: #8a2c12; font-size: 13px; }
+.canvas-save-reminder span { font-size: 11px; line-height: 1.45; }
+.canvas-save-reminder-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
+.canvas-save-reminder-actions .btn { min-height: 32px; }
+.line-canvas-save-reminder { margin-top: 0; margin-bottom: 12px; }
+@keyframes canvas-save-pulse { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(.75); opacity: .72; } }
 .workshop-map-shell { overflow: hidden; background: #fff; border: 1px solid #e5e5e7; border-radius: 16px; box-shadow: 0 10px 34px rgba(0, 0, 0, .055); }
 .workshop-map-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 18px 20px; border-bottom: 1px solid #e8e8ed; }
 .workshop-map-toolbar h3 { margin: 0; color: #1d1d1f; font-size: 16px; }
@@ -12824,6 +13844,9 @@ button:enabled:active {
 .workshop-map-dimension-x { top: 18px; left: 54px; right: 28px; text-align: center; }
 .workshop-map-dimension-z { top: 50%; left: 12px; transform: translateY(-50%) rotate(-90deg); white-space: nowrap; }
 .workshop-map-stage { position: relative; overflow: hidden; width: 100%; height: clamp(500px, 62vh, 680px); background-color: #eef3f5; background-image: linear-gradient(rgba(92, 119, 132, .095) 1px, transparent 1px), linear-gradient(90deg, rgba(92, 119, 132, .095) 1px, transparent 1px), linear-gradient(rgba(92, 119, 132, .12) 1px, transparent 1px), linear-gradient(90deg, rgba(92, 119, 132, .12) 1px, transparent 1px); background-position: center; background-size: 20px 20px, 20px 20px, 100px 100px, 100px 100px; border: 1px solid #bfcdd3; border-radius: 12px; box-shadow: inset 0 0 0 1px rgba(255,255,255,.7), inset 0 0 34px rgba(37, 70, 84, .045); touch-action: none; }
+.workshop-map-stage.pending-drag-active { border-color: rgba(229, 139, 0, .72); box-shadow: inset 0 0 0 2px rgba(245, 158, 11, .15), 0 0 0 3px rgba(245, 158, 11, .08); }
+.workshop-map-stage.pending-drop-active { border-color: #e58b00; box-shadow: inset 0 0 0 4px rgba(245, 158, 11, .28), 0 0 0 5px rgba(245, 158, 11, .14); }
+.workshop-map-stage.pending-drag-active .workshop-line-placement-dock { backdrop-filter: none; }
 .workshop-map-stage::before { position: absolute; inset: 13px; content: ''; border: 1px dashed rgba(66, 95, 108, .22); border-radius: 7px; pointer-events: none; }
 .workshop-map-axis { position: absolute; z-index: 0; background: rgba(29, 29, 31, .22); pointer-events: none; }
 .workshop-map-axis-x { top: 50%; right: 0; left: 0; height: 1px; }
@@ -12842,6 +13865,27 @@ button:enabled:active {
 .workshop-map-track.rail { height: 2px; background: #bd842b; box-shadow: 0 -3px #bd842b, 0 3px #bd842b; }
 .workshop-map-line.selected .workshop-map-track.lane { background: #8dd9f3; }
 .workshop-map-line.selected .workshop-map-track.rail { background: #ffd36a; box-shadow: 0 -3px #ffd36a, 0 3px #ffd36a; }
+.workshop-line-placement-dock { position: absolute; z-index: 9; top: 14px; right: 14px; width: min(230px, calc(100% - 28px)); max-height: calc(100% - 28px); overflow: hidden; color: #364152; background: rgba(255, 255, 255, .96); border: 1px solid rgba(229, 139, 0, .42); border-radius: 13px; box-shadow: 0 13px 34px rgba(48, 57, 66, .2); backdrop-filter: blur(10px); }
+.workshop-line-placement-dock > header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 12px; background: linear-gradient(135deg, #fff8e8, #fff1cc); border-bottom: 1px solid #f5d390; }
+.workshop-line-placement-dock > header div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.workshop-line-placement-dock > header strong { color: #704000; font-size: 12px; }
+.workshop-line-placement-dock > header span { color: #9a6a21; font-size: 10px; }
+.workshop-line-placement-dock > header b { display: grid; flex: 0 0 26px; width: 26px; height: 26px; place-items: center; color: #fff; background: #dd8400; border-radius: 8px; font-size: 11px; }
+.workshop-line-placement-list { display: grid; max-height: 260px; padding: 8px; overflow-y: auto; gap: 7px; }
+.workshop-line-placement-card { display: flex; min-width: 0; padding: 9px 8px; align-items: center; gap: 8px; color: #344054; background: #fff; border: 1px solid #e5e7eb; border-radius: 9px; box-shadow: 0 3px 9px rgba(16, 24, 40, .05); cursor: grab; user-select: none; touch-action: none; transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease, opacity .16s ease; }
+.workshop-line-placement-card:hover, .workshop-line-placement-card.attention { border-color: #e58b00; box-shadow: 0 0 0 3px rgba(229, 139, 0, .13), 0 7px 16px rgba(91, 56, 0, .1); transform: translateY(-1px); }
+.workshop-line-placement-card.dragging { opacity: .48; cursor: grabbing; }
+.workshop-line-placement-handle { flex: 0 0 auto; color: #b36a00; font-size: 19px; line-height: 1; }
+.workshop-line-placement-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.workshop-line-placement-copy strong { overflow: hidden; color: #344054; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.workshop-line-placement-copy small { color: #98a2b3; font-size: 9px; }
+.workshop-line-placement-card em { flex: 0 0 auto; color: #9a5500; font-size: 9px; font-style: normal; font-weight: 800; }
+.workshop-pending-line-ghost { position: fixed; z-index: 10000; top: 0; left: 0; display: flex; width: 220px; min-width: 0; padding: 10px 10px; align-items: center; gap: 8px; color: #344054; background: rgba(255, 255, 255, .98); border: 1px solid #e5a12f; border-radius: 10px; box-shadow: 0 15px 38px rgba(91, 56, 0, .24); pointer-events: none; user-select: none; opacity: .92; will-change: transform; }
+.workshop-pending-line-ghost.can-drop { color: #17542f; border-color: #12b76a; box-shadow: 0 0 0 4px rgba(18, 183, 106, .13), 0 15px 38px rgba(19, 78, 47, .22); }
+.workshop-pending-line-ghost em { flex: 0 0 auto; color: #9a5500; font-size: 9px; font-style: normal; font-weight: 800; }
+.workshop-pending-line-ghost.can-drop em { color: #087443; }
+:global(body.workshop-pending-line-dragging),
+:global(body.workshop-pending-line-dragging *) { cursor: grabbing !important; user-select: none !important; }
 .workshop-map-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 8px; color: #6e6e73; text-align: center; }
 .workshop-map-empty strong { color: #1d1d1f; font-size: 16px; }
 .workshop-map-empty span { margin-bottom: 8px; font-size: 12px; }
@@ -12868,6 +13912,7 @@ button:enabled:active {
 .workshop-map-metrics p.danger { color: #b42318; background: #fff0ef; }
 .workshop-line-detail-button { width: 100%; margin-top: 14px; }
 .workshop-map-inspector-empty { display: grid; height: 100%; min-height: 240px; place-items: center; color: #86868b; font-size: 12px; text-align: center; }
+.workshop-loading-state { display: grid; min-height: 280px; margin-top: 14px; place-items: center; color: #667085; background: #f8fafb; border: 1px dashed #cfd8df; border-radius: 14px; font-size: 13px; }
 .line-transform-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
 .line-transform-grid .input { width: 100%; min-width: 0; box-sizing: border-box; }
 @media (max-width: 1180px) {
@@ -12886,5 +13931,10 @@ button:enabled:active {
     .workshop-spatial-grid, .line-transform-grid { grid-template-columns: 1fr; }
     .workshop-map-board { padding-right: 14px; padding-left: 38px; }
     .workshop-map-toolbar { padding: 15px; }
+    .canvas-save-reminder { align-items: flex-start; flex-wrap: wrap; margin-right: 10px; margin-left: 10px; }
+    .canvas-save-reminder-actions { width: 100%; padding-left: 24px; justify-content: flex-end; }
+    .line-placement-pending-card { align-items: flex-start; }
+    .line-placement-pending-action { display: none; }
+    .workshop-line-placement-dock { top: 10px; right: 10px; width: min(220px, calc(100% - 20px)); }
 }
 </style>

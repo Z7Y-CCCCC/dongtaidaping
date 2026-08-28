@@ -17,6 +17,40 @@
     "enableGenericBindings": true,
     "showStatusLight": true
   },
+  "inspection": {
+    "enabled": true,
+    "shell": {
+      "node_names": [
+        "v5_static_07_photo_light_gray",
+        "v5_static_10_photo_paint_white",
+        "v5_static_11_photo_panel_warm_white"
+      ],
+      "node_paths": [],
+      "opacity": 0.16,
+      "wireframe": false
+    },
+    "solid": {
+      "view_id": "device_detail",
+      "camera": { "yaw": 238, "pitch": 19, "distance_scale": 1.12, "target_offset": [0, 0, 0] }
+    },
+    "xray": {
+      "view_id": "device_xray",
+      "camera": { "yaw": 238, "pitch": 19, "distance_scale": 1.08, "target_offset": [0, 0.2, 0] }
+    },
+    "exploded": {
+      "view_id": "device_exploded",
+      "camera": { "yaw": 238, "pitch": 22, "distance_scale": 1.22, "target_offset": [0, 0.35, 0] }
+    },
+    "animation_duration": 0.72,
+    "parts": [
+      { "id": "front_door_open", "name": "前门组件", "node_name": "multi_v5_front_door_assembly", "explode_offset": [-1.5, 0.25, -0.25], "description": "前室升降门与驱动组件", "point_keys": ["doors.front_door_open"] },
+      { "id": "middle_door_open", "name": "中门组件", "node_name": "multi_middle_door_reference", "explode_offset": [0, 0.55, -0.2], "description": "中间隔热门组件", "point_keys": ["doors.middle_door_open"] },
+      { "id": "rear_fan_rotate", "name": "后室循环风扇", "node_name": "multi_v4_roof_circulation_fan_01", "explode_offset": [1.45, 0.7, 0.35], "description": "后室循环风扇与电机", "point_keys": ["motors.rear_fan_speed"] },
+      { "id": "front_fan_rotate", "name": "前室循环风扇", "node_name": "multi_v4_roof_circulation_fan_02", "explode_offset": [-1.35, 0.85, 0.4], "description": "前室循环风扇与电机", "point_keys": ["motors.front_fan_speed"] },
+      { "id": "oil_stir_1_rotate", "name": "淬火搅拌轴 1", "node_name": "multi_v4_oil_agitator_shaft_01", "explode_offset": [1.8, -0.45, -0.5], "description": "淬火槽搅拌机构 1", "point_keys": ["motors.oil_stir_1_speed"] },
+      { "id": "oil_stir_2_rotate", "name": "淬火搅拌轴 2", "node_name": "multi_v4_oil_agitator_shaft_02", "explode_offset": [2.2, -0.25, -0.2], "description": "淬火槽搅拌机构 2", "point_keys": ["motors.oil_stir_2_speed"] }
+    ]
+  },
   "assetSpec": {
     "version": "1.0.0",
     "device_family": "箱式气氛多用炉 V5 PBR",

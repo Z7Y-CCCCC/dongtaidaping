@@ -16,10 +16,9 @@ const SYSTEM_VIEW_COMPONENT_IDS = new Set([
 ])
 
 export const SYSTEM_WIDGET_LIBRARY = [
-  { type: 'navigation', label: '场景导航与返回', icon: '←', description: 'Unity 原生返回、视角层级和场景导航', preview: 'navigation' },
-  { type: 'device_label', label: '设备世界浮标', icon: '⌖', description: '跟随三维设备显示名称和状态', preview: 'label' },
-  { type: 'diagnostics', label: '运行诊断面板', icon: '◌', description: '连接、PLC 和模型加载状态', preview: 'diagnostics' },
-  { type: 'line_overview_cards', label: '产线设备概览', icon: '▤', description: '产线视角下的设备概览卡片', preview: 'line' }
+  // 其余三种旧 Unity OnGUI 组件仍保留在 SYSTEM_WIDGET_TYPES 中用于读取历史发布，
+  // 但正式大屏已经由透明 Web 数据层接管，不再向设计器暴露。
+  { type: 'navigation', label: '场景导航与返回', icon: '←', description: '大屏视角层级导航与返回上一级', preview: 'navigation' }
 ]
 
 export const DASHBOARD_VIEW_MODES = [
@@ -34,7 +33,10 @@ const DEFAULT_VIEW_DEFINITIONS = [
   { id: 'factory_overview', name: '全厂总览', mode: 'factory', targetType: 'factory', parentViewId: '', camera: { yaw: -39, pitch: 33, distanceScale: 1.08, transitionSeconds: .8 } },
   { id: 'workshop_overview', name: '车间视角', mode: 'workshop', targetType: 'workshop', parentViewId: 'factory_overview', camera: { yaw: -39, pitch: 36, distanceScale: 1.08, transitionSeconds: .7 } },
   { id: 'line_overview', name: '产线视角', mode: 'line', targetType: 'line', parentViewId: 'workshop_overview', camera: { yaw: -39, pitch: 33, distanceScale: 1.08, transitionSeconds: .65 } },
-  { id: 'device_detail', name: '设备详情', mode: 'device', targetType: 'device', parentViewId: 'line_overview', camera: { yaw: 238, pitch: 19, distanceScale: 1.12, transitionSeconds: .55, relativeToTarget: true } }
+  { id: 'device_detail', name: '设备实体视角', mode: 'device', targetType: 'device', parentViewId: 'line_overview', camera: { yaw: 238, pitch: 19, distanceScale: 1.12, transitionSeconds: .55, relativeToTarget: true }, metadata: { inspectionStage: 'solid' } },
+  { id: 'device_xray', name: '设备透视视角', mode: 'device', targetType: 'device', parentViewId: 'device_detail', camera: { yaw: 238, pitch: 19, distanceScale: 1.08, transitionSeconds: .65, relativeToTarget: true }, metadata: { inspectionStage: 'xray' } },
+  { id: 'device_exploded', name: '设备拆解视角', mode: 'device', targetType: 'device', parentViewId: 'device_xray', camera: { yaw: 238, pitch: 22, distanceScale: 1.22, transitionSeconds: .7, relativeToTarget: true }, metadata: { inspectionStage: 'exploded' } },
+  { id: 'device_part', name: '部件详情视角', mode: 'device', targetType: 'device_part', parentViewId: 'device_exploded', camera: { yaw: 238, pitch: 18, distanceScale: 1.35, transitionSeconds: .55, relativeToTarget: true }, metadata: { inspectionStage: 'part' } }
 ]
 
 function normalizeDashboardView(source = {}, index = 0) {
@@ -79,7 +81,9 @@ export function createDefaultDashboardViews() {
 export function normalizeDashboardViews(scene = {}) {
   const source = objectValue(scene, {})
   const raw = Array.isArray(source.views) && source.views.length ? source.views : createDefaultDashboardViews()
-  const views = raw.slice(0, 50).map((view, index) => normalizeDashboardView(view, index))
+  const existingIds = new Set(raw.map(view => String(view?.id || '')))
+  const inspectionDefaults = createDefaultDashboardViews().filter(view => view.id.startsWith('device_') && !existingIds.has(view.id))
+  const views = [...raw, ...inspectionDefaults].slice(0, 50).map((view, index) => normalizeDashboardView(view, index))
   const ids = new Set(views.map(view => view.id))
   const defaultViewId = ids.has(String(source.defaultViewId || '')) ? String(source.defaultViewId) : (views[0]?.id || 'factory_overview')
   return { views, defaultViewId }
@@ -96,6 +100,16 @@ export const DASHBOARD_WIDGET_LIBRARY = [
   { type: 'alarm_list', label: '报警表', icon: '!', group: '数据', description: '只读报警与事件履历' },
   { type: 'device_list', label: '设备列表', icon: '☷', group: '数据', description: '设备在线、运行和报警状态' },
   { type: 'marquee', label: '滚动消息', icon: '↔', group: '数据', description: '实时日志和报警滚动条' }
+]
+
+export const DASHBOARD_WIDGET_PRESETS = [
+  {
+    id: 'device_part_detail',
+    label: '部件详情面板',
+    icon: '▤',
+    group: '设备检查',
+    description: '生成右侧部件名称、说明和实时参数面板，并绑定设备检查上下文'
+  }
 ]
 
 const TYPE_DEFAULTS = {
@@ -204,7 +218,7 @@ function normalizeDatabaseDataset(source = {}, fallback = {}, index = 0) {
     rowLimit: Math.round(numberValue(data.rowLimit ?? base.rowLimit, 50, 1, 500)),
     refreshMs: Math.round(numberValue(data.refreshMs ?? base.refreshMs, 5000, 1000, 3600000)),
     contextField: String(data.contextField || ''),
-    contextKey: ['deviceId', 'lineId', 'workshopId', 'viewId'].includes(data.contextKey) ? data.contextKey : ''
+    contextKey: ['deviceId', 'lineId', 'workshopId', 'viewId', 'partId'].includes(data.contextKey) ? data.contextKey : ''
   }
 }
 
@@ -230,7 +244,7 @@ export function normalizeDashboardWidget(source = {}, canvas = DEFAULT_DASHBOARD
   const hasCanonicalFrame = frame.width !== undefined || frame.height !== undefined
   const data = objectValue(source.data, objectValue(source.binding, {}))
   const requestedMode = String(data.mode || '')
-  const normalizedMode = requestedMode === 'plc' || requestedMode === 'database'
+  const normalizedMode = requestedMode === 'plc' || requestedMode === 'database' || requestedMode === 'runtime'
     ? requestedMode
     : 'static'
   const resolvedDataMode = normalizedMode === 'static'
@@ -259,7 +273,7 @@ export function normalizeDashboardWidget(source = {}, canvas = DEFAULT_DASHBOARD
     content: { ...deepClone(defaults.content || {}), ...deepClone(config) },
     style: { ...deepClone(defaults.style || {}), ...deepClone(source.style || source.config?.style || {}) },
     data: {
-      // 旧版 runtime 指标没有真实数据来源，统一迁移为静态占位；真实数据只允许 PLC 或数据库只读绑定。
+      // 旧版无来源指标仍迁移为静态占位；新 runtime 模式只读取当前视角与部件上下文。
       mode: resolvedDataMode,
       deviceId: String(data.deviceId || data.device_id || ''),
       pointId: String(data.pointId || data.point_id || ''),
@@ -367,6 +381,146 @@ export function createDashboardWidget(type, index = 0, position = {}) {
     zIndex: index,
     runtimeTarget: 'overlay'
   }, DEFAULT_DASHBOARD_CANVAS, index)
+}
+
+export function createDashboardWidgetPreset(presetId, options = {}) {
+  if (presetId !== 'device_part_detail') return []
+
+  const canvas = { ...DEFAULT_DASHBOARD_CANVAS, ...objectValue(options.canvas, {}) }
+  const canvasWidth = Math.max(320, Number(canvas.width) || DEFAULT_DASHBOARD_CANVAS.width)
+  const canvasHeight = Math.max(180, Number(canvas.height) || DEFAULT_DASHBOARD_CANVAS.height)
+  const margin = Math.max(18, Math.round(Math.min(canvasWidth, canvasHeight) * .025))
+  const panelWidth = Math.min(500, Math.max(380, canvasWidth * .28), canvasWidth - margin * 2)
+  const panelHeight = Math.min(820, Math.max(560, canvasHeight * .76), canvasHeight - margin * 2)
+  const panelX = Math.max(margin, canvasWidth - panelWidth - margin)
+  const panelY = Math.max(margin, (canvasHeight - panelHeight) / 2)
+  const padding = Math.max(18, Math.min(28, Math.round(panelWidth * .055)))
+  const gap = Math.max(10, Math.min(16, Math.round(panelHeight * .02)))
+  const innerWidth = panelWidth - padding * 2
+  const nameHeight = Math.max(84, Math.min(116, Math.round(panelHeight * .14)))
+  const descriptionHeight = Math.max(100, Math.min(150, Math.round(panelHeight * .18)))
+  const footerHeight = Math.max(52, Math.min(70, Math.round(panelHeight * .09)))
+  const metricsHeight = Math.max(180, panelHeight - padding * 2 - nameHeight - descriptionHeight - footerHeight - gap * 3)
+  const baseZ = Math.max(0, Number(options.baseZ) || 0)
+  const viewIds = stringArray(options.viewIds).length ? stringArray(options.viewIds) : ['device_part']
+  const groupId = String(options.groupId || 'group_device_part_detail').replace(/[^a-zA-Z0-9_-]/g, '_')
+  const visibility = {
+    viewModes: ['device'],
+    viewIds,
+    matchBoundDevice: false,
+    ruleMode: 'all',
+    rules: [{ source: 'context', path: 'inspectionStage', operator: '==', value: 'part' }]
+  }
+  const pointItems = Array.from({ length: 6 }, (_, index) => ({
+    label: `参数 ${index + 1}`,
+    labelPath: `selectedPart.points.${index}.label`,
+    path: `selectedPart.points.${index}.value`,
+    unitPath: `selectedPart.points.${index}.unit`,
+    decimals: 2
+  }))
+  const create = (source, offset) => normalizeDashboardWidget({
+    ...source,
+    groupId,
+    visibility: deepClone(visibility),
+    runtimeTarget: 'overlay',
+    zIndex: baseZ + offset
+  }, canvas, baseZ + offset)
+
+  const innerX = panelX + padding
+  const nameY = panelY + padding
+  const descriptionY = nameY + nameHeight + gap
+  const metricsY = descriptionY + descriptionHeight + gap
+  const footerY = metricsY + metricsHeight + gap
+
+  return [
+    create({
+      id: 'widget_device_part_panel',
+      type: 'container',
+      title: '部件详情面板',
+      locked: true,
+      frame: { x: panelX, y: panelY, width: panelWidth, height: panelHeight, rotation: 0 },
+      content: { showTitle: false, previewLabel: '部件详情区域' },
+      style: {
+        background: 'linear-gradient(155deg, rgba(7, 22, 36, .94), rgba(9, 30, 48, .84))',
+        color: '#eef7ff',
+        borderColor: 'rgba(91, 193, 255, .35)',
+        borderRadius: 20,
+        padding: 0,
+        shadow: 'strong'
+      }
+    }, 0),
+    create({
+      id: 'widget_device_part_name',
+      type: 'text',
+      title: '已选部件',
+      frame: { x: innerX, y: nameY, width: innerWidth, height: nameHeight, rotation: 0 },
+      content: { text: '{value}', align: 'left' },
+      style: {
+        background: 'rgba(20, 53, 78, .72)',
+        color: '#ffffff',
+        fontSize: 30,
+        borderColor: 'rgba(101, 207, 255, .32)',
+        borderRadius: 14,
+        padding: 16,
+        shadow: 'glow'
+      },
+      data: { mode: 'runtime', path: 'selectedPart.name', readOnly: true }
+    }, 1),
+    create({
+      id: 'widget_device_part_description',
+      type: 'text',
+      title: '部件说明',
+      frame: { x: innerX, y: descriptionY, width: innerWidth, height: descriptionHeight, rotation: 0 },
+      content: { text: '{value}', align: 'left' },
+      style: {
+        background: 'rgba(10, 28, 44, .68)',
+        color: '#cfe3f1',
+        fontSize: 17,
+        borderColor: 'rgba(101, 174, 220, .2)',
+        borderRadius: 14,
+        padding: 16,
+        shadow: 'soft'
+      },
+      data: { mode: 'runtime', path: 'selectedPart.description', readOnly: true }
+    }, 2),
+    create({
+      id: 'widget_device_part_metrics',
+      type: 'metrics',
+      title: '实时参数 / 运行状况',
+      frame: { x: innerX, y: metricsY, width: innerWidth, height: metricsHeight, rotation: 0 },
+      content: {
+        layout: 'list',
+        hideEmptyItems: true,
+        emptyText: '该部件暂未关联实时点位',
+        items: pointItems
+      },
+      style: {
+        background: 'rgba(10, 28, 44, .76)',
+        color: '#eef7ff',
+        borderColor: 'rgba(89, 178, 238, .28)',
+        borderRadius: 14,
+        padding: 16,
+        shadow: 'soft'
+      },
+      data: { mode: 'runtime', path: 'selectedPart.points.0.value', readOnly: true }
+    }, 3),
+    create({
+      id: 'widget_device_part_id',
+      type: 'text',
+      title: '',
+      frame: { x: innerX, y: footerY, width: innerWidth, height: footerHeight, rotation: 0 },
+      content: { text: '部件编号  {value}', showTitle: false, align: 'left' },
+      style: {
+        background: 'rgba(10, 28, 44, .48)',
+        color: '#86a8be',
+        fontSize: 13,
+        borderColor: 'rgba(89, 178, 238, .16)',
+        borderRadius: 12,
+        padding: 14
+      },
+      data: { mode: 'runtime', path: 'selectedPart.id', readOnly: true }
+    }, 4)
+  ]
 }
 
 export function widgetTypeLabel(type) {

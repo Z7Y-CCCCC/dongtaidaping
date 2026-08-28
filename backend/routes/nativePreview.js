@@ -52,7 +52,9 @@ function normalizeFocus(value) {
         mode,
         workshopId: shortText(source.workshopId, 120),
         lineId: shortText(source.lineId, 120),
-        deviceId: shortText(source.deviceId, 120)
+        deviceId: shortText(source.deviceId, 120),
+        inspectionStage: shortText(source.inspectionStage, 32),
+        partId: shortText(source.partId, 128)
     };
 }
 
@@ -68,14 +70,10 @@ module.exports = function createNativePreviewRouter(controller) {
     });
 
     router.post('/', (req, res) => {
-        const action = ['apply', 'reset', 'reload', 'camera', 'focus', 'view'].includes(req.body?.action)
+        const action = ['apply', 'reset', 'reload', 'camera', 'focus', 'view', 'inspection_back'].includes(req.body?.action)
             ? req.body.action
             : 'apply';
-        const devices = (Array.isArray(req.body?.devices) ? req.body.devices : [])
-            .slice(0, MAX_DEVICES)
-            .map(normalizeDevice)
-            .filter(device => device.id);
-        const lines = (Array.isArray(req.body?.lines) ? req.body.lines : [])
+        const normalizedLines = (Array.isArray(req.body?.lines) ? req.body.lines : [])
             .slice(0, MAX_LINES)
             .map(line => ({
                 id: shortText(line?.id, 120),
@@ -83,6 +81,20 @@ module.exports = function createNativePreviewRouter(controller) {
                 layout_json: normalizeLineLayout(line?.layout_json ?? line?.layout)
             }))
             .filter(line => line.id);
+        const pendingLineIds = new Set(
+            normalizedLines.filter(line => line.layout_json.placementPending).map(line => String(line.id))
+        );
+        const lines = normalizedLines.filter(line => !line.layout_json.placementPending);
+        const devices = (Array.isArray(req.body?.devices) ? req.body.devices : [])
+            .slice(0, MAX_DEVICES)
+            .map(normalizeDevice)
+            .filter(device => {
+                if (!device.id) return false;
+                const config = safeObject(device.instance_config);
+                return !pendingLineIds.has(String(device.line_id || ''))
+                    && !pendingLineIds.has(String(config.laneLineId || ''))
+                    && !pendingLineIds.has(String(config.railLineId || ''));
+            });
         const workshops = (Array.isArray(req.body?.workshops) ? req.body.workshops : [])
             .slice(0, MAX_WORKSHOPS)
             .map(workshop => ({

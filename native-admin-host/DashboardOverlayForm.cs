@@ -102,6 +102,13 @@ internal sealed class DashboardOverlayForm : Form
         PostHostState();
     }
 
+    public void Reload()
+    {
+        if (IsDisposed || _webView.CoreWebView2 == null) return;
+        ApplyEmptyInteractionRegion();
+        _webView.CoreWebView2.Reload();
+    }
+
     /// <summary>
     /// 投屏时隐藏 AdminHost 顶部页签，透明数据层需要随之扩展到 Unity
     /// 客户区的最上方；停止投屏后恢复正常的嵌入布局。

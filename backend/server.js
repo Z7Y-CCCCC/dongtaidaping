@@ -28,7 +28,7 @@ const {
     saveDatabaseConfig,
     testDatabaseConfig
 } = require('./db/database');
-const { mergeBuiltinModels } = require('./services/builtinModels');
+const { getBuiltinModels, mergeBuiltinModels } = require('./services/builtinModels');
 const { stringifyModelMetadata } = require('./services/modelAssetMetadata');
 const { publicProtocolDefinitions } = require('./services/plcProtocolConfig');
 const {
@@ -235,7 +235,23 @@ app.get('/api/models', async (req, res) => {
 app.put('/api/models/:id', async (req, res) => {
     try {
         const db = await getDb();
-        const existing = await db.get('SELECT * FROM models WHERE id = ?', [req.params.id]);
+        let existing = await db.get('SELECT * FROM models WHERE id = ?', [req.params.id]);
+        if (!existing) {
+            const builtin = getBuiltinModels().find(model => model.id === req.params.id);
+            if (builtin?.file_path) {
+                await db.upsert('models', {
+                    id: builtin.id,
+                    name: builtin.name,
+                    file_path: builtin.file_path,
+                    asset_type: builtin.asset_type || 'model',
+                    tags: builtin.tags || '[]',
+                    thumbnail: builtin.thumbnail || null,
+                    default_scale: Number(builtin.default_scale || 1),
+                    metadata: builtin.metadata || '{}'
+                }, 'id');
+                existing = await db.get('SELECT * FROM models WHERE id = ?', [req.params.id]);
+            }
+        }
         if (!existing) {
             return res.status(404).json({ error: '模型不存在或为不可编辑的内置模型' });
         }

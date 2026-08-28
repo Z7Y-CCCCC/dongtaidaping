@@ -446,7 +446,7 @@ function normalizeBinding(source = {}) {
         label: shortText(source.label, source.alias || '数据项', 100),
         color: shortText(source.color, '#55c7ff', 64),
         contextField: shortText(source.contextField, '', 255),
-        contextKey: ['deviceId', 'lineId', 'workshopId', 'viewId'].includes(source.contextKey) ? source.contextKey : ''
+        contextKey: ['deviceId', 'lineId', 'workshopId', 'viewId', 'partId'].includes(source.contextKey) ? source.contextKey : ''
     };
 }
 

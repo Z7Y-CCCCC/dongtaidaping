@@ -51,7 +51,7 @@ router.get('/', async (req, res) => {
             pointsByDevice[p.device_id].push(p);
         });
 
-        const linesWithDevices = lines.map(line => {
+        const normalizedLines = lines.map(line => {
             const layout = normalizeLineLayout(line.layout_json || line.layout);
             const devices = allDevices
                 .filter(d => d.line_id === line.id && !isAuxiliaryDevice(d))
@@ -61,6 +61,10 @@ router.get('/', async (req, res) => {
                 }));
             return { ...line, layout, layout_json: JSON.stringify(layout), devices };
         });
+        const pendingLineIds = new Set(
+            normalizedLines.filter(line => line.layout.placementPending).map(line => String(line.id))
+        );
+        const linesWithDevices = normalizedLines.filter(line => !line.layout.placementPending);
 
         const workshopsWithLines = workshops.map(ws => {
             const layout = normalizeWorkshopLayout(ws.layout_json || ws.layout);
@@ -70,6 +74,9 @@ router.get('/', async (req, res) => {
                 .filter(d => {
                     if (!isAuxiliaryDevice(d)) return false;
                     const config = safeJsonParse(d.instance_config, {});
+                    if (pendingLineIds.has(String(d.line_id || ''))
+                        || pendingLineIds.has(String(config.laneLineId || ''))
+                        || pendingLineIds.has(String(config.railLineId || ''))) return false;
                     return config.workshop_id === ws.id
                         || config.workshopId === ws.id
                         || (d.line_id && wsLineIds.has(d.line_id));

@@ -11,6 +11,8 @@ const props = defineProps({
   deviceDataMap: { type: Object, default: () => ({}) },
   pointValues: { type: Object, default: () => ({}) },
   databaseValues: { type: Object, default: () => ({}) },
+  runtimeContext: { type: Object, default: () => ({}) },
+  selectedPart: { type: Object, default: () => ({}) },
   preview: { type: Boolean, default: false }
 })
 
@@ -49,7 +51,9 @@ const dataContext = computed(() => ({
   trendPoints: props.trendPoints,
   deviceStatusMap: props.deviceStatusMap,
   deviceDataMap: props.deviceDataMap,
-  points: props.pointValues
+  points: props.pointValues,
+  context: props.runtimeContext,
+  selectedPart: props.selectedPart
 }))
 
 function getWidgetValue(path) {
@@ -168,15 +172,23 @@ const metricItems = computed(() => {
     { label: '在线设备', path: 'metrics.online_devices', suffixPath: 'metrics.total_devices', separator: '/' }
   ]
   return items.map(item => {
-    const value = getWidgetValue(item.path)
+    const rawValue = getWidgetValue(item.path)
     const suffix = item.suffixPath ? getWidgetValue(item.suffixPath) : undefined
+    const dynamicLabel = item.labelPath ? getWidgetValue(item.labelPath) : undefined
+    const dynamicUnit = item.unitPath ? getWidgetValue(item.unitPath) : undefined
+    const hasValue = rawValue !== undefined && rawValue !== null && rawValue !== ''
+    const decimals = Number(item.decimals)
+    const formattedValue = hasValue && typeof rawValue === 'number' && Number.isFinite(decimals)
+      ? rawValue.toLocaleString(undefined, { minimumFractionDigits: Math.max(0, decimals), maximumFractionDigits: Math.max(0, decimals) })
+      : (hasValue ? String(rawValue) : (item.fallback ?? '--'))
     return {
-      label: item.label || item.path || '指标',
+      label: dynamicLabel || item.label || item.path || '指标',
       value: item.suffixPath
-        ? `${value ?? '--'}${item.separator || ''}${suffix ?? '--'}${item.unit || ''}`
-        : `${value ?? '--'}${item.unit || ''}`
+        ? `${formattedValue}${item.separator || ''}${suffix ?? '--'}${dynamicUnit ?? item.unit ?? ''}`
+        : `${formattedValue}${dynamicUnit ?? item.unit ?? ''}`,
+      hasValue
     }
-  })
+  }).filter(item => content.value.hideEmptyItems !== true || item.hasValue)
 })
 
 const eventRows = computed(() => {
@@ -247,6 +259,7 @@ function disposeChart() { if (chart) { chart.dispose(); chart = null } }
 
 function renderChart() {
   if (!['trend', 'metrics'].includes(type.value)) { disposeChart(); return }
+  if (type.value === 'metrics' && content.value.layout === 'list') { disposeChart(); return }
   if (!chartRef.value) return
   if (!chart) chart = echarts.init(chartRef.value)
   if (type.value === 'trend') {
@@ -363,7 +376,7 @@ onUnmounted(() => { window.removeEventListener('resize', resizeChart); disposeCh
     <div v-if="widgetTitle && content.showTitle !== false && type !== 'image'" class="widget-title"><i></i><span>{{ widgetTitle }}</span></div>
 
     <template v-if="type === 'metrics'">
-      <div class="metrics-layout"><div ref="chartRef" class="widget-chart"></div><div class="metric-list"><div v-for="item in metricItems" :key="item.label" class="metric-row"><span>{{ item.label }}</span><strong>{{ item.value }}</strong></div></div></div>
+      <div class="metrics-layout" :class="{ 'list-only': content.layout === 'list' }"><div v-if="content.layout !== 'list'" ref="chartRef" class="widget-chart"></div><div class="metric-list"><div v-for="item in metricItems" :key="item.label" class="metric-row"><span>{{ item.label }}</span><strong>{{ item.value }}</strong></div><p v-if="!metricItems.length" class="metric-empty">{{ content.emptyText || '暂无指标数据' }}</p></div></div>
     </template>
 
     <template v-else-if="type === 'trend'">
@@ -400,7 +413,7 @@ onUnmounted(() => { window.removeEventListener('resize', resizeChart); disposeCh
     </template>
 
     <template v-else-if="type === 'container'">
-      <div class="container-placeholder"><span></span><small>容器区域</small></div>
+      <div v-if="preview" class="container-placeholder"><span></span><small>{{ content.previewLabel || '容器区域' }}</small></div>
     </template>
 
     <template v-else>
@@ -412,7 +425,7 @@ onUnmounted(() => { window.removeEventListener('resize', resizeChart); disposeCh
 <style scoped>
 .widget-shell{box-sizing:border-box;position:relative;width:100%;height:100%;min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden;padding:14px;border:1px solid rgba(91,169,219,.24);border-radius:14px;color:#edf7ff;background:rgba(10,24,38,.82);box-shadow:0 14px 34px rgba(0,8,18,.22);font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;transition:border-color .18s,filter .18s,transform .18s}.widget-shell.interactive{cursor:pointer}.widget-shell.quality-bad{filter:saturate(.72)}
 .widget-title{flex:0 0 auto;display:flex;align-items:center;gap:8px;min-height:22px;margin-bottom:8px;color:inherit;font-size:13px;font-weight:700;letter-spacing:.02em}.widget-title i{width:3px;height:14px;border-radius:99px;background:var(--widget-line-color,#55c7ff);box-shadow:0 0 12px color-mix(in srgb,var(--widget-line-color,#55c7ff) 55%,transparent)}.widget-title span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.metrics-layout{flex:1;min-height:0;display:grid;grid-template-columns:minmax(110px,38%) minmax(0,1fr);gap:12px}.widget-chart{width:100%;height:100%;min-height:80px}.trend-chart{flex:1}.metric-list{min-height:0;display:grid;align-content:center;gap:3px;overflow:hidden}.metric-row{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:26px;padding:3px 0;border-bottom:1px solid rgba(175,214,239,.07);color:#91a7b9;font-size:11px}.metric-row strong{color:#f1f8fd;font-size:13px}
+.metrics-layout{flex:1;min-height:0;display:grid;grid-template-columns:minmax(110px,38%) minmax(0,1fr);gap:12px}.metrics-layout.list-only{display:block}.widget-chart{width:100%;height:100%;min-height:80px}.trend-chart{flex:1}.metric-list{min-height:0;display:grid;align-content:center;gap:3px;overflow:hidden}.list-only .metric-list{height:100%;align-content:start;gap:0}.metric-row{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:26px;padding:3px 0;border-bottom:1px solid rgba(175,214,239,.07);color:#91a7b9;font-size:11px}.list-only .metric-row{min-height:42px;padding:7px 2px;font-size:12px}.metric-row strong{color:#f1f8fd;font-size:13px}.list-only .metric-row strong{font-size:15px}.metric-empty{display:grid;place-items:center;min-height:100%;margin:0;color:#71899d;font-size:11px;text-align:center}
 .alarm-list{flex:1;min-height:0;margin:0;padding:0;overflow:hidden;list-style:none}.alarm-list li{display:grid;grid-template-columns:25px minmax(0,1fr) auto;gap:8px;align-items:center;min-height:31px;border-bottom:1px solid rgba(174,214,240,.07);font-size:10px}.rank,.tag{display:grid;place-items:center;min-height:20px;padding:0 5px;border-radius:6px;color:#91bdd8;background:rgba(74,141,185,.12)}.rank.warning,.tag.warning{color:#ffd080;background:rgba(255,176,52,.12)}.rank.critical,.tag.critical{color:#ff8c88;background:rgba(255,94,89,.12)}.alarm-txt{min-width:0;overflow:hidden;color:#d0dfeb;text-overflow:ellipsis;white-space:nowrap}.alarm-txt small{margin-right:7px;color:#6f899d}.tag{font-size:8px;text-transform:uppercase}
 .marquee-content-wrap{flex:1;min-height:0;overflow:hidden}.marquee-content{display:flex;align-items:center;width:max-content;height:100%;white-space:nowrap;animation:widgetMarquee linear infinite}.marquee-item{margin-right:42px;color:inherit;font-size:12px}.marquee-item.warning{color:#ffd080}.marquee-item.critical{color:#ff8c88}
 .text-widget-body{flex:1;min-height:0;display:grid;align-content:center;gap:5px;overflow:hidden;color:inherit;line-height:1.5}.text-widget-body p{margin:0;white-space:pre-wrap}

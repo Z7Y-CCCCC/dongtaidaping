@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Drawing.Drawing2D;
 using System.IO.Pipes;
 using System.Net.Http;
 using System.Text;
@@ -24,6 +25,8 @@ internal sealed class AdminPanelForm : Form
     private readonly Panel _header = new();
     private readonly Label _title = new();
     private readonly Label _status = new();
+    private readonly NativeRefreshButton _refreshButton;
+    private readonly ToolTip _refreshToolTip = new();
     private readonly Button _maximizeButton = new();
     private readonly Button _closeButton = new();
     private readonly Panel _resizeGrip = new();
@@ -71,6 +74,7 @@ internal sealed class AdminPanelForm : Form
         _parentRestoreBounds = Rectangle.Empty;
         _attached = _parentHandle != IntPtr.Zero;
         _adminVisible = !options.StartInDashboardMode;
+        _refreshButton = new NativeRefreshButton(ReloadWebPages);
 
         Text = "后台管理";
         FormBorderStyle = FormBorderStyle.None;
@@ -175,9 +179,15 @@ internal sealed class AdminPanelForm : Form
         _resizeGrip.MouseMove += ContinueResize;
         _resizeGrip.MouseUp += EndResize;
 
+        _refreshButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _refreshButton.Location = new Point(Math.Max(0, ClientSize.Width - 166), 0);
+        _refreshToolTip.SetToolTip(_refreshButton, "刷新页面");
+
         Controls.Add(_webView);
         Controls.Add(_header);
         Controls.Add(_resizeGrip);
+        Controls.Add(_refreshButton);
+        _refreshButton.BringToFront();
         _resizeGrip.BringToFront();
     }
 
@@ -330,6 +340,7 @@ internal sealed class AdminPanelForm : Form
                 else if (action == "maximize") ToggleMaximize();
                 else if (action == "show_dashboard") ShowDashboard();
                 else if (action == "show_admin") ShowAdmin();
+                else if (action == "reload_page") ReloadWebPages();
                 else if (action == "close_window") HandleCloseRequest();
                 else if (action == "close") HandleCloseRequest();
                 else if (action == "state") SendHostState();
@@ -395,6 +406,28 @@ internal sealed class AdminPanelForm : Form
     private bool _webViewReadyForMessages()
     {
         return _webView.CoreWebView2 != null && !IsDisposed;
+    }
+
+    private void ReloadWebPages()
+    {
+        if (_closing || IsDisposed) return;
+        try
+        {
+            _webView.CoreWebView2?.Reload();
+        }
+        catch (Exception exception)
+        {
+            WriteHostError("后台页面刷新失败", exception);
+        }
+
+        try
+        {
+            _dashboardOverlay?.Reload();
+        }
+        catch (Exception exception)
+        {
+            WriteHostError("透明数据层刷新失败", exception);
+        }
     }
 
     private void ApplyInitialPlacement()
@@ -792,6 +825,9 @@ internal sealed class AdminPanelForm : Form
                 break;
             case "maximize":
                 ToggleParentMaximize();
+                break;
+            case "reload":
+                ReloadWebPages();
                 break;
             case "close":
                 HandleCloseRequest();
@@ -1681,6 +1717,114 @@ internal sealed class AdminPanelForm : Form
         public IntPtr Handle { get; } = handle;
     }
 
+    private sealed class NativeRefreshButton : Control
+    {
+        private readonly Action _action;
+        private bool _hovered;
+        private bool _pressed;
+
+        public NativeRefreshButton(Action action)
+        {
+            _action = action;
+            Size = new Size(40, 32);
+            Cursor = Cursors.Hand;
+            TabStop = false;
+            AccessibleRole = AccessibleRole.PushButton;
+            AccessibleName = "刷新页面";
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint
+                | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw
+                | ControlStyles.UserPaint,
+                true
+            );
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            var graphics = e.Graphics;
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var background = new LinearGradientBrush(
+                ClientRectangle,
+                Color.FromArgb(237, 242, 247),
+                Color.FromArgb(226, 234, 241),
+                LinearGradientMode.Vertical
+            ))
+            {
+                graphics.FillRectangle(background, ClientRectangle);
+            }
+
+            var scale = Math.Max(1f, DeviceDpi / 96f);
+            if (_hovered || _pressed)
+            {
+                var hoverRect = Rectangle.Inflate(ClientRectangle, -(int)Math.Round(2 * scale), -(int)Math.Round(2 * scale));
+                using var hoverPath = RoundedPath(hoverRect, Math.Max(4, (int)Math.Round(7 * scale)));
+                using var hoverBrush = new SolidBrush(_pressed
+                    ? Color.FromArgb(192, 206, 218)
+                    : Color.FromArgb(211, 222, 231));
+                graphics.FillPath(hoverBrush, hoverPath);
+            }
+
+            using var pen = new Pen(Color.FromArgb(71, 84, 103), 1.65f * scale)
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round
+            };
+            var arc = new RectangleF(12 * scale, 7 * scale, 16 * scale, 16 * scale);
+            graphics.DrawArc(pen, arc, -42, 300);
+            var tip = new PointF(arc.Right - 1.2f * scale, arc.Top + 3.2f * scale);
+            graphics.DrawLine(pen, tip, new PointF(tip.X - 5 * scale, tip.Y));
+            graphics.DrawLine(pen, tip, new PointF(tip.X, tip.Y + 5 * scale));
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            base.OnMouseEnter(e);
+            _hovered = true;
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            _hovered = false;
+            _pressed = false;
+            Invalidate();
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            _pressed = true;
+            Capture = true;
+            Invalidate();
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (e.Button != MouseButtons.Left || !_pressed) return;
+            _pressed = false;
+            Capture = false;
+            Invalidate();
+            if (ClientRectangle.Contains(e.Location)) _action();
+        }
+
+        private static GraphicsPath RoundedPath(Rectangle rect, int radius)
+        {
+            var diameter = Math.Max(2, radius * 2);
+            var path = new GraphicsPath();
+            path.AddArc(rect.Left, rect.Top, diameter, diameter, 180, 90);
+            path.AddArc(rect.Right - diameter, rect.Top, diameter, diameter, 270, 90);
+            path.AddArc(rect.Right - diameter, rect.Bottom - diameter, diameter, diameter, 0, 90);
+            path.AddArc(rect.Left, rect.Bottom - diameter, diameter, diameter, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         _closing = true;
@@ -1707,6 +1851,7 @@ internal sealed class AdminPanelForm : Form
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing) _refreshToolTip.Dispose();
         if (disposing && !_webViewDisposeAttempted)
         {
             _webViewDisposeAttempted = true;

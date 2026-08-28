@@ -13,7 +13,10 @@ const lineReturnBusy = ref(false)
 const navigationRootReady = ref(false)
 const childNavigationEntered = ref(false)
 const databaseValues = reactive({})
-const runtimeContext = reactive({ viewId: 'factory_overview', viewMode: 'factory', sceneReady: false, sceneId: '', workshopId: '', lineId: '', deviceId: '' })
+const runtimeContext = reactive({
+    viewId: 'factory_overview', viewMode: 'factory', sceneReady: false, sceneId: '', workshopId: '', lineId: '', deviceId: '',
+    inspectionStage: '', partId: '', partName: '', partDescription: '', partPointIds: [], partPointKeys: [], partDetailViewId: ''
+})
 const groupVisibility = reactive({})
 const widgetVisibility = reactive({})
 
@@ -54,6 +57,7 @@ const canReturnToParentView = computed(() => {
     if (runtimeContext.sceneReady === false) return false
     const mode = String(runtimeContext.viewMode || currentView.value?.mode || 'factory').toLowerCase()
     if (mode === 'factory' || runtimeContext.viewId === defaultViewId.value) return false
+    if (mode === 'device' && runtimeContext.inspectionStage && runtimeContext.inspectionStage !== 'solid') return true
     if (!currentView.value?.returnViewId && !currentView.value?.parentViewId) return false
     if (mode === 'device') return Boolean(runtimeContext.deviceId || currentView.value?.targetId)
     if (mode === 'line') return Boolean(runtimeContext.lineId || currentView.value?.targetId)
@@ -69,10 +73,10 @@ function runtimeContextIsRoot() {
 
 function applyRuntimeContext(payload, { userNavigation = false } = {}) {
     if (!payload || typeof payload !== 'object') return
-    const previousDataContext = [runtimeContext.viewId, runtimeContext.workshopId, runtimeContext.lineId, runtimeContext.deviceId].join('|')
+    const previousDataContext = [runtimeContext.viewId, runtimeContext.workshopId, runtimeContext.lineId, runtimeContext.deviceId, runtimeContext.partId].join('|')
     Object.assign(runtimeContext, payload)
     if (!Object.prototype.hasOwnProperty.call(payload, 'sceneReady')) runtimeContext.sceneReady = true
-    const nextDataContext = [runtimeContext.viewId, runtimeContext.workshopId, runtimeContext.lineId, runtimeContext.deviceId].join('|')
+    const nextDataContext = [runtimeContext.viewId, runtimeContext.workshopId, runtimeContext.lineId, runtimeContext.deviceId, runtimeContext.partId].join('|')
     if (previousDataContext !== nextDataContext) refreshDatabaseValues(true)
 
     if (runtimeContextIsRoot()) {
@@ -88,6 +92,9 @@ function applyRuntimeContext(payload, { userNavigation = false } = {}) {
     }
 }
 const parentViewName = computed(() => {
+    if (runtimeContext.inspectionStage === 'part') return '设备拆解视角'
+    if (runtimeContext.inspectionStage === 'exploded') return '设备透视视角'
+    if (runtimeContext.inspectionStage === 'xray') return '设备实体视角'
     const parentId = currentView.value?.returnViewId || currentView.value?.parentViewId
     return dashboardViews.value.find(view => view.id === parentId)?.name || '上一级视角'
 })
@@ -160,6 +167,47 @@ const pointValues = computed(() => {
     return result
 })
 
+function pointForContextKey(deviceId, key) {
+    const value = String(key || '').trim()
+    if (!value) return null
+    const separator = value.indexOf('.')
+    const category = separator > 0 ? value.slice(0, separator) : ''
+    const field = separator > 0 ? value.slice(separator + 1) : value
+    for (const workshop of getWorkshops() || []) {
+        for (const line of workshop.lines || []) {
+            const device = (line.devices || []).find(item => String(item.id) === String(deviceId))
+            if (!device) continue
+            const point = (device.dataPoints || []).find(item => {
+                const pointCategory = String(item.category || 'analog')
+                const pointField = String(item.value_role || item.name || '')
+                return (!category || pointCategory === category) && pointField === field
+            })
+            if (point) return pointValues.value[`${deviceId}:${point.id}`] || null
+        }
+    }
+    return null
+}
+
+const selectedPart = computed(() => {
+    const deviceId = String(runtimeContext.deviceId || '')
+    const pointIds = Array.isArray(runtimeContext.partPointIds) ? runtimeContext.partPointIds : []
+    const pointKeys = Array.isArray(runtimeContext.partPointKeys) ? runtimeContext.partPointKeys : []
+    const resolvedPoints = [
+        ...pointIds.map(id => pointValues.value[`${deviceId}:${id}`] || pointValues.value[String(id)]).filter(Boolean),
+        ...pointKeys.map(key => pointForContextKey(deviceId, key)).filter(Boolean)
+    ]
+    const points = [...new Map(resolvedPoints.map((point, index) => [String(point.id || `${point.category || ''}.${point.value_role || point.name || index}`), point])).values()]
+    const pointMap = Object.fromEntries(points.map((point, index) => [String(point.id || index), point]))
+    return {
+        id: runtimeContext.partId || '',
+        name: runtimeContext.partName || '',
+        description: runtimeContext.partDescription || '',
+        points,
+        pointMap,
+        stage: runtimeContext.inspectionStage || ''
+    }
+})
+
 function runtimeValueForWidget(widget) {
     const binding = widget?.data || widget?.binding || {}
     if (binding.mode === 'database') return databaseValues[widget.id]?.value
@@ -174,7 +222,9 @@ function runtimeValueForWidget(widget) {
             events: dataStore.events.value,
             trendPoints: dataStore.trendPoints.value,
             deviceStatusMap: dataStore.deviceStatusMap,
-            deviceDataMap: dataStore.deviceDataMap
+            deviceDataMap: dataStore.deviceDataMap,
+            context: runtimeContext,
+            selectedPart: selectedPart.value
         }
         return getByPath(context, binding.path || binding.source)
     }
@@ -308,6 +358,7 @@ async function focusNativeScene(mode, event = {}) {
         deviceId: mode === 'device' ? (event.deviceId || '') : '',
         lineId: mode === 'line' ? (event.lineId || runtimeContext.lineId || '') : (mode === 'device' ? runtimeContext.lineId : ''),
         workshopId: mode === 'workshop' ? (event.workshopId || '') : (['line', 'device'].includes(mode) ? runtimeContext.workshopId : '')
+        ,inspectionStage: '', partId: ''
     }
     Object.assign(runtimeContext, nextContext)
     try {
@@ -349,6 +400,7 @@ async function focusNativeView(viewId, event = {}) {
         deviceId: mode === 'device' ? (event.deviceId || view?.targetId || '') : '',
         lineId: mode === 'line' ? (event.lineId || view?.targetId || runtimeContext.lineId || '') : (mode === 'device' ? runtimeContext.lineId : ''),
         workshopId: mode === 'workshop' ? (event.workshopId || view?.targetId || '') : (['line', 'device'].includes(mode) ? runtimeContext.workshopId : '')
+        ,inspectionStage: '', partId: ''
     }
     Object.assign(runtimeContext, nextContext)
     try {
@@ -378,6 +430,14 @@ async function returnToLineView() {
     if (lineReturnBusy.value) return
     lineReturnBusy.value = true
     try {
+        if (runtimeContext.viewMode === 'device' && runtimeContext.inspectionStage && runtimeContext.inspectionStage !== 'solid') {
+            await fetch(`${API_BASE}/native-preview`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'inspection_back', source: 'dashboard_overlay', focus: { mode: 'device', deviceId: runtimeContext.deviceId } })
+            })
+            return
+        }
         const parentId = currentView.value?.returnViewId || currentView.value?.parentViewId
         if (parentId) await focusNativeView(parentId, { mode: 'factory' })
         else await focusNativeScene('line')
@@ -455,7 +515,8 @@ async function refreshDatabaseValues(force = false) {
             view_id: runtimeContext.viewId || '',
             workshop_id: runtimeContext.workshopId || '',
             line_id: runtimeContext.lineId || '',
-            device_id: runtimeContext.deviceId || ''
+            device_id: runtimeContext.deviceId || '',
+            part_id: runtimeContext.partId || ''
         })
         const response = await fetch(`${API_BASE}/data-sources/runtime-values?${query}`)
         if (!response.ok) return
@@ -571,9 +632,11 @@ onUnmounted(() => {
                     :events="dataStore.events.value"
                     :trend-points="dataStore.trendPoints.value"
                     :device-status-map="dataStore.deviceStatusMap"
-                    :device-data-map="dataStore.deviceDataMap"
-                    :point-values="pointValues"
-                    :database-values="databaseValues"
+        :device-data-map="dataStore.deviceDataMap"
+        :point-values="pointValues"
+        :database-values="databaseValues"
+        :runtime-context="runtimeContext"
+        :selected-part="selectedPart"
                     @action="handleWidgetAction"
                 />
             </div>

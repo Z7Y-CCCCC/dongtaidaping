@@ -15,9 +15,16 @@ async function main() {
         actual REAL NOT NULL,
         target REAL NOT NULL
     )`);
+    seed.exec(`CREATE TABLE designer_part_metrics (
+        part_id TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        value REAL NOT NULL
+    )`);
     seed.prepare('INSERT INTO designer_metrics(device_id, recorded_at, actual, target) VALUES (?, ?, ?, ?)').run('Device_01', '2026-08-15 10:00:00', 40, 50);
     seed.prepare('INSERT INTO designer_metrics(device_id, recorded_at, actual, target) VALUES (?, ?, ?, ?)').run('Device_01', '2026-08-15 10:05:00', 80, 100);
     seed.prepare('INSERT INTO designer_metrics(device_id, recorded_at, actual, target) VALUES (?, ?, ?, ?)').run('Device_02', '2026-08-15 10:05:00', 10, 100);
+    seed.prepare('INSERT INTO designer_part_metrics(part_id, recorded_at, value) VALUES (?, ?, ?)').run('front_door_open', '2026-08-15 10:05:00', 55);
+    seed.prepare('INSERT INTO designer_part_metrics(part_id, recorded_at, value) VALUES (?, ?, ?)').run('rear_fan_rotate', '2026-08-15 10:05:00', 88);
     seed.close();
     process.env.APP_DATA_DIR = root;
 
@@ -66,6 +73,14 @@ async function main() {
     if (multiRuntime.widget_multi?.value !== 10 || multiRuntime.widget_multi?.series?.length !== 3) {
         throw new Error(`运行时设备上下文过滤失效：${JSON.stringify(multiRuntime.widget_multi)}`);
     }
+    const partRuntime = await service.readRuntimeBindings([{ id: 'widget_part', data: {
+        mode: 'database', connectionId: connection.id, table: 'designer_part_metrics', field: 'value',
+        timeField: 'recorded_at', orderBy: 'recorded_at', valueMode: 'latest',
+        contextKey: 'partId', contextField: 'part_id'
+    } }], { partId: 'front_door_open' });
+    if (partRuntime.widget_part?.value !== 55) {
+        throw new Error(`运行时部件上下文过滤失效：${JSON.stringify(partRuntime.widget_part)}`);
+    }
     const configuredBackupRules = service.saveBackupConfig({
         startupEnabled: false,
         scheduledEnabled: true,
@@ -110,6 +125,7 @@ async function main() {
         runtimeQuality: runtime.widget_test?.quality,
         multiDatasetFormula: multiPreview.value,
         deviceContextFormula: multiRuntime.widget_multi?.value,
+        partContextValue: partRuntime.widget_part?.value,
         backup: backup.filename,
         shutdownBackup: shutdownBackups[0],
         configurableTriggers: true
