@@ -18,6 +18,7 @@
     "test:runtime": "node scripts/runtime-display-test.cjs",
     "test:native-dashboard": "node scripts/native-dashboard-config-test.cjs",
     "test:native-preview": "node scripts/native-scene-preview-test.cjs",
+    "test:mcp": "node scripts/mcp-interface-test.cjs",
     "test:spatial": "node scripts/spatial-hierarchy-test.cjs",
     "test:cast": "node scripts/cast-discovery-test.cjs",
     "test:designer": "node scripts/dashboard-designer-test.cjs",

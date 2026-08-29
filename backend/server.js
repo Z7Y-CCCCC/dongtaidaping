@@ -88,6 +88,8 @@ const nativePreviewController = { wsServer: null };
 app.use('/api/native-preview', require('./routes/nativePreview')(nativePreviewController));
 app.use('/api/platform', require('./routes/platform'));
 app.use('/api/data-sources', require('./routes/dataSources'));
+// 受控的本机 MCP 接口：让设计/验收 agent 通过 JSON-RPC 操作现场配置。
+app.use('/api/mcp', require('./routes/mcp')({ port: PORT }));
 
 // 仅供 Electron 本机管理“登录后自启”和局域网投屏，路由内部会拒绝非回环请求。
 const runtimeController = { lanDisplay: null };
@@ -690,6 +692,7 @@ async function startServer() {
         console.log(`   Database:    ${dbConfig.type} ${dbConfig.host || dbConfig.filename}:${dbConfig.port || ''}/${dbConfig.database || ''}`);
         console.log(`   配置 API:    http://${HOST}:${PORT}/api/config`);
         console.log(`   管理 API:    http://${HOST}:${PORT}/api/lines | devices | datapoints | settings`);
+        console.log(`   MCP 接口:    http://${HOST}:${PORT}/api/mcp`);
         console.log(`   引擎状态:    http://${HOST}:${PORT}/api/engine/status`);
         console.log(`   WebSocket:   ws://${HOST}:${PORT}/ws\n`);
 

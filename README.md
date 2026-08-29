@@ -309,6 +309,30 @@ GET /api/platform/events?limit=20&window_hours=24
 - 诊断面板配置
 - 数据库连接设置
 
+## Agent / MCP 自动化接口
+
+后端提供一个受控的 JSON-RPC MCP 接口，供本机 agent 直接读取和操作现场配置：
+
+```text
+http://127.0.0.1:3001/api/mcp
+```
+
+接口支持 `initialize`、`tools/list` 和 `tools/call`，内置工具包括：
+
+- `get_project_state`：读取完整项目、空间、设备、点位和设计稿状态
+- `configure_demo_site`：幂等创建南区热处理示范车间并发布运行版本
+- `upsert_workshop` / `upsert_line` / `upsert_device` / `sync_device_points`：受控写入现场配置
+- `save_dashboard_draft` / `publish_dashboard`：保存或发布低代码大屏
+- `set_data_mode`：切换模拟数据或现场 PLC
+- `run_acceptance_checks`：执行数据库、引擎、模型、视角和部件面板验收
+
+接口默认只允许本机访问；需要远程 agent 时，设置 `MCP_API_TOKEN`，并通过 `Authorization: Bearer <token>` 或 `X-MCP-Token` 访问。示例验收：
+
+```bash
+cd backend
+npm run test:mcp
+```
+
 ## 常见问题
 
 ### 1. 后端启动失败，提示数据库连接失败
