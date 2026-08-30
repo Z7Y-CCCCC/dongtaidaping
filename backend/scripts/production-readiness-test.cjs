@@ -114,6 +114,15 @@ async function main() {
 
         const checks = {
             healthOk: health.response.status === 200 && health.body?.status === 'ok',
+            healthContract: !!health.body?.components?.backend
+                && !!health.body?.components?.database
+                && !!health.body?.components?.dataEngine
+                && !!health.body?.components?.unity
+                && ['ready', 'degraded', 'not_ready'].includes(health.body?.readiness?.status)
+                && typeof health.body?.readiness?.displayReady === 'boolean',
+            healthDoesNotClaimDisplayReadyWithoutUnity: health.body?.components?.unity?.status !== 'connected'
+                ? health.body?.readiness?.displayReady === false
+                : true,
             noPoweredBy: !headers.get('x-powered-by'),
             securityHeadersPresent: headers.get('x-content-type-options') === 'nosniff'
                 && headers.get('content-security-policy')

@@ -76,6 +76,12 @@ function limitClause(type, limit) {
     return type === 'sqlserver' ? ` TOP ${boundedLimit(limit)} ` : ` LIMIT ${boundedLimit(limit)}`;
 }
 
+function castIdentifier(column, type) {
+    if (type === 'mysql') return `CAST(${column} AS CHAR)`;
+    if (type === 'sqlserver') return `CAST(${column} AS VARCHAR(128))`;
+    return `CAST(${column} AS TEXT)`;
+}
+
 function quoteIdentifier(value, type) {
     const name = String(value || '');
     if (!/^[a-zA-Z0-9_]+$/.test(name)) throw new Error('业务数据表名不合法');
@@ -250,7 +256,7 @@ async function readOee(connectionId, options = {}) {
     const type = sqlDialect(connectionId);
     const params = [];
     const predicates = [];
-    if (options.deviceId) { params.push(String(options.deviceId)); predicates.push(`CAST(furnace_id AS CHAR) = ${placeholder(type, params.length)}`); }
+    if (options.deviceId) { params.push(String(options.deviceId)); predicates.push(`${castIdentifier('furnace_id', type)} = ${placeholder(type, params.length)}`); }
     const limit = boundedLimit(options.limit || 90);
     const top = type === 'sqlserver' ? `TOP ${limit} ` : '';
     const tail = type === 'sqlserver' ? '' : ` LIMIT ${limit}`;
