@@ -11,6 +11,7 @@ const props = defineProps({
   deviceDataMap: { type: Object, default: () => ({}) },
   pointValues: { type: Object, default: () => ({}) },
   databaseValues: { type: Object, default: () => ({}) },
+  businessData: { type: Object, default: () => ({}) },
   runtimeContext: { type: Object, default: () => ({}) },
   selectedPart: { type: Object, default: () => ({}) },
   preview: { type: Boolean, default: false }
@@ -67,6 +68,57 @@ const pointRecord = computed(() => {
   return props.pointValues[`${deviceId}:${pointId}`] || props.pointValues[pointId] || null
 })
 const databaseRecord = computed(() => props.databaseValues[String(props.widget.id || '')] || null)
+const businessSection = computed(() => dataBinding.value.businessSection || content.value.section || 'batches')
+const businessSectionMeta = computed(() => objectValue(props.businessData?.sections?.[businessSection.value], {}))
+const businessRows = computed(() => Array.isArray(businessSectionMeta.value.rows)
+  ? businessSectionMeta.value.rows.slice(0, Math.max(1, Number(content.value.limit || 6)))
+  : [])
+const businessSectionLabel = computed(() => ({
+  batches: '批次与工艺执行',
+  compliance: '温度 / 碳势合规',
+  oee: '设备运行统计',
+  energy: '单批次能耗',
+  maintenance: '维护记录'
+}[businessSection.value] || '外部业务数据'))
+const businessUnavailable = computed(() => businessSectionMeta.value.available === false)
+
+function firstBusinessValue(row, keys = []) {
+  for (const key of keys) {
+    const value = row?.[key]
+    if (value !== undefined && value !== null && value !== '') return value
+  }
+  return '--'
+}
+
+function businessRowTitle(row) {
+  if (businessSection.value === 'batches') return firstBusinessValue(row, ['batchNo', 'batchName', 'id'])
+  if (businessSection.value === 'compliance') return firstBusinessValue(row, ['signalName', 'signalId', 'deviceId'])
+  if (businessSection.value === 'oee') return firstBusinessValue(row, ['deviceId', 'date'])
+  return firstBusinessValue(row, ['recordTime', 'batchId', 'id', 'name', 'orderNo'])
+}
+
+function businessRowSubtitle(row) {
+  if (businessSection.value === 'batches') return [row?.productName, row?.status].filter(Boolean).join(' · ') || '工艺批次'
+  if (businessSection.value === 'compliance') return [row?.deviceId, row?.recordTime].filter(Boolean).join(' · ') || '归档信号'
+  if (businessSection.value === 'oee') return [row?.date, row?.batchCount != null ? `批次 ${row.batchCount}` : ''].filter(Boolean).join(' · ')
+  return firstBusinessValue(row, ['description', 'status', 'message', 'recordTime'])
+}
+
+function businessRowValue(row) {
+  if (businessSection.value === 'batches') {
+    const progress = Number(row?.progress)
+    return Number.isFinite(progress) ? `${progress.toFixed(0)}%` : firstBusinessValue(row, ['status', 'currentStep'])
+  }
+  if (businessSection.value === 'compliance') {
+    const value = row?.value ?? row?.rawValue
+    return value === null || value === undefined || value === '' ? '--' : `${value}`
+  }
+  if (businessSection.value === 'oee') {
+    const value = row?.utilizationRate
+    return value === null || value === undefined ? '--' : `${Number(value).toFixed(1)}%`
+  }
+  return firstBusinessValue(row, ['energy', 'energyKwh', 'value', 'status'])
+}
 
 const boundValue = computed(() => {
   const binding = dataBinding.value
@@ -354,7 +406,7 @@ watch(boundValue, value => {
   localTrend.value = [...localTrend.value, { time: now, value: number }].slice(-Math.max(8, Number(content.value.historyLength || 60)))
 })
 
-watch(() => [props.widget, props.metrics, props.trendPoints, props.events, props.databaseValues, localTrend.value], () => nextTick(renderChart), { deep: true })
+watch(() => [props.widget, props.metrics, props.trendPoints, props.events, props.databaseValues, props.businessData, localTrend.value], () => nextTick(renderChart), { deep: true })
 
 onMounted(() => { nextTick(renderChart); window.addEventListener('resize', resizeChart) })
 onUnmounted(() => { window.removeEventListener('resize', resizeChart); disposeChart() })
@@ -385,6 +437,15 @@ onUnmounted(() => { window.removeEventListener('resize', resizeChart); disposeCh
 
     <template v-else-if="type === 'alarm_list'">
       <ul class="alarm-list"><li v-for="(event, index) in eventRows.slice(0, content.limit || 5)" :key="event.id || index"><span class="rank" :class="event.level">{{ index + 1 }}</span><span class="alarm-txt"><small v-if="content.showTime !== false">{{ event.time || event.occurred_at || '--' }}</small>{{ event.msg || event.title || event.message }}</span><span v-if="content.showLevel !== false" class="tag" :class="event.level">{{ event.level || 'info' }}</span></li></ul>
+    </template>
+
+    <template v-else-if="type === 'business_summary'">
+      <div class="business-summary">
+        <div class="business-toolbar"><span>{{ businessSectionLabel }}</span><small v-if="content.showSource !== false">{{ businessData?.source?.connectionId || '未配置只读连接' }}</small></div>
+        <div v-if="businessUnavailable" class="business-empty"><strong>{{ businessSectionMeta.message || content.unavailableText || '外部数据库未提供该类标准数据表' }}</strong><small>本组件只读展示，不会创建或修改排产数据</small></div>
+        <div v-else-if="!businessRows.length" class="business-empty"><strong>{{ content.emptyText || '外部系统暂无记录' }}</strong><small>{{ businessData?.fetchedAt ? `最近读取 ${businessData.fetchedAt}` : '等待外部数据库读取' }}</small></div>
+        <div v-else class="business-rows"><div v-for="(row, index) in businessRows" :key="row.id || row.batchNo || `${businessSection}-${index}`" class="business-row"><span><strong>{{ businessRowTitle(row) }}</strong><small>{{ businessRowSubtitle(row) }}</small></span><b>{{ businessRowValue(row) }}</b></div></div>
+      </div>
     </template>
 
     <template v-else-if="type === 'marquee'">
@@ -432,6 +493,7 @@ onUnmounted(() => { window.removeEventListener('resize', resizeChart); disposeCh
 .value-widget-body{flex:1;min-height:0;display:grid;align-content:center;gap:6px}.value-widget-body>span{color:#8ea7ba;font-size:12px}.value-widget-body strong{color:var(--widget-value-color);font-size:clamp(24px,3vw,48px);font-weight:800;line-height:1.05;text-shadow:0 0 20px color-mix(in srgb,var(--widget-value-color) 24%,transparent)}.value-widget-body strong small{margin-left:7px;color:#9fb3c3;font-size:.34em;font-weight:500}.value-widget-body em{color:#ffb05c;font-size:9px;font-style:normal}.value-widget-body.shape-tile strong{letter-spacing:.08em;font-family:Consolas,monospace}.value-widget-body.shape-plain{align-content:center;text-align:center}.value-widget-body.shape-gauge::before{content:"";position:absolute;right:14px;bottom:14px;width:56px;height:56px;border:7px solid rgba(91,184,237,.12);border-top-color:var(--widget-value-color);border-radius:50%}
 .status-widget-body{flex:1;min-height:0;display:flex;align-items:center;gap:13px}.status-lamp{display:grid;place-items:center;width:44px;height:44px;border-radius:50%;background:rgba(116,142,162,.1)}.status-lamp i{width:18px;height:18px;border-radius:50%;background:var(--widget-off-color);box-shadow:0 0 0 6px color-mix(in srgb,var(--widget-off-color) 12%,transparent),0 0 15px color-mix(in srgb,var(--widget-off-color) 30%,transparent)}.state-on .status-lamp i{background:var(--widget-on-color);box-shadow:0 0 0 6px color-mix(in srgb,var(--widget-on-color) 12%,transparent),0 0 18px color-mix(in srgb,var(--widget-on-color) 50%,transparent)}.state-unknown .status-lamp i{background:var(--widget-alarm-color)}.status-widget-body div{display:grid;gap:3px}.status-widget-body small{color:#829bae;font-size:10px}.status-widget-body strong{font-size:20px}.status-widget-body.shape-badge .status-lamp{width:24px;height:24px}.status-widget-body.shape-badge .status-lamp i{width:10px;height:10px}.status-widget-body.shape-switch .status-lamp{width:52px;height:26px;border-radius:99px;justify-content:start;padding:4px}.status-widget-body.shape-switch .status-lamp i{width:18px;height:18px;box-shadow:none;transition:.2s}.status-widget-body.shape-switch.state-on .status-lamp{justify-content:end;background:color-mix(in srgb,var(--widget-on-color) 22%,transparent)}
 .device-list{flex:1;min-height:0;overflow:hidden}.device-list-row{display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:9px;align-items:center;min-height:37px;border-bottom:1px solid rgba(174,214,240,.07)}.device-list-row>i{width:7px;height:7px;border-radius:50%;background:#45d797;box-shadow:0 0 9px rgba(69,215,151,.45)}.device-list-row.quality-bad>i{background:#75899a;box-shadow:none}.device-list-row.alarm>i{background:#ff625f;box-shadow:0 0 10px rgba(255,98,95,.55)}.device-list-row span{min-width:0}.device-list-row span strong,.device-list-row span small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.device-list-row span strong{font-size:10px}.device-list-row span small{margin-top:2px;color:#728ca1;font-size:8px}.device-list-row>b{color:#dcebf6;font-size:11px}.device-list-row>b small{color:#728ca1;font-size:8px}.device-list>p{display:grid;place-items:center;height:100%;margin:0;color:#71899d;font-size:10px}
+.business-summary{flex:1;min-height:0;display:flex;flex-direction:column;gap:8px}.business-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#b7d6e8;font-size:11px}.business-toolbar span{font-weight:700}.business-toolbar small{max-width:48%;overflow:hidden;color:#6f899d;text-overflow:ellipsis;white-space:nowrap;font-size:9px}.business-rows{min-height:0;overflow:hidden}.business-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-height:40px;padding:5px 7px;border-bottom:1px solid rgba(174,214,240,.07)}.business-row span{min-width:0}.business-row strong,.business-row small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.business-row strong{color:#e4f2fb;font-size:11px}.business-row small{margin-top:3px;color:#71899d;font-size:9px}.business-row b{color:#67d2ff;font-size:13px;font-weight:700}.business-empty{flex:1;display:grid;place-content:center;gap:8px;padding:12px;text-align:center;color:#8aa3b4}.business-empty strong{color:#b8d3e3;font-size:11px}.business-empty small{color:#6f899d;font-size:9px;line-height:1.5}
 .image-widget{width:100%;height:100%;display:block}.image-placeholder,.unknown-widget,.container-placeholder{flex:1;display:grid;place-content:center;gap:5px;text-align:center;color:#71899d}.image-placeholder>span{font-size:30px;color:#61bce9}.image-placeholder strong,.unknown-widget strong{color:#b8d2e4}.image-placeholder small,.unknown-widget small,.container-placeholder small{font-size:9px}.container-placeholder span{width:58px;height:32px;border:1px dashed rgba(91,184,237,.35);border-radius:7px;justify-self:center}.unknown-widget{border:1px dashed rgba(100,164,207,.24);border-radius:8px}
 .widget-animation-fadeIn{animation-name:widgetFadeIn;animation-fill-mode:both}.widget-animation-slideUp{animation-name:widgetSlideUp;animation-fill-mode:both}.widget-animation-pulse{animation-name:widgetPulse;animation-timing-function:ease-in-out}.widget-animation-breathe{animation-name:widgetBreathe;animation-timing-function:ease-in-out}.widget-animation-float{animation-name:widgetFloat;animation-timing-function:ease-in-out}.widget-animation-blink{animation-name:widgetBlink;animation-timing-function:steps(2,end)}
 @keyframes widgetMarquee{to{transform:translateX(-50%)}}@keyframes widgetFadeIn{from{opacity:0}to{opacity:1}}@keyframes widgetSlideUp{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}@keyframes widgetPulse{50%{transform:scale(1.018)}}@keyframes widgetBreathe{50%{filter:brightness(1.14);box-shadow:0 0 30px rgba(63,182,255,.22)}}@keyframes widgetFloat{50%{transform:translateY(-5px)}}@keyframes widgetBlink{50%{opacity:.45}}

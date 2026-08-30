@@ -13,6 +13,13 @@ const lineReturnBusy = ref(false)
 const navigationRootReady = ref(false)
 const childNavigationEntered = ref(false)
 const databaseValues = reactive({})
+const businessData = reactive({
+    status: 'idle',
+    readOnly: true,
+    source: { connectionId: '' },
+    fetchedAt: null,
+    sections: {}
+})
 const runtimeContext = reactive({
     viewId: 'factory_overview', viewMode: 'factory', sceneReady: false, sceneId: '', workshopId: '', lineId: '', deviceId: '',
     inspectionStage: '', partId: '', partName: '', partDescription: '', partPointIds: [], partPointKeys: [], partDetailViewId: ''
@@ -77,7 +84,10 @@ function applyRuntimeContext(payload, { userNavigation = false } = {}) {
     Object.assign(runtimeContext, payload)
     if (!Object.prototype.hasOwnProperty.call(payload, 'sceneReady')) runtimeContext.sceneReady = true
     const nextDataContext = [runtimeContext.viewId, runtimeContext.workshopId, runtimeContext.lineId, runtimeContext.deviceId, runtimeContext.partId].join('|')
-    if (previousDataContext !== nextDataContext) refreshDatabaseValues(true)
+    if (previousDataContext !== nextDataContext) {
+        refreshDatabaseValues(true)
+        refreshBusinessData(true)
+    }
 
     if (runtimeContextIsRoot()) {
         childNavigationEntered.value = false
@@ -140,6 +150,10 @@ const widgets = computed(() => {
     widgetVisibility
     }))
 })
+const businessWidgets = computed(() => configuredWidgets.value.filter(widget => {
+    const type = widget.type || widget.widget_type
+    return type === 'business_summary' || widget.data?.mode === 'business'
+}))
 
 function getByPath(source, path) {
     if (!path) return undefined
@@ -493,7 +507,7 @@ async function handleRuntimeMessage(message) {
         runtimeContext.viewId = platform.value.document?.scene?.defaultViewId || platform.value.activeScene?.defaultViewId || runtimeContext.viewId
         runtimeContext.viewMode = dashboardViews.value.find(view => view.id === runtimeContext.viewId)?.mode || 'factory'
         dataStore.setEventQueryOptions(eventQueryConfig())
-        await refreshDatabaseValues(true)
+        await Promise.all([refreshDatabaseValues(true), refreshBusinessData(true)])
         await nextTick()
         scheduleRegionReport()
     }
@@ -529,6 +543,45 @@ async function refreshDatabaseValues(force = false) {
     }
 }
 
+function emptyBusinessSections(message) {
+    return Object.fromEntries(['batches', 'compliance', 'oee', 'energy', 'maintenance'].map(key => [key, {
+        available: false,
+        rows: [],
+        errorCode: 'NOT_CONFIGURED',
+        message
+    }]))
+}
+
+async function refreshBusinessData(force = false) {
+    if (!businessWidgets.value.length) return
+    const connectionId = String(businessWidgets.value.find(widget => widget.data?.connectionId)?.data?.connectionId
+        || businessWidgets.value.find(widget => widget.content?.connectionId)?.content?.connectionId || '').trim()
+    if (!connectionId) {
+        businessData.status = 'unconfigured'
+        businessData.source = { connectionId: '' }
+        businessData.fetchedAt = null
+        businessData.sections = emptyBusinessSections('请在设计器中为业务摘要组件配置外部只读数据库连接')
+        return
+    }
+    try {
+        const params = new URLSearchParams({ connection_id: connectionId, limit: '200' })
+        if (runtimeContext.deviceId) params.set('device_id', runtimeContext.deviceId)
+        const response = await fetch(`${API_BASE}/business-data/snapshot?${params.toString()}`, { cache: 'no-store' })
+        const payload = await response.json().catch(() => ({}))
+        if (!response.ok || payload.success === false) throw new Error(payload.error || `业务数据读取失败：${response.status}`)
+        businessData.status = 'ready'
+        businessData.readOnly = payload.readOnly !== false
+        businessData.source = payload.source || { connectionId }
+        businessData.fetchedAt = payload.fetchedAt || new Date().toISOString()
+        businessData.sections = payload.sections || {}
+    } catch (error) {
+        businessData.status = 'error'
+        businessData.source = { connectionId }
+        businessData.fetchedAt = null
+        businessData.sections = emptyBusinessSections(error.message || '外部业务数据读取失败')
+    }
+}
+
 onMounted(async () => {
     document.documentElement.style.background = 'transparent'
     document.body.style.background = 'transparent'
@@ -547,7 +600,8 @@ onMounted(async () => {
         dataStore.refreshEvents(true),
         dataStore.refreshMetrics(true),
         dataStore.refreshHealth(true),
-        refreshDatabaseValues(true)
+        refreshDatabaseValues(true),
+        refreshBusinessData(true)
     ])
 
     await nextTick()
@@ -564,6 +618,7 @@ onMounted(async () => {
         dataStore.refreshMetrics()
         dataStore.refreshHealth()
         refreshDatabaseValues()
+        refreshBusinessData()
     }, 5000)
 
     hostConnected.value = true
@@ -637,8 +692,9 @@ onUnmounted(() => {
                     :device-status-map="dataStore.deviceStatusMap"
         :device-data-map="dataStore.deviceDataMap"
         :point-values="pointValues"
-        :database-values="databaseValues"
-        :runtime-context="runtimeContext"
+                    :database-values="databaseValues"
+                    :business-data="businessData"
+                    :runtime-context="runtimeContext"
         :selected-part="selectedPart"
                     @action="handleWidgetAction"
                 />

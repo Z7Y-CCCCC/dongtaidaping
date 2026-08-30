@@ -96,6 +96,7 @@ export const DASHBOARD_WIDGET_LIBRARY = [
   { type: 'image', label: '图片', icon: '▧', group: '基础', description: '现场图片、Logo 和图标' },
   { type: 'container', label: '容器', icon: '□', group: '布局', description: '透明卡片和区域分组' },
   { type: 'metrics', label: '指标组', icon: '▦', group: '数据', description: '多指标与环形图' },
+  { type: 'business_summary', label: '业务摘要', icon: '▤', group: '数据', description: '只读显示排产批次、合规曲线、利用率、能耗和维护记录' },
   { type: 'trend', label: '通用图表', icon: '⌁', group: '数据', description: '折线、面积、柱状、饼图、环图和仪表盘' },
   { type: 'alarm_list', label: '报警表', icon: '!', group: '数据', description: '只读报警与事件履历' },
   { type: 'device_list', label: '设备列表', icon: '☷', group: '数据', description: '设备在线、运行和报警状态' },
@@ -173,6 +174,18 @@ const TYPE_DEFAULTS = {
     content: { compact: true },
     style: { background: 'rgba(10, 24, 38, .82)', color: '#eef7ff', borderColor: 'rgba(89, 178, 238, .28)', borderRadius: 14 }
   },
+  business_summary: {
+    size: [620, 340],
+    title: '排产业务摘要',
+    content: {
+      section: 'batches',
+      limit: 6,
+      emptyText: '外部系统暂无记录',
+      unavailableText: '外部数据库未提供该类标准数据表',
+      showSource: true
+    },
+    style: { background: 'rgba(10, 24, 38, .84)', color: '#eef7ff', borderColor: 'rgba(89, 178, 238, .32)', borderRadius: 14 }
+  },
   marquee: {
     size: [1080, 76],
     title: '实时消息',
@@ -244,11 +257,11 @@ export function normalizeDashboardWidget(source = {}, canvas = DEFAULT_DASHBOARD
   const hasCanonicalFrame = frame.width !== undefined || frame.height !== undefined
   const data = objectValue(source.data, objectValue(source.binding, {}))
   const requestedMode = String(data.mode || '')
-  const normalizedMode = requestedMode === 'plc' || requestedMode === 'database' || requestedMode === 'runtime'
+  const normalizedMode = requestedMode === 'plc' || requestedMode === 'database' || requestedMode === 'runtime' || requestedMode === 'business'
     ? requestedMode
     : 'static'
   const resolvedDataMode = normalizedMode === 'static'
-    ? (data.connectionId || data.connection_id ? 'database' : (data.pointId || data.point_id ? 'plc' : 'static'))
+    ? (type === 'business_summary' ? 'business' : (data.connectionId || data.connection_id ? 'database' : (data.pointId || data.point_id ? 'plc' : 'static')))
     : normalizedMode
   const legacyDataset = normalizeDatabaseDataset(data, data, 0)
   const datasets = (Array.isArray(data.datasets) && data.datasets.length ? data.datasets : [legacyDataset])
@@ -280,6 +293,9 @@ export function normalizeDashboardWidget(source = {}, canvas = DEFAULT_DASHBOARD
       path: resolvedDataMode === 'static' ? '' : String(data.path || ''),
       source: resolvedDataMode === 'static' ? '' : String(data.source || ''),
       connectionId: String(data.connectionId || data.connection_id || ''),
+      businessSection: ['batches', 'compliance', 'oee', 'energy', 'maintenance'].includes(String(data.businessSection || data.business_section))
+        ? String(data.businessSection || data.business_section)
+        : (['batches', 'compliance', 'oee', 'energy', 'maintenance'].includes(String(config.section)) ? String(config.section) : 'batches'),
       schema: String(data.schema || ''),
       table: String(data.table || ''),
       field: String(data.field || ''),

@@ -124,6 +124,26 @@ const mockTrend = ref([
   { time: '10:10', value: 824 }, { time: '10:15', value: 836 },
   { time: '10:20', value: 842 }, { time: '10:25', value: 838 }
 ])
+const mockBusinessData = reactive({
+  readOnly: true,
+  source: { connectionId: '排产系统只读库' },
+  fetchedAt: '2026-08-30T10:26:18+08:00',
+  sections: {
+    batches: { available: true, rows: [
+      { id: 1, batchNo: 'B-20260830-001', productName: '18CrNiMo7-6 齿轮', status: '执行中', progress: 68 },
+      { id: 2, batchNo: 'B-20260830-002', productName: '42CrMo 轴类件', status: '待执行', progress: 0 }
+    ] },
+    compliance: { available: true, rows: [
+      { deviceId: 'Furnace_01', signalName: '炉温', value: 836.4, recordTime: '10:25:40' },
+      { deviceId: 'Furnace_01', signalName: '碳势', value: 0.88, recordTime: '10:25:40' }
+    ] },
+    oee: { available: true, rows: [
+      { deviceId: 'Furnace_01', date: '2026-08-30', batchCount: 8, utilizationRate: 88.5 }
+    ] },
+    energy: { available: false, rows: [], message: '外部数据库未提供该类标准数据表' },
+    maintenance: { available: false, rows: [], message: '外部数据库未提供该类标准数据表' }
+  }
+})
 const mockDeviceStatus = reactive({
   Furnace_01: { name: '1# 多用炉', temp: 836, running: true, alarm: false, online: true, quality: 'good' },
   Furnace_02: { name: '2# 多用炉', temp: 821, running: true, alarm: false, online: true, quality: 'good' },
@@ -1010,19 +1030,29 @@ function changeBindingMode() {
   if (widget.data.mode !== 'plc') {
     widget.data.pointId = ''
   }
-  if (widget.data.mode !== 'database') {
+  const usesExternalDatabase = ['database', 'business'].includes(widget.data.mode)
+  if (!usesExternalDatabase) {
     widget.data.connectionId = ''
     widget.data.schema = ''
     widget.data.table = ''
     widget.data.field = ''
     widget.data.timeField = ''
     widget.data.orderBy = ''
-  } else {
+  } else if (widget.data.mode === 'database') {
     const datasets = ensureDatabaseDatasets(widget)
     if (['trend', 'alarm_list', 'device_list', 'marquee'].includes(widget.type)) {
       datasets.forEach(dataset => { if (!dataset.table) dataset.valueMode = 'list' })
     }
     datasets.forEach((dataset, index) => loadDatasetTables(dataset, index))
+  }
+  if (widget.data.mode === 'business') {
+    widget.data.schema = ''
+    widget.data.table = ''
+    widget.data.field = ''
+    widget.data.timeField = ''
+    widget.data.orderBy = ''
+    widget.data.businessSection = widget.data.businessSection || widget.content.section || 'batches'
+    widget.content.section = widget.data.businessSection
   }
   if (widget.data.mode === 'runtime' && !widget.data.path) widget.data.path = 'selectedPart.description'
   commitHistory('修改数据源')
@@ -1413,6 +1443,7 @@ onBeforeUnmount(() => {
                   :device-status-map="mockDeviceStatus"
                   :point-values="pointValues"
                   :database-values="databasePreviewValues"
+                  :business-data="mockBusinessData"
                   :runtime-context="previewContext"
                   :selected-part="previewSelectedPart"
                   preview
@@ -1465,6 +1496,11 @@ onBeforeUnmount(() => {
               </template>
               <template v-if="['alarm_list','device_list'].includes(selectedWidget.type)">
                 <label>最多显示<input v-model.number="selectedWidget.content.limit" type="number" min="1" max="100" @change="recordProperty()" /></label>
+              </template>
+              <template v-if="selectedWidget.type === 'business_summary'">
+                <label>业务区块<select v-model="selectedWidget.content.section" @change="selectedWidget.data.businessSection = selectedWidget.content.section; recordProperty('选择业务区块')"><option value="batches">批次与工艺执行</option><option value="compliance">温度 / 碳势合规</option><option value="oee">设备运行统计</option><option value="energy">单批次能耗</option><option value="maintenance">维护记录</option></select></label>
+                <label>最多显示<input v-model.number="selectedWidget.content.limit" type="number" min="1" max="50" @change="recordProperty('修改业务记录数')" /></label>
+                <label class="visibility-bound-device"><input v-model="selectedWidget.content.showSource" type="checkbox" @change="recordProperty('显示数据源')" /> 显示外部数据源</label>
               </template>
               <template v-if="selectedWidget.type === 'trend'">
                 <label>图表形式<select v-model="selectedWidget.content.chartType" @change="recordProperty('修改图表形式')"><option value="line">折线图</option><option value="area">面积图</option><option value="bar">柱状图</option><option value="stackedBar">堆叠柱状图</option><option value="scatter">散点图</option><option value="pie">饼图</option><option value="donut">环形图</option><option value="gauge">仪表盘</option></select></label>
@@ -1520,7 +1556,7 @@ onBeforeUnmount(() => {
 
             <section v-else-if="inspectorTab === 'data'" class="inspector-section">
               <div class="readonly-banner"><span>只读</span>所有外部数据源和 PLC 点位只用于展示，发布校验会拦截任何写入配置。</div>
-              <label>数据来源<select v-model="selectedWidget.data.mode" @change="changeBindingMode"><option value="static">静态 / 组件默认数据</option><option value="plc">PLC 只读点位</option><option value="database">数据库连接</option><option value="runtime">设备检查上下文</option></select></label>
+              <label>数据来源<select v-model="selectedWidget.data.mode" @change="changeBindingMode"><option value="static">静态 / 组件默认数据</option><option value="plc">PLC 只读点位</option><option value="database">通用数据库连接</option><option value="business">排产业务只读适配层</option><option value="runtime">设备检查上下文</option></select></label>
               <template v-if="selectedWidget.data.mode === 'plc'">
                 <label>设备<select v-model="selectedWidget.data.deviceId" @change="selectedWidget.data.pointId=''; recordProperty('选择设备')"><option value="">请选择设备</option><option v-for="device in devices" :key="device.id" :value="String(device.id)">{{ device.name }}（{{ device.id }}）</option></select></label>
                 <label>READ 点位<select v-model="selectedWidget.data.pointId" :disabled="!selectedWidget.data.deviceId" @change="bindSelectedPoint"><option value="">请选择只读点位</option><option v-for="point in selectedDevicePoints" :key="point.id" :value="String(point.id)">{{ point.label || point.name }} · {{ point.plc_tag || `DB${point.db_number}.${point.db_byte_offset}` }}</option></select></label>
@@ -1548,6 +1584,11 @@ onBeforeUnmount(() => {
                 <label>设备详情适用范围<select v-model="selectedWidget.data.deviceId" @change="bindDatabaseToDevice"><option value="">所有设备通用</option><option v-for="device in devices" :key="`db-${device.id}`" :value="String(device.id)">仅 {{ device.name }}（{{ device.id }}）</option></select><small class="field-hint">不同设备参数来自不同表时，复制组件后分别选择设备和表即可。</small></label>
                 <button type="button" class="inspector-preview-button" :disabled="databaseMetadataLoading" @click="previewDatabaseBinding()">刷新数据预览</button>
                 <div v-if="databasePreviewValues[selectedWidget.id]" class="binding-summary"><span>预览值</span><strong>{{ databasePreviewValues[selectedWidget.id]?.value ?? '--' }} {{ selectedWidget.data.unit }}</strong><span>数据项</span><code>{{ databasePreviewValues[selectedWidget.id]?.series?.map(item => `${item.label}: ${item.value ?? '--'}`).join(' · ') || '--' }}</code><span>状态</span><strong>{{ databasePreviewValues[selectedWidget.id]?.error || '读取正常' }}</strong></div>
+              </template>
+              <template v-else-if="selectedWidget.data.mode === 'business'">
+                <label>外部业务数据库<select v-model="selectedWidget.data.connectionId" @change="recordProperty('选择业务数据库')"><option value="">请选择只读连接</option><option v-for="source in dataSources" :key="`business-${source.id}`" :value="source.id">{{ source.name }} · {{ source.type }}</option></select></label>
+                <label>业务区块<select v-model="selectedWidget.data.businessSection" @change="selectedWidget.content.section = selectedWidget.data.businessSection; recordProperty('选择业务区块')"><option value="batches">批次与工艺执行</option><option value="compliance">温度 / 碳势合规</option><option value="oee">设备运行统计</option><option value="energy">单批次能耗</option><option value="maintenance">维护记录</option></select></label>
+                <div class="readonly-banner compact"><span>只读</span>运行时会按当前设备上下文读取外部数据库；没有标准表时显示“未提供”，不会写入排产系统。</div>
               </template>
               <template v-else-if="selectedWidget.data.mode === 'runtime'">
                 <label>上下文路径<input v-model="selectedWidget.data.path" class="input" placeholder="selectedPart.description / selectedPart.name / context.inspectionStage" @change="recordProperty('修改检查上下文路径')" /></label>
