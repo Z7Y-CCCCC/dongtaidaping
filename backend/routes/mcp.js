@@ -242,6 +242,15 @@ function toolDefinitions() {
                 required: ['license'],
                 additionalProperties: false
             }
+        },
+        {
+            name: 'get_release_status',
+            description: '读取当前发布版本、离线升级包签名/哈希要求和回滚流程，不会执行升级。',
+            inputSchema: {
+                type: 'object',
+                properties: {},
+                additionalProperties: false
+            }
         }
     ];
 }
@@ -631,6 +640,10 @@ function createMcpRouter({ port = 3001 } = {}) {
         return await localApi('/api/license', { method: 'PUT', body: JSON.stringify({ license: args.license }) });
     }
 
+    async function getReleaseStatus() {
+        return await localApi('/api/release');
+    }
+
     async function callTool(name, args = {}) {
         switch (name) {
             case 'get_project_state': return result(await loadState());
@@ -646,6 +659,7 @@ function createMcpRouter({ port = 3001 } = {}) {
             case 'get_heat_treatment_template_library': return result(await getHeatTreatmentTemplateLibrary(args));
             case 'get_license_status': return result({ success: true, readOnly: true, ...getLicenseStatus() });
             case 'install_license': return result(await installLicense(args));
+            case 'get_release_status': return result(await getReleaseStatus());
             default: throw Object.assign(new Error(`未知工具：${name}`), { code: -32602 });
         }
     }

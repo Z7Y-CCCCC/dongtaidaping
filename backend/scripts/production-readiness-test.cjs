@@ -87,6 +87,7 @@ async function main() {
         const version = await fetchResult(`${origin}/api/version`);
         const license = await fetchResult(`${origin}/api/license`);
         const licenseContract = await fetchResult(`${origin}/api/license/contract`);
+        const release = await fetchResult(`${origin}/api/release`);
         const acceptance = await fetchResult(`${origin}/api/acceptance-report`);
         const headers = health.response.headers;
         const disallowedCors = await fetchResult(`${origin}/api/health`, {
@@ -139,6 +140,12 @@ async function main() {
                 && Array.isArray(licenseContract.body?.fields),
             healthLicenseContract: !!health.body?.components?.license
                 && typeof health.body?.components?.license?.enforce === 'boolean',
+            releaseContract: release.response.status === 200
+                && release.body?.success === true
+                && release.body?.readOnly === true
+                && release.body?.mode === 'offline_signed_package'
+                && release.body?.contract?.signatureRequired === true
+                && release.body?.contract?.sha256Required === true,
             acceptanceReportContract: acceptance.response.status === 200
                 && acceptance.body?.success === true
                 && acceptance.body?.readOnly === true

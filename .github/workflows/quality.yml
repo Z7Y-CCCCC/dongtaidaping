@@ -24,6 +24,8 @@ jobs:
           cache: npm
           cache-dependency-path: backend/package-lock.json
       - run: npm ci
+      - run: npm run test:license
+      - run: npm run test:release-package
       - run: npm run test:business-data
       - run: npm run test:data-sources
       - run: npm run test:designer

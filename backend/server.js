@@ -96,6 +96,7 @@ app.use('/api/business-data', require('./routes/businessData'));
 app.use('/api/template-library', require('./routes/templateLibrary'));
 app.use('/api/acceptance-report', require('./routes/acceptanceReport'));
 app.use('/api/license', require('./routes/license'));
+app.use('/api/release', require('./routes/release'));
 // 受控的本机 MCP 接口：让设计/验收 agent 通过 JSON-RPC 操作现场配置。
 app.use('/api/mcp', require('./routes/mcp')({ port: PORT }));
 

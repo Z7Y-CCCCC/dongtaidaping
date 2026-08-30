@@ -389,6 +389,11 @@ const licenseStatus = reactive({
 const licenseText = ref('')
 const licenseBusy = ref(false)
 const licenseMessage = ref('')
+const releaseStatus = reactive({
+    mode: 'offline_signed_package',
+    current: { productVersion: '—', configurationVersion: '—', buildCommit: 'unknown' },
+    contract: { signatureRequired: true, sha256Required: true, downgradeRejected: true, rollback: '' }
+})
 const newWorkshop = reactive({ id: '', name: '' })
 const selectedWorkshopEditorId = ref(storedAdminUiState.selectedWorkshopEditorId || '')
 const workshopSavingId = ref('')
@@ -453,6 +458,15 @@ async function loadLicenseStatus() {
     } catch (error) {
         licenseStatus.status = 'error'
         licenseStatus.reason = error.message || '读取授权状态失败'
+    }
+}
+
+async function loadReleaseStatus() {
+    try {
+        Object.assign(releaseStatus, await adminApi.getReleaseStatus())
+    } catch (error) {
+        releaseStatus.mode = 'unavailable'
+        releaseStatus.contract = { ...releaseStatus.contract, rollback: error.message || '读取发布状态失败' }
     }
 }
 
@@ -4753,7 +4767,7 @@ watch([
 onMounted(async () => {
     window.addEventListener('beforeunload', handleUnsavedCanvasBeforeUnload)
     await loadWorkshops()
-    await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform(), loadTemplatePacks(), loadLicenseStatus()])
+    await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform(), loadTemplatePacks(), loadLicenseStatus(), loadReleaseStatus()])
     startRuntimeRefresh()
     loadCastDevices({ silent: true })
     startCastRefresh()
@@ -8931,6 +8945,12 @@ async function openAdminSetupStep(step) {
                             <div><span>许可证编号</span><strong>{{ licenseStatus.licenseId || '—' }}</strong></div>
                             <div><span>有效期</span><strong>{{ licenseStatus.expiresAt ? formatBackupTime(licenseStatus.expiresAt) : '—' }}</strong></div>
                             <div><span>强制授权</span><strong>{{ licenseStatus.enforce ? '已开启' : '未开启（开发/演示）' }}</strong></div>
+                        </div>
+                        <div class="release-status-card">
+                            <div><span>当前程序版本</span><strong>{{ releaseStatus.current?.productVersion || '—' }}</strong></div>
+                            <div><span>配置版本</span><strong>{{ releaseStatus.current?.configurationVersion || '—' }}</strong></div>
+                            <div><span>升级模式</span><strong>{{ releaseStatus.mode === 'offline_signed_package' ? '离线签名包' : '不可用' }}</strong></div>
+                            <p>升级包必须通过签名和 SHA-256 校验，低版本包会被拒绝；现场先导出整站灾备，再安装升级包，失败时按回滚说明恢复。</p>
                         </div>
                         <p class="license-reason" :class="{ warning: !licenseStatus.valid && licenseStatus.enforce }">{{ licenseStatus.reason }}</p>
                         <div class="license-install-card">
@@ -13510,13 +13530,19 @@ button:enabled:active {
 .license-summary-grid span,.license-summary-grid strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .license-summary-grid span { color: #86868b; font-size: 10px; }
 .license-summary-grid strong { margin-top: 5px; color: #27272a; font-size: 12px; }
+.release-status-card { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; padding: 12px 13px; background: #f7f7f8; border: 1px solid #e6e6e9; border-radius: 10px; }
+.release-status-card > div { min-width: 0; }
+.release-status-card span,.release-status-card strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.release-status-card span { color: #86868b; font-size: 10px; }
+.release-status-card strong { margin-top: 4px; color: #27272a; font-size: 12px; }
+.release-status-card p { grid-column: 1 / -1; margin: 2px 0 0; color: #6e6e73; font-size: 11px; line-height: 1.45; }
 .license-reason { margin: 12px 0 0; color: #6e6e73; font-size: 12px; line-height: 1.5; }
 .license-reason.warning { color: #a33a2b; }
 .license-install-card { margin-top: 18px; padding: 14px; background: #fafafa; border: 1px solid #e5e5e7; border-radius: 12px; }
 .license-install-card label { display: flex; flex-direction: column; gap: 7px; color: #515154; font-size: 12px; }
 .license-textarea { width: 100%; min-height: 150px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; line-height: 1.45; }
 .license-actions { margin-top: 11px; margin-bottom: 0; }
-@media (max-width: 820px) { .license-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 820px) { .license-summary-grid,.release-status-card { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .external-data-source-manager { margin-top: 24px; padding: 16px; background: #fff; border: 1px solid #e2e2e5; border-radius: 10px; transition: border-color 180ms ease, box-shadow 180ms ease; }
 .external-data-source-manager.open { border-color: #d5d5da; box-shadow: 0 8px 24px #00000008; }
 .external-data-source-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
