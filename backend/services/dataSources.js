@@ -352,6 +352,25 @@ async function executeRows(handle, sql, params = []) {
     return handle.client.prepare(sql).all(...params);
 }
 
+/**
+ * Execute a parameterised read-only query against a configured external data source.
+ *
+ * The digital-twin display must never write to the scheduling/production system.
+ * Keep this guard at the shared connector boundary so future business-data
+ * adapters cannot accidentally introduce INSERT/UPDATE/DELETE statements.
+ */
+async function executeReadOnlyQuery(connectionId, sql, params = []) {
+    const statement = String(sql || '').trim();
+    if (!statement) throw new Error('只读查询不能为空');
+    if (!/^(select|with)\b/i.test(statement)) throw new Error('外部业务数据只允许 SELECT 查询');
+    if (statement.includes(';')) throw new Error('只读查询不允许多语句执行');
+    if (/\b(insert|update|delete|drop|alter|create|truncate|replace|grant|revoke|call|set)\b/i.test(statement)) {
+        throw new Error('只读查询包含被禁止的写入或管理关键字');
+    }
+    const connection = resolveConnection(connectionId);
+    return withConnection(connection, handle => executeRows(handle, statement, params));
+}
+
 async function testDataSource(input = {}) {
     const connection = resolveInputConnection(input);
     return withConnection(connection, async handle => {
@@ -877,6 +896,7 @@ module.exports = {
     MASKED_PASSWORD,
     createConnectionBackup,
     deleteDataSource,
+    executeReadOnlyQuery,
     getBackupStatus,
     listColumns,
     listDataSources,

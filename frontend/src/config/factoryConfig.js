@@ -268,6 +268,35 @@ export const adminApi = {
         const suffix = sceneId ? `?scene_id=${encodeURIComponent(sceneId)}` : ''
         return readApiJson(await fetch(`${API_BASE}/data-sources/runtime-values${suffix}`), '读取外部数据库数据失败')
     },
+    // 排产系统业务数据只读适配层
+    async getBusinessDataManifest(connectionId = '') {
+        const suffix = connectionId ? `?connection_id=${encodeURIComponent(connectionId)}` : ''
+        return readApiJson(await fetch(`${API_BASE}/business-data/manifest${suffix}`), '读取业务数据契约失败')
+    },
+    async getBusinessDataSnapshot(connectionId = '', options = {}) {
+        const params = new URLSearchParams({ ...(connectionId ? { connection_id: connectionId } : {}), ...options })
+        const suffix = params.toString() ? `?${params}` : ''
+        return readApiJson(await fetch(`${API_BASE}/business-data/snapshot${suffix}`), '读取业务数据快照失败')
+    },
+    async getBusinessBatches(connectionId = '', options = {}) {
+        const params = new URLSearchParams({ ...(connectionId ? { connection_id: connectionId } : {}), ...options })
+        const suffix = params.toString() ? `?${params}` : ''
+        return readApiJson(await fetch(`${API_BASE}/business-data/batches${suffix}`), '读取批次数据失败')
+    },
+    async getBusinessBatchDetail(id, connectionId = '') {
+        const suffix = connectionId ? `?connection_id=${encodeURIComponent(connectionId)}` : ''
+        return readApiJson(await fetch(`${API_BASE}/business-data/batches/${pathId(id)}${suffix}`), '读取批次详情失败')
+    },
+    async getBusinessCompliance(connectionId = '', options = {}) {
+        const params = new URLSearchParams({ ...(connectionId ? { connection_id: connectionId } : {}), ...options })
+        const suffix = params.toString() ? `?${params}` : ''
+        return readApiJson(await fetch(`${API_BASE}/business-data/compliance${suffix}`), '读取温度碳势曲线失败')
+    },
+    async getBusinessOee(connectionId = '', options = {}) {
+        const params = new URLSearchParams({ ...(connectionId ? { connection_id: connectionId } : {}), ...options })
+        const suffix = params.toString() ? `?${params}` : ''
+        return readApiJson(await fetch(`${API_BASE}/business-data/oee${suffix}`), '读取设备统计失败')
+    },
     async getDatabaseBackups() { return readApiJson(await fetch(`${API_BASE}/database/backups`), '读取数据库备份失败') },
     async saveDatabaseBackupPolicy(config) { return readApiJson(await fetch(`${API_BASE}/database/backups/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(config) }), '保存备份保留策略失败') },
     async createDatabaseBackup() { return readApiJson(await fetch(`${API_BASE}/database/backups`, { method: 'POST' }), '创建数据库备份失败') },

@@ -23,6 +23,7 @@
     "test:cast": "node scripts/cast-discovery-test.cjs",
     "test:designer": "node scripts/dashboard-designer-test.cjs",
     "test:data-sources": "node scripts/data-source-test.cjs",
+    "test:business-data": "node scripts/business-data-test.cjs",
     "test:datapoints-sync": "node scripts/data-point-sync-test.cjs",
     "test:deletion-safety": "node scripts/deletion-safety-test.cjs",
     "test:plc-protocols": "node scripts/plc-protocol-test.cjs"
