@@ -402,11 +402,45 @@ app.post('/api/engine/restart', async (req, res) => {
 
 app.get('/api/health', (req, res) => {
     const engineStatus = global.dataEngine ? global.dataEngine.getStatus() : null;
+    const dbStatus = getDbStatus();
+    const wsServer = global.wsServer;
+    const unityClients = wsServer?.countClients?.('unity') || 0;
+    const webClients = wsServer?.countClients?.('web') || 0;
+    const collector = engineStatus?.collectorStatus || {};
+    const collectorAgeMs = collector.lastFrameAt ? Math.max(0, Date.now() - Number(collector.lastFrameAt)) : null;
+    const dataFresh = collectorAgeMs !== null && collectorAgeMs <= 15000;
+    const databaseReady = dbStatus.connected === true;
+    const engineReady = !!engineStatus?.mode && ['connected', 'simulating'].includes(String(collector.status || '').toLowerCase());
+    const nativeSceneReady = unityClients > 0;
+    const readinessFailures = [];
+    if (!databaseReady) readinessFailures.push('database');
+    if (!engineReady) readinessFailures.push('data_engine');
+    if (!dataFresh) readinessFailures.push('data_freshness');
+    if (!nativeSceneReady) readinessFailures.push('unity');
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        db: getDbStatus(),
-        engine: engineStatus
+        db: dbStatus,
+        engine: engineStatus,
+        components: {
+            backend: { status: 'healthy' },
+            database: { status: databaseReady ? 'healthy' : 'error', connected: databaseReady, error: dbStatus.error || null },
+            dataEngine: {
+                status: engineReady ? 'healthy' : (engineStatus ? 'degraded' : 'error'),
+                mode: engineStatus?.mode || null,
+                collectorStatus: collector.status || 'not_started',
+                lastFrameAt: collector.lastFrameAt || null,
+                ageMs: collectorAgeMs,
+                fresh: dataFresh
+            },
+            unity: { status: nativeSceneReady ? 'healthy' : 'offline', clients: unityClients },
+            dashboard: { status: webClients > 0 ? 'healthy' : 'idle', clients: webClients }
+        },
+        readiness: {
+            status: readinessFailures.length ? 'degraded' : 'ready',
+            displayReady: nativeSceneReady && dataFresh,
+            failures: readinessFailures
+        }
     });
 });
 

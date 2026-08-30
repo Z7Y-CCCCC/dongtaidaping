@@ -43,6 +43,12 @@ export function createDashboardDataStore(options = {}) {
     const trendUpdateIntervalMs = options.trendUpdateIntervalMs || 5000;
     const wsConnected = ref(false);
     const plcStatusText = ref('等待连接...');
+    const health = reactive({
+        status: 'unknown',
+        readiness: { status: 'unknown', displayReady: false, failures: ['backend'] },
+        components: {},
+        checkedAt: null
+    });
     const selectedDeviceId = ref(null);
     const selectedDeviceData = reactive({});
     const deviceStatusMap = reactive({});
@@ -79,6 +85,8 @@ export function createDashboardDataStore(options = {}) {
     let lastRealtimeFrameAt = 0;
     let metricsInFlight = false;
     let eventsInFlight = false;
+    let healthInFlight = false;
+    let lastHealthRefreshAt = 0;
 
     function setStaleMs(value) {
         const next = Number(value);
@@ -380,6 +388,44 @@ export function createDashboardDataStore(options = {}) {
         }
     }
 
+    function healthLabel(payload) {
+        if (!payload) return '后端不可用';
+        const failures = payload.readiness?.failures || [];
+        if (payload.readiness?.displayReady) {
+            return String(payload.engine?.mode || '').toLowerCase() === 'simulation' ? '模拟数据正常' : '实时数据正常';
+        }
+        if (failures.includes('unity')) return 'Unity 未连接';
+        if (failures.includes('database')) return '数据库异常';
+        if (failures.includes('data_engine')) return '采集器未就绪';
+        if (failures.includes('data_freshness')) return '数据已过期';
+        return '系统未就绪';
+    }
+
+    async function refreshHealth(force = false) {
+        const now = Date.now();
+        if (!force && (healthInFlight || now - lastHealthRefreshAt < 5000)) return;
+        healthInFlight = true;
+        try {
+            const response = await fetch(`${API_BASE}/health`, { cache: 'no-store' });
+            const payload = await response.json().catch(() => null);
+            if (!response.ok || !payload) throw new Error('健康检查失败');
+            health.status = payload.status || 'unknown';
+            health.readiness = payload.readiness || { status: 'unknown', displayReady: false, failures: ['backend'] };
+            health.components = payload.components || {};
+            health.checkedAt = payload.timestamp || new Date().toISOString();
+            plcStatusText.value = healthLabel(payload);
+        } catch (error) {
+            health.status = 'offline';
+            health.readiness = { status: 'not_ready', displayReady: false, failures: ['backend'] };
+            health.components = { backend: { status: 'error' } };
+            health.checkedAt = new Date().toISOString();
+            plcStatusText.value = '后端不可用';
+        } finally {
+            lastHealthRefreshAt = Date.now();
+            healthInFlight = false;
+        }
+    }
+
     function connect() {
         if (disposed) return;
         if (reconnectTimer) {
@@ -445,6 +491,7 @@ export function createDashboardDataStore(options = {}) {
         staleMs,
         wsConnected,
         plcStatusText,
+        health,
         selectedDeviceId,
         selectedDeviceData,
         deviceStatusMap,
@@ -462,6 +509,7 @@ export function createDashboardDataStore(options = {}) {
         connect,
         dispose,
         refreshEvents,
-        refreshMetrics
+        refreshMetrics,
+        refreshHealth
     };
 }

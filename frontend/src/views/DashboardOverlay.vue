@@ -546,6 +546,7 @@ onMounted(async () => {
     await Promise.all([
         dataStore.refreshEvents(true),
         dataStore.refreshMetrics(true),
+        dataStore.refreshHealth(true),
         refreshDatabaseValues(true)
     ])
 
@@ -561,6 +562,7 @@ onMounted(async () => {
     refreshTimer = window.setInterval(() => {
         dataStore.refreshEvents()
         dataStore.refreshMetrics()
+        dataStore.refreshHealth()
         refreshDatabaseValues()
     }, 5000)
 
@@ -604,8 +606,9 @@ onUnmounted(() => {
             <button
                 type="button"
                 class="overlay-status"
-                :class="{ online: dataStore.wsConnected.value && hostConnected }"
+                :class="{ online: dataStore.health.readiness.displayReady && hostConnected }"
                 data-overlay-hit="true"
+                :title="`后端：${dataStore.health.components.backend?.status || '未知'}；数据库：${dataStore.health.components.database?.status || '未知'}；Unity：${dataStore.health.components.unity?.status || '未知'}；数据：${dataStore.health.components.dataEngine?.fresh ? '新鲜' : '未就绪'}`"
                 @click="selectWidget('overlay-status')"
             >
                 <span class="overlay-status-dot"></span>
