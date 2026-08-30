@@ -9,6 +9,7 @@ const {
     runtimePlatformPayload
 } = require('../services/dashboardDocuments');
 const { normalizeProtocol, sanitizePlcOptions } = require('../services/plcProtocolConfig');
+const { getHeatTreatmentTemplatePacks } = require('../services/heatTreatmentTemplates');
 
 function safeJsonParse(value, fallback) {
     if (!value) return fallback;
@@ -99,6 +100,7 @@ router.get('/', async (req, res) => {
             settings,
             workshops: workshopsWithLines,
             models,
+            templatePacks: getHeatTreatmentTemplatePacks(),
             platform: runtimePlatformPayload({
                 project: activeProject,
                 scene: runtimeScene,

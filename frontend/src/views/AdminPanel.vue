@@ -372,6 +372,7 @@ function getDbStatusBadgeClass(statusText) {
 
 // ============ 车间管理 ============
 const workshops = ref([])
+const templatePacks = ref([])
 const newWorkshop = reactive({ id: '', name: '' })
 const selectedWorkshopEditorId = ref(storedAdminUiState.selectedWorkshopEditorId || '')
 const workshopSavingId = ref('')
@@ -423,6 +424,11 @@ async function loadWorkshops() {
         selectedWorkshopEditorId.value = workshops.value[0]?.id || ''
     }
     if (!workshops.value.length) workshopManagementStep.value = 'list'
+}
+
+async function loadTemplatePacks() {
+    const result = await adminApi.getHeatTreatmentTemplateLibrary()
+    templatePacks.value = Array.isArray(result?.packs) ? result.packs : []
 }
 
 function selectWorkshopManagementStep(step) {
@@ -4682,7 +4688,7 @@ watch([
 onMounted(async () => {
     window.addEventListener('beforeunload', handleUnsavedCanvasBeforeUnload)
     await loadWorkshops()
-    await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform()])
+    await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform(), loadTemplatePacks()])
     startRuntimeRefresh()
     loadCastDevices({ silent: true })
     startCastRefresh()
@@ -7397,6 +7403,30 @@ async function openAdminSetupStep(step) {
                 <div v-if="activeTab === 'devices'" class="tab-content">
                     <h2>设备管理</h2>
                     <p class="desc">管理所有设备，包括设备名称、所属产线、使用模型和数据连接。</p>
+
+                    <section v-if="templatePacks.length" class="template-pack-library">
+                        <div class="template-pack-library-heading">
+                            <div>
+                                <strong>热处理数字孪生标准包</strong>
+                                <small>设备模型、只读点位、展示报警和部件绑定的可复用蓝图</small>
+                            </div>
+                            <span class="template-pack-readonly">只读蓝图</span>
+                        </div>
+                        <div class="template-pack-grid">
+                            <article v-for="pack in templatePacks" :key="pack.id" class="template-pack-card">
+                                <div class="template-pack-card-top">
+                                    <strong>{{ pack.name }}</strong>
+                                    <code>v{{ pack.version }}</code>
+                                </div>
+                                <p>{{ pack.description }}</p>
+                                <div class="template-pack-stats">
+                                    <span>{{ pack.pointPack?.length || 0 }} 个点位</span>
+                                    <span>{{ pack.alarmRules?.length || 0 }} 条报警</span>
+                                    <span>{{ pack.partBindings?.length || 0 }} 个部件</span>
+                                </div>
+                            </article>
+                        </div>
+                    </section>
 
                     <button @click="openCreateDevice" class="btn btn-primary" style="margin-bottom:20px">+ 添加设备</button>
 
@@ -13915,6 +13945,20 @@ button:enabled:active {
 .workshop-loading-state { display: grid; min-height: 280px; margin-top: 14px; place-items: center; color: #667085; background: #f8fafb; border: 1px dashed #cfd8df; border-radius: 14px; font-size: 13px; }
 .line-transform-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
 .line-transform-grid .input { width: 100%; min-width: 0; box-sizing: border-box; }
+.template-pack-library { margin: 18px 0 20px; padding: 16px; border: 1px solid #dfe4ea; border-radius: 14px; background: linear-gradient(135deg, #f8fbfd, #f4f7fa); }
+.template-pack-library-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.template-pack-library-heading strong, .template-pack-library-heading small { display: block; }
+.template-pack-library-heading strong { color: #1d2939; font-size: 15px; }
+.template-pack-library-heading small { margin-top: 4px; color: #667085; font-size: 11px; }
+.template-pack-readonly { flex: 0 0 auto; padding: 5px 9px; color: #175cd3; background: #eff8ff; border: 1px solid #b2ddff; border-radius: 999px; font-size: 10px; font-weight: 600; }
+.template-pack-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+.template-pack-card { min-width: 0; padding: 12px; border: 1px solid #e4e7ec; border-radius: 10px; background: #fff; }
+.template-pack-card-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.template-pack-card-top strong { min-width: 0; overflow: hidden; color: #344054; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.template-pack-card-top code { flex: 0 0 auto; color: #98a2b3; font-size: 9px; }
+.template-pack-card p { min-height: 34px; margin: 8px 0; color: #667085; font-size: 10px; line-height: 1.55; }
+.template-pack-stats { display: flex; flex-wrap: wrap; gap: 6px; color: #475467; font-size: 10px; }
+.template-pack-stats span { padding: 4px 6px; border-radius: 5px; background: #f2f4f7; }
 @media (max-width: 1180px) {
     .workshop-spatial-heading { flex-direction: column; }
     .workshop-spatial-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
@@ -13936,5 +13980,6 @@ button:enabled:active {
     .line-placement-pending-card { align-items: flex-start; }
     .line-placement-pending-action { display: none; }
     .workshop-line-placement-dock { top: 10px; right: 10px; width: min(220px, calc(100% - 20px)); }
+    .template-pack-grid { grid-template-columns: 1fr; }
 }
 </style>

@@ -90,6 +90,8 @@ app.use('/api/platform', require('./routes/platform'));
 app.use('/api/data-sources', require('./routes/dataSources'));
 // 外部排产/生产数据库只读适配层：供数字孪生大屏读取批次、工艺和统计数据。
 app.use('/api/business-data', require('./routes/businessData'));
+// 热处理行业模板、点位包、报警规则和部件绑定清单（只读蓝图）。
+app.use('/api/template-library', require('./routes/templateLibrary'));
 // 受控的本机 MCP 接口：让设计/验收 agent 通过 JSON-RPC 操作现场配置。
 app.use('/api/mcp', require('./routes/mcp')({ port: PORT }));
 

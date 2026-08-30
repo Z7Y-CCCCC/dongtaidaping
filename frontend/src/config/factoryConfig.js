@@ -7,6 +7,7 @@ const factoryConfig = reactive({
     workshops: [],
     lines: [],
     models: [],
+    templatePacks: [],
     platform: {},
     loaded: false
 })
@@ -42,6 +43,7 @@ async function loadConfig() {
         // 由于 config.js 返回的是 workshops -> lines，我们把它拍平赋给 factoryConfig.lines 方便原有逻辑使用
         factoryConfig.lines = factoryConfig.workshops.flatMap(ws => ws.lines)
         factoryConfig.models = data.models || []
+        factoryConfig.templatePacks = data.templatePacks || []
         factoryConfig.platform = data.platform || {}
         factoryConfig.loaded = true
         
@@ -125,6 +127,7 @@ function useFallbackConfig() {
     factoryConfig.lines = fallbackLines
     
     factoryConfig.models = []
+    factoryConfig.templatePacks = []
     factoryConfig.platform = {
         activeProject: { id: 'project_default', name: '离线演示项目' },
         activeScene: {
@@ -164,6 +167,7 @@ export function useFactoryConfig() {
         },
         getAllDevices: () => factoryConfig.lines.flatMap(l => l.devices),
         getPlatform: () => factoryConfig.platform,
+        getTemplatePacks: () => factoryConfig.templatePacks,
         getSetting: (key, defaultValue = '') => factoryConfig.settings[key] || defaultValue,
         getFactoryName: () => factoryConfig.settings.factory_name || '智能热处理数字孪生控制中心'
     }
@@ -296,6 +300,10 @@ export const adminApi = {
         const params = new URLSearchParams({ ...(connectionId ? { connection_id: connectionId } : {}), ...options })
         const suffix = params.toString() ? `?${params}` : ''
         return readApiJson(await fetch(`${API_BASE}/business-data/oee${suffix}`), '读取设备统计失败')
+    },
+    async getHeatTreatmentTemplateLibrary(category = '') {
+        const suffix = category ? `?category=${encodeURIComponent(category)}` : ''
+        return readApiJson(await fetch(`${API_BASE}/template-library${suffix}`), '读取热处理模板库失败')
     },
     async getDatabaseBackups() { return readApiJson(await fetch(`${API_BASE}/database/backups`), '读取数据库备份失败') },
     async saveDatabaseBackupPolicy(config) { return readApiJson(await fetch(`${API_BASE}/database/backups/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(config) }), '保存备份保留策略失败') },

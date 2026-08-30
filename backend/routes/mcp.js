@@ -9,6 +9,7 @@ const {
     publishDraft
 } = require('../services/dashboardDocuments');
 const { mergeBuiltinModels } = require('../services/builtinModels');
+const { getHeatTreatmentTemplatePacks } = require('../services/heatTreatmentTemplates');
 
 const PROTOCOL_VERSIONS = new Set(['2025-06-18', '2025-03-26', '2024-11-05']);
 const SERVER_INFO = {
@@ -208,6 +209,17 @@ function toolDefinitions() {
             inputSchema: {
                 type: 'object',
                 properties: {},
+                additionalProperties: false
+            }
+        },
+        {
+            name: 'get_heat_treatment_template_library',
+            description: '读取热处理数字孪生模板库：设备模板、只读点位包、展示报警规则、模型部件绑定和外部业务数据区块。不会修改现场配置。',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    category: { type: 'string', enum: ['furnace', 'washer'] }
+                },
                 additionalProperties: false
             }
         }
@@ -587,6 +599,12 @@ function createMcpRouter({ port = 3001 } = {}) {
         return { success: checks.every(check => check.passed), checks, checkedAt: new Date().toISOString() };
     }
 
+    async function getHeatTreatmentTemplateLibrary(args = {}) {
+        const category = text(args.category).toLowerCase();
+        const packs = getHeatTreatmentTemplatePacks().filter(pack => !category || pack.category === category);
+        return { success: true, readOnly: true, contractVersion: 1, packs, count: packs.length };
+    }
+
     async function callTool(name, args = {}) {
         switch (name) {
             case 'get_project_state': return result(await loadState());
@@ -599,6 +617,7 @@ function createMcpRouter({ port = 3001 } = {}) {
             case 'publish_dashboard': return result(await publishDashboard(args));
             case 'configure_demo_site': return result(await configureDemoSite(args));
             case 'run_acceptance_checks': return result(await runAcceptanceChecks());
+            case 'get_heat_treatment_template_library': return result(await getHeatTreatmentTemplateLibrary(args));
             default: throw Object.assign(new Error(`未知工具：${name}`), { code: -32602 });
         }
     }
