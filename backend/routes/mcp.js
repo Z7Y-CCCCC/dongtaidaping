@@ -10,6 +10,7 @@ const {
 } = require('../services/dashboardDocuments');
 const { mergeBuiltinModels } = require('../services/builtinModels');
 const { getHeatTreatmentTemplatePacks } = require('../services/heatTreatmentTemplates');
+const { getLicenseStatus } = require('../services/license');
 
 const PROTOCOL_VERSIONS = new Set(['2025-06-18', '2025-03-26', '2024-11-05']);
 const SERVER_INFO = {
@@ -220,6 +221,25 @@ function toolDefinitions() {
                 properties: {
                     category: { type: 'string', enum: ['furnace', 'washer'] }
                 },
+                additionalProperties: false
+            }
+        },
+        {
+            name: 'get_license_status',
+            description: '读取离线许可证状态、客户、有效期和授权功能，不会修改许可证。',
+            inputSchema: {
+                type: 'object',
+                properties: {},
+                additionalProperties: false
+            }
+        },
+        {
+            name: 'install_license',
+            description: '安装已由交付方签名的离线许可证；公钥校验失败时拒绝写入。',
+            inputSchema: {
+                type: 'object',
+                properties: { license: { type: 'object' } },
+                required: ['license'],
                 additionalProperties: false
             }
         }
@@ -594,6 +614,7 @@ function createMcpRouter({ port = 3001 } = {}) {
             { id: 'points', label: '关键点位', passed: state.dataPoints.filter(item => item.device_id === 'demo_furnace_01').length >= 6, detail: `${state.dataPoints.filter(item => item.device_id === 'demo_furnace_01').length} 个点位` },
             { id: 'views', label: '多级视角链路', passed: ['device_detail', 'device_xray', 'device_exploded', 'device_part'].every(id => views.some(view => view.id === id)), detail: views.map(view => view.id).join(' → ') },
             { id: 'part-panel', label: '部件详情面板', passed: state.designer.document?.widgets?.some(widget => widget.id === 'widget_device_part_panel' || widget.groupId === 'group_device_part_detail'), detail: 'selectedPart 上下文' },
+            (() => { const license = getLicenseStatus(); return { id: 'license', label: '离线授权', passed: !license.enforce || license.valid, detail: license.reason }; })(),
             { id: 'release', label: '运行版本', passed: !!state.designer.currentRelease, detail: state.designer.currentRelease?.version || '未发布' }
         ];
         return { success: checks.every(check => check.passed), checks, checkedAt: new Date().toISOString() };
@@ -603,6 +624,11 @@ function createMcpRouter({ port = 3001 } = {}) {
         const category = text(args.category).toLowerCase();
         const packs = getHeatTreatmentTemplatePacks().filter(pack => !category || pack.category === category);
         return { success: true, readOnly: true, contractVersion: 1, packs, count: packs.length };
+    }
+
+    async function installLicense(args = {}) {
+        if (!args.license || typeof args.license !== 'object') throw new Error('license 必须是对象');
+        return await localApi('/api/license', { method: 'PUT', body: JSON.stringify({ license: args.license }) });
     }
 
     async function callTool(name, args = {}) {
@@ -618,6 +644,8 @@ function createMcpRouter({ port = 3001 } = {}) {
             case 'configure_demo_site': return result(await configureDemoSite(args));
             case 'run_acceptance_checks': return result(await runAcceptanceChecks());
             case 'get_heat_treatment_template_library': return result(await getHeatTreatmentTemplateLibrary(args));
+            case 'get_license_status': return result({ success: true, readOnly: true, ...getLicenseStatus() });
+            case 'install_license': return result(await installLicense(args));
             default: throw Object.assign(new Error(`未知工具：${name}`), { code: -32602 });
         }
     }

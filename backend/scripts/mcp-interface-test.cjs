@@ -22,7 +22,7 @@ async function rpc(id, method, params = {}) {
 
     const list = await rpc(2, 'tools/list');
     const toolNames = list.result.tools.map(tool => tool.name);
-    for (const name of ['get_project_state', 'configure_demo_site', 'run_acceptance_checks']) {
+    for (const name of ['get_project_state', 'configure_demo_site', 'run_acceptance_checks', 'get_license_status']) {
         assert(toolNames.includes(name), `工具缺失：${name}`);
     }
 
@@ -33,6 +33,9 @@ async function rpc(id, method, params = {}) {
     const checks = await rpc(4, 'tools/call', { name: 'run_acceptance_checks', arguments: {} });
     assert.equal(checks.result.structuredContent.success, true);
     assert(checks.result.structuredContent.checks.every(check => check.passed), '存在未通过的 MCP 验收项');
+
+    const license = await rpc(5, 'tools/call', { name: 'get_license_status', arguments: {} });
+    assert.equal(license.result.structuredContent.readOnly, true);
 
     console.log(JSON.stringify({ success: true, protocolVersion: init.result.protocolVersion, tools: toolNames.length, checks: checks.result.structuredContent.checks.length }, null, 2));
 })().catch(error => {
