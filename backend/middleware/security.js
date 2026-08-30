@@ -104,7 +104,9 @@ function protectManagementWrites(req, res, next) {
     }
 
     // 安装/替换许可证和安全退出必须能在许可证失效时执行，避免现场被锁死。
-    const licenseExempt = req.path.startsWith('/api/license') || req.path.startsWith('/api/internal');
+    const licenseExempt = req.path.startsWith('/api/license')
+        || req.path.startsWith('/api/internal')
+        || req.path === '/api/release/verify';
     if (!licenseExempt) {
         try {
             assertLicenseForWrite();
