@@ -46,6 +46,7 @@ const {
     startDataSourceMaintenance,
     stopDataSourceMaintenance
 } = require('./services/dataSources');
+const { loadReleaseManifest } = require('./services/releaseManifest');
 
 const app = express();
 app.disable('x-powered-by');
@@ -94,6 +95,10 @@ app.use('/api/business-data', require('./routes/businessData'));
 app.use('/api/template-library', require('./routes/templateLibrary'));
 // 受控的本机 MCP 接口：让设计/验收 agent 通过 JSON-RPC 操作现场配置。
 app.use('/api/mcp', require('./routes/mcp')({ port: PORT }));
+
+app.get('/api/version', (req, res) => {
+    res.json({ success: true, readOnly: true, ...loadReleaseManifest() });
+});
 
 // 仅供 Electron 本机管理“登录后自启”和局域网投屏，路由内部会拒绝非回环请求。
 const runtimeController = { lanDisplay: null };
@@ -422,6 +427,7 @@ app.get('/api/health', (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
+        version: loadReleaseManifest(),
         db: dbStatus,
         engine: engineStatus,
         components: {

@@ -84,6 +84,7 @@ async function main() {
         await waitForHttp(`${origin}/api/health`, 30000);
 
         const health = await fetchResult(`${origin}/api/health`);
+        const version = await fetchResult(`${origin}/api/version`);
         const headers = health.response.headers;
         const disallowedCors = await fetchResult(`${origin}/api/health`, {
             headers: { Origin: 'https://attacker.invalid' }
@@ -120,6 +121,12 @@ async function main() {
                 && !!health.body?.components?.unity
                 && ['ready', 'degraded', 'not_ready'].includes(health.body?.readiness?.status)
                 && typeof health.body?.readiness?.displayReady === 'boolean',
+            versionContract: version.response.status === 200
+                && version.body?.success === true
+                && version.body?.productVersion
+                && version.body?.configurationVersion
+                && Number.isInteger(version.body?.dashboardSchemaVersion)
+                && Number.isInteger(version.body?.businessDataContractVersion),
             healthDoesNotClaimDisplayReadyWithoutUnity: health.body?.components?.unity?.status !== 'connected'
                 ? health.body?.readiness?.displayReady === false
                 : true,
