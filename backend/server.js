@@ -47,6 +47,7 @@ const {
     stopDataSourceMaintenance
 } = require('./services/dataSources');
 const { loadReleaseManifest } = require('./services/releaseManifest');
+const { getLicenseStatus } = require('./services/license');
 
 const app = express();
 app.disable('x-powered-by');
@@ -94,11 +95,12 @@ app.use('/api/business-data', require('./routes/businessData'));
 // 热处理行业模板、点位包、报警规则和部件绑定清单（只读蓝图）。
 app.use('/api/template-library', require('./routes/templateLibrary'));
 app.use('/api/acceptance-report', require('./routes/acceptanceReport'));
+app.use('/api/license', require('./routes/license'));
 // 受控的本机 MCP 接口：让设计/验收 agent 通过 JSON-RPC 操作现场配置。
 app.use('/api/mcp', require('./routes/mcp')({ port: PORT }));
 
 app.get('/api/version', (req, res) => {
-    res.json({ success: true, readOnly: true, ...loadReleaseManifest() });
+    res.json({ success: true, readOnly: true, ...loadReleaseManifest(), license: getLicenseStatus() });
 });
 
 // 仅供 Electron 本机管理“登录后自启”和局域网投屏，路由内部会拒绝非回环请求。
@@ -415,20 +417,23 @@ app.get('/api/health', (req, res) => {
     const unityClients = wsServer?.countClients?.('unity') || 0;
     const webClients = wsServer?.countClients?.('web') || 0;
     const collector = engineStatus?.collectorStatus || {};
+    const license = getLicenseStatus();
     const collectorAgeMs = collector.lastFrameAt ? Math.max(0, Date.now() - Number(collector.lastFrameAt)) : null;
     const dataFresh = collectorAgeMs !== null && collectorAgeMs <= 15000;
     const databaseReady = dbStatus.connected === true;
     const engineReady = !!engineStatus?.mode && ['connected', 'simulating'].includes(String(collector.status || '').toLowerCase());
     const nativeSceneReady = unityClients > 0;
+    const licenseReady = !license.enforce || license.valid;
     const readinessFailures = [];
     if (!databaseReady) readinessFailures.push('database');
     if (!engineReady) readinessFailures.push('data_engine');
     if (!dataFresh) readinessFailures.push('data_freshness');
     if (!nativeSceneReady) readinessFailures.push('unity');
+    if (!licenseReady) readinessFailures.push('license');
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        version: loadReleaseManifest(),
+        version: { ...loadReleaseManifest(), license },
         db: dbStatus,
         engine: engineStatus,
         components: {
@@ -443,11 +448,19 @@ app.get('/api/health', (req, res) => {
                 fresh: dataFresh
             },
             unity: { status: nativeSceneReady ? 'healthy' : 'offline', clients: unityClients },
-            dashboard: { status: webClients > 0 ? 'healthy' : 'idle', clients: webClients }
+            dashboard: { status: webClients > 0 ? 'healthy' : 'idle', clients: webClients },
+            license: {
+                status: licenseReady ? (license.valid ? 'healthy' : 'not_enforced') : 'error',
+                enforce: license.enforce,
+                configured: license.configured,
+                valid: license.valid,
+                expiresAt: license.expiresAt,
+                reason: license.reason
+            }
         },
         readiness: {
             status: readinessFailures.length ? 'degraded' : 'ready',
-            displayReady: nativeSceneReady && dataFresh,
+            displayReady: databaseReady && engineReady && dataFresh && nativeSceneReady && licenseReady,
             failures: readinessFailures
         }
     });

@@ -2,6 +2,7 @@ const express = require('express');
 const { getDb, getDbStatus, getDatabaseBackupStatus } = require('../db/database');
 const { getHeatTreatmentTemplatePacks } = require('../services/heatTreatmentTemplates');
 const { loadReleaseManifest } = require('../services/releaseManifest');
+const { getLicenseStatus } = require('../services/license');
 
 const router = express.Router();
 
@@ -24,6 +25,7 @@ router.get('/', async (req, res) => {
     const collectorAgeMs = collector.lastFrameAt ? Math.max(0, Date.now() - Number(collector.lastFrameAt)) : null;
     const collectorFresh = collectorAgeMs !== null && collectorAgeMs <= 15000;
     const templatePacks = getHeatTreatmentTemplatePacks();
+    const license = getLicenseStatus();
     let releaseCount = null;
     let deviceCount = null;
     try {
@@ -66,6 +68,15 @@ router.get('/', async (req, res) => {
             supported: backupStatus.supported === true,
             type: backupStatus.type || null
         },
+        license: {
+            passed: !license.enforce || license.valid,
+            enforce: license.enforce,
+            configured: license.configured,
+            valid: license.valid,
+            status: license.status,
+            expiresAt: license.expiresAt,
+            reason: license.reason
+        },
         unity: {
             passed: unityClients > 0,
             status: unityClients > 0 ? 'connected' : 'offline',
@@ -73,6 +84,7 @@ router.get('/', async (req, res) => {
         }
     };
     const configurationChecks = ['database', 'collector', 'dashboardRelease', 'deviceConfiguration', 'templateLibrary', 'backup'];
+    if (license.enforce) configurationChecks.push('license');
     const configurationReady = configurationChecks.every(key => checks[key].passed);
     const displayReady = configurationReady && checks.unity.passed;
     res.json({

@@ -15,6 +15,7 @@
 - **点位语音播报**：点位可配置变化、上升沿、下降沿、等于阈值、越上限、越下限等触发规则，支持系统文字转语音、生成 WAV 和上传固定音频。
 - **报警跑马灯**：报警履历支持配置显示条数与时间范围。
 - **数据库可切换**：默认 MySQL/MariaDB；代码保留 SQLite、PostgreSQL、SQL Server 适配入口。
+- **离线授权**：支持 Ed25519 签名许可证、有效期/客户/功能校验；不联网也能完成现场授权。
 
 ## 技术栈
 
@@ -183,6 +184,20 @@ npm run dev
 | `DB_PASSWORD` 或 `MYSQL_PASSWORD` | 密码 |
 | `DB_NAME` 或 `MYSQL_DATABASE` | 数据库名 |
 | `SQLITE_FILE` | SQLite 数据库文件 |
+
+## 离线授权与许可证
+
+许可证是离线 JSON 文件，由交付方使用 Ed25519 私钥签名，现场只保存许可证和公钥，不保存私钥，也不会因断网失效。后端提供只读状态接口 `GET /api/license` 和契约接口 `GET /api/license/contract`；安装新许可证使用本机管理接口 `PUT /api/license`。
+
+正式安装包建议通过环境变量或启动器注入：
+
+```text
+LICENSE_PUBLIC_KEY_FILE=C:\ProgramData\HeatTreatment\license-public-key.pem
+LICENSE_FILE=%APPDATA%\heat-treatment-digital-twin-desktop\data\license.json
+LICENSE_ENFORCE=true
+```
+
+`LICENSE_ENFORCE=true` 时，许可证无效会阻止配置修改，但仍允许读取状态、安装替换许可证和安全退出，避免现场被锁死。开发/演示模式默认不强制授权。许可证的 `features` 用于后续按客户开通只读业务数据、设备数量或高级视角能力。
 
 ## SQLite 断电恢复与备份
 

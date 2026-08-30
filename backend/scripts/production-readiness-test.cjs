@@ -85,6 +85,8 @@ async function main() {
 
         const health = await fetchResult(`${origin}/api/health`);
         const version = await fetchResult(`${origin}/api/version`);
+        const license = await fetchResult(`${origin}/api/license`);
+        const licenseContract = await fetchResult(`${origin}/api/license/contract`);
         const acceptance = await fetchResult(`${origin}/api/acceptance-report`);
         const headers = health.response.headers;
         const disallowedCors = await fetchResult(`${origin}/api/health`, {
@@ -127,7 +129,16 @@ async function main() {
                 && version.body?.productVersion
                 && version.body?.configurationVersion
                 && Number.isInteger(version.body?.dashboardSchemaVersion)
-                && Number.isInteger(version.body?.businessDataContractVersion),
+                && Number.isInteger(version.body?.businessDataContractVersion)
+                && version.body?.license?.format,
+            licenseContract: license.response.status === 200
+                && license.body?.success === true
+                && license.body?.readOnly === true
+                && license.body?.format
+                && licenseContract.response.status === 200
+                && Array.isArray(licenseContract.body?.fields),
+            healthLicenseContract: !!health.body?.components?.license
+                && typeof health.body?.components?.license?.enforce === 'boolean',
             acceptanceReportContract: acceptance.response.status === 200
                 && acceptance.body?.success === true
                 && acceptance.body?.readOnly === true

@@ -196,7 +196,8 @@ const SETTINGS_SUBPAGES = [
     { key: 'runtime', label: '运行与投屏', description: '自启动、电视投屏与本地运行服务' },
     { key: 'database', label: '数据库与备份', description: '连接、外部数据源、备份与恢复' },
     { key: 'performance', label: '客户端性能', description: 'Unity 画质与旧 Web 兼容参数' },
-    { key: 'data', label: '数据通路', description: 'PLC 实时采集或离线模拟模式' }
+    { key: 'data', label: '数据通路', description: 'PLC 实时采集或离线模拟模式' },
+    { key: 'license', label: '授权与版本', description: '离线许可证、有效期与发布信息' }
 ]
 
 function restoreSubpage(value, options, fallback) {
@@ -373,6 +374,21 @@ function getDbStatusBadgeClass(statusText) {
 // ============ 车间管理 ============
 const workshops = ref([])
 const templatePacks = ref([])
+const licenseStatus = reactive({
+    status: 'loading',
+    reason: '正在读取授权状态…',
+    configured: false,
+    valid: false,
+    enforce: false,
+    licenseId: null,
+    customer: null,
+    issuedAt: null,
+    expiresAt: null,
+    features: []
+})
+const licenseText = ref('')
+const licenseBusy = ref(false)
+const licenseMessage = ref('')
 const newWorkshop = reactive({ id: '', name: '' })
 const selectedWorkshopEditorId = ref(storedAdminUiState.selectedWorkshopEditorId || '')
 const workshopSavingId = ref('')
@@ -429,6 +445,55 @@ async function loadWorkshops() {
 async function loadTemplatePacks() {
     const result = await adminApi.getHeatTreatmentTemplateLibrary()
     templatePacks.value = Array.isArray(result?.packs) ? result.packs : []
+}
+
+async function loadLicenseStatus() {
+    try {
+        Object.assign(licenseStatus, await adminApi.getLicenseStatus())
+    } catch (error) {
+        licenseStatus.status = 'error'
+        licenseStatus.reason = error.message || '读取授权状态失败'
+    }
+}
+
+function licenseStatusLabel(status) {
+    return {
+        valid: '有效',
+        not_enforced: '未强制',
+        not_configured: '未配置',
+        unverified: '待验证',
+        expired: '已过期',
+        not_yet_valid: '尚未生效',
+        machine_mismatch: '安装实例不匹配',
+        invalid: '无效',
+        loading: '读取中…',
+        error: '读取失败'
+    }[status] || status || '未知'
+}
+
+async function installLicenseFromText() {
+    if (!licenseText.value.trim()) {
+        licenseMessage.value = '请粘贴交付方提供的许可证 JSON。'
+        return
+    }
+    let license
+    try {
+        license = JSON.parse(licenseText.value)
+    } catch (error) {
+        licenseMessage.value = '许可证不是有效 JSON，请检查复制内容。'
+        return
+    }
+    licenseBusy.value = true
+    licenseMessage.value = '正在校验签名并安装许可证…'
+    try {
+        Object.assign(licenseStatus, await adminApi.installLicense(license))
+        licenseMessage.value = `许可证已安装：${licenseStatus.customer || licenseStatus.licenseId || '未命名客户'}`
+        licenseText.value = ''
+    } catch (error) {
+        licenseMessage.value = error.message || '许可证安装失败'
+    } finally {
+        licenseBusy.value = false
+    }
 }
 
 function selectWorkshopManagementStep(step) {
@@ -4688,7 +4753,7 @@ watch([
 onMounted(async () => {
     window.addEventListener('beforeunload', handleUnsavedCanvasBeforeUnload)
     await loadWorkshops()
-    await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform(), loadTemplatePacks()])
+    await Promise.all([loadLines(), loadDevices(), loadSettings(), loadModels(), loadPlatform(), loadTemplatePacks(), loadLicenseStatus()])
     startRuntimeRefresh()
     loadCastDevices({ silent: true })
     startCastRefresh()
@@ -8848,6 +8913,37 @@ async function openAdminSetupStep(step) {
                             <span>运行模式：{{ formatEngineMode(engineStatus.mode) }}</span>
                             <span>数据状态：{{ engineStatus.plcStatus?.message || '未知' }}</span>
                             <span v-if="engineStatus.collectorStatus?.lastFrameAt">最近帧：{{ new Date(engineStatus.collectorStatus.lastFrameAt).toLocaleTimeString() }}</span>
+                        </div>
+                    </div>
+
+                    <div v-show="settingsSubpage === 'license'" class="settings-section secondary-page-panel license-settings-panel">
+                        <div class="license-heading-row">
+                            <div>
+                                <h3 class="section-title">离线许可证</h3>
+                                <p class="desc">许可证只在本机校验，不上传客户信息；强制授权开启后，许可证失效会保护配置写入。</p>
+                            </div>
+                            <span class="license-status-pill" :class="`license-${licenseStatus.status}`">
+                                {{ licenseStatusLabel(licenseStatus.status) }}
+                            </span>
+                        </div>
+                        <div class="license-summary-grid">
+                            <div><span>客户</span><strong>{{ licenseStatus.customer || '未配置' }}</strong></div>
+                            <div><span>许可证编号</span><strong>{{ licenseStatus.licenseId || '—' }}</strong></div>
+                            <div><span>有效期</span><strong>{{ licenseStatus.expiresAt ? formatBackupTime(licenseStatus.expiresAt) : '—' }}</strong></div>
+                            <div><span>强制授权</span><strong>{{ licenseStatus.enforce ? '已开启' : '未开启（开发/演示）' }}</strong></div>
+                        </div>
+                        <p class="license-reason" :class="{ warning: !licenseStatus.valid && licenseStatus.enforce }">{{ licenseStatus.reason }}</p>
+                        <div class="license-install-card">
+                            <label>安装或替换许可证 JSON
+                                <textarea v-model="licenseText" class="input license-textarea" rows="8" spellcheck="false" placeholder="粘贴交付方提供的签名许可证 JSON"></textarea>
+                            </label>
+                            <div class="form-row license-actions">
+                                <button type="button" class="btn btn-primary" :disabled="licenseBusy || !licenseText.trim()" @click="installLicenseFromText">
+                                    {{ licenseBusy ? '校验中…' : '校验并安装' }}
+                                </button>
+                                <button type="button" class="btn" :disabled="licenseBusy" @click="loadLicenseStatus">刷新状态</button>
+                            </div>
+                            <p v-if="licenseMessage" class="database-backup-message">{{ licenseMessage }}</p>
                         </div>
                     </div>
 
@@ -13402,6 +13498,25 @@ button:enabled:active {
 .render-custom-grid { margin-top: 18px; padding-top: 18px; border-top: 1px solid #e5e5e7; }
 .checkbox-line { display: flex; align-items: center; gap: 8px; min-height: 38px; font-weight: 400; }
 .database-production-notice { margin: 16px 0 0; padding: 11px 13px; color: #173f2b; background: #edf8f1; border-left: 3px solid #24834f; font-size: 13px; line-height: 1.55; }
+.license-settings-panel { margin-bottom: 18px; }
+.license-heading-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.license-heading-row .section-title { margin-bottom: 4px; }
+.license-status-pill { flex: 0 0 auto; padding: 6px 11px; color: #5b5b60; background: #f1f1f3; border: 1px solid #dedee3; border-radius: 999px; font-size: 11px; font-weight: 700; }
+.license-status-pill.license-valid { color: #1f6b3b; background: #edf8f1; border-color: #bfe4ca; }
+.license-status-pill.license-not_enforced { color: #6a5517; background: #fff8df; border-color: #ead58a; }
+.license-status-pill.license-invalid,.license-status-pill.license-expired,.license-status-pill.license-machine_mismatch,.license-status-pill.license-error { color: #9b2c2c; background: #fff1f1; border-color: #efc6c6; }
+.license-summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 18px; }
+.license-summary-grid > div { min-width: 0; padding: 12px 13px; background: #f7f7f8; border: 1px solid #e6e6e9; border-radius: 10px; }
+.license-summary-grid span,.license-summary-grid strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.license-summary-grid span { color: #86868b; font-size: 10px; }
+.license-summary-grid strong { margin-top: 5px; color: #27272a; font-size: 12px; }
+.license-reason { margin: 12px 0 0; color: #6e6e73; font-size: 12px; line-height: 1.5; }
+.license-reason.warning { color: #a33a2b; }
+.license-install-card { margin-top: 18px; padding: 14px; background: #fafafa; border: 1px solid #e5e5e7; border-radius: 12px; }
+.license-install-card label { display: flex; flex-direction: column; gap: 7px; color: #515154; font-size: 12px; }
+.license-textarea { width: 100%; min-height: 150px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; line-height: 1.45; }
+.license-actions { margin-top: 11px; margin-bottom: 0; }
+@media (max-width: 820px) { .license-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .external-data-source-manager { margin-top: 24px; padding: 16px; background: #fff; border: 1px solid #e2e2e5; border-radius: 10px; transition: border-color 180ms ease, box-shadow 180ms ease; }
 .external-data-source-manager.open { border-color: #d5d5da; box-shadow: 0 8px 24px #00000008; }
 .external-data-source-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; }

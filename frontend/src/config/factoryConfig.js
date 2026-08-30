@@ -306,6 +306,15 @@ export const adminApi = {
         return readApiJson(await fetch(`${API_BASE}/template-library${suffix}`), '读取热处理模板库失败')
     },
     async getAcceptanceReport() { return readApiJson(await fetch(`${API_BASE}/acceptance-report`, { cache: 'no-store' }), '读取自动验收报告失败') },
+    async getLicenseStatus() { return readApiJson(await fetch(`${API_BASE}/license`, { cache: 'no-store' }), '读取离线授权状态失败') },
+    async getLicenseContract() { return readApiJson(await fetch(`${API_BASE}/license/contract`, { cache: 'no-store' }), '读取许可证契约失败') },
+    async installLicense(license) {
+        return readApiJson(await fetch(`${API_BASE}/license`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ license })
+        }), '安装离线许可证失败')
+    },
     async getDatabaseBackups() { return readApiJson(await fetch(`${API_BASE}/database/backups`), '读取数据库备份失败') },
     async saveDatabaseBackupPolicy(config) { return readApiJson(await fetch(`${API_BASE}/database/backups/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(config) }), '保存备份保留策略失败') },
     async createDatabaseBackup() { return readApiJson(await fetch(`${API_BASE}/database/backups`, { method: 'POST' }), '创建数据库备份失败') },

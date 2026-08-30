@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const cors = require('cors');
+const { assertLicenseForWrite } = require('../services/license');
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
@@ -91,21 +92,28 @@ function protectManagementWrites(req, res, next) {
         return;
     }
 
-    if (isLoopbackAddress(req.socket.remoteAddress)) {
-        next();
-        return;
-    }
-
+    const loopback = isLoopbackAddress(req.socket.remoteAddress);
     const configuredToken = String(process.env.ADMIN_API_TOKEN || '');
-    if (configuredToken && safeTokenEqual(suppliedAdminToken(req), configuredToken)) {
-        next();
+    const tokenAuthorized = configuredToken && safeTokenEqual(suppliedAdminToken(req), configuredToken);
+    if (!loopback && !tokenAuthorized) {
+        res.status(403).json({
+            success: false,
+            error: '管理修改仅允许在现场电脑本机执行；远程管理需配置 ADMIN_API_TOKEN'
+        });
         return;
     }
 
-    res.status(403).json({
-        success: false,
-        error: '管理修改仅允许在现场电脑本机执行；远程管理需配置 ADMIN_API_TOKEN'
-    });
+    // 安装/替换许可证和安全退出必须能在许可证失效时执行，避免现场被锁死。
+    const licenseExempt = req.path.startsWith('/api/license') || req.path.startsWith('/api/internal');
+    if (!licenseExempt) {
+        try {
+            assertLicenseForWrite();
+        } catch (error) {
+            res.status(402).json({ success: false, code: error.code || 'LICENSE_REQUIRED', error: error.message });
+            return;
+        }
+    }
+    next();
 }
 
 function createOperationRateLimiter(options = {}) {
