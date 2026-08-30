@@ -93,6 +93,7 @@ app.use('/api/data-sources', require('./routes/dataSources'));
 app.use('/api/business-data', require('./routes/businessData'));
 // 热处理行业模板、点位包、报警规则和部件绑定清单（只读蓝图）。
 app.use('/api/template-library', require('./routes/templateLibrary'));
+app.use('/api/acceptance-report', require('./routes/acceptanceReport'));
 // 受控的本机 MCP 接口：让设计/验收 agent 通过 JSON-RPC 操作现场配置。
 app.use('/api/mcp', require('./routes/mcp')({ port: PORT }));
 

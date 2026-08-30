@@ -85,6 +85,7 @@ async function main() {
 
         const health = await fetchResult(`${origin}/api/health`);
         const version = await fetchResult(`${origin}/api/version`);
+        const acceptance = await fetchResult(`${origin}/api/acceptance-report`);
         const headers = health.response.headers;
         const disallowedCors = await fetchResult(`${origin}/api/health`, {
             headers: { Origin: 'https://attacker.invalid' }
@@ -127,6 +128,12 @@ async function main() {
                 && version.body?.configurationVersion
                 && Number.isInteger(version.body?.dashboardSchemaVersion)
                 && Number.isInteger(version.body?.businessDataContractVersion),
+            acceptanceReportContract: acceptance.response.status === 200
+                && acceptance.body?.success === true
+                && acceptance.body?.readOnly === true
+                && typeof acceptance.body?.configurationReady === 'boolean'
+                && typeof acceptance.body?.displayReady === 'boolean'
+                && Array.isArray(acceptance.body?.blockingFailures),
             healthDoesNotClaimDisplayReadyWithoutUnity: health.body?.components?.unity?.status !== 'connected'
                 ? health.body?.readiness?.displayReady === false
                 : true,

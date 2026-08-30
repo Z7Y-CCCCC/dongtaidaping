@@ -305,6 +305,7 @@ export const adminApi = {
         const suffix = category ? `?category=${encodeURIComponent(category)}` : ''
         return readApiJson(await fetch(`${API_BASE}/template-library${suffix}`), '读取热处理模板库失败')
     },
+    async getAcceptanceReport() { return readApiJson(await fetch(`${API_BASE}/acceptance-report`, { cache: 'no-store' }), '读取自动验收报告失败') },
     async getDatabaseBackups() { return readApiJson(await fetch(`${API_BASE}/database/backups`), '读取数据库备份失败') },
     async saveDatabaseBackupPolicy(config) { return readApiJson(await fetch(`${API_BASE}/database/backups/config`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(config) }), '保存备份保留策略失败') },
     async createDatabaseBackup() { return readApiJson(await fetch(`${API_BASE}/database/backups`, { method: 'POST' }), '创建数据库备份失败') },
