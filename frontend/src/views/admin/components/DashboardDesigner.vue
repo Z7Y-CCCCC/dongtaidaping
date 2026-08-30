@@ -30,6 +30,8 @@ const loading = ref(true)
 const saving = ref(false)
 const publishing = ref(false)
 const status = reactive({ tone: 'info', text: '正在读取设计器...' })
+const acceptanceReport = ref(null)
+const acceptanceLoading = ref(false)
 const zoom = ref(0.68)
 const previewMode = ref(false)
 const inspectorTab = ref('content')
@@ -239,6 +241,23 @@ const canvasOuterStyle = computed(() => ({
 function setStatus(text, tone = 'info') {
   status.text = text
   status.tone = tone
+}
+
+async function runAcceptanceReport() {
+  if (acceptanceLoading.value) return
+  acceptanceLoading.value = true
+  try {
+    const result = await adminApi.getAcceptanceReport()
+    if (result?.error) throw new Error(result.error)
+    acceptanceReport.value = result
+    if (result.displayReady) setStatus('自动验收通过：配置、采集器与 Unity 均已就绪', 'success')
+    else if (result.configurationReady) setStatus('配置验收通过：等待 Unity 连接后即可展示', 'warning')
+    else setStatus(`验收未通过：${(result.blockingFailures || []).join('、') || '请查看报告'}`, 'danger')
+  } catch (error) {
+    setStatus(error.message || '自动验收失败', 'danger')
+  } finally {
+    acceptanceLoading.value = false
+  }
 }
 
 function snapshot(value = documentModel.value) {
@@ -1338,6 +1357,7 @@ onBeforeUnmount(() => {
           <option v-for="view in views" :key="view.id" :value="view.id">{{ view.name }}</option>
         </select>
         <span class="toolbar-status" :class="status.tone" :title="status.text">{{ status.text }}</span>
+        <button type="button" class="acceptance-button" :class="{ passed: acceptanceReport?.configurationReady }" :disabled="acceptanceLoading" :title="acceptanceReport ? `阻断项：${(acceptanceReport.blockingFailures || []).join('、') || '无'}` : '运行配置、数据与 Unity 自动验收'" @click="runAcceptanceReport">{{ acceptanceLoading ? '验收中…' : acceptanceReport?.displayReady ? '验收通过' : '自动验收' }}</button>
         <button type="button" :class="{ active: previewMode }" @click="togglePreviewMode">{{ previewMode ? '退出预览' : '预览' }}</button>
         <button type="button" class="save-button" :disabled="saving || !isDirty" @click="saveDraft">{{ saving ? '保存中...' : '保存草稿' }}</button>
         <button type="button" class="publish-button" :disabled="publishing || saving" @click="publishVersion">{{ publishing ? '发布中...' : '保存并发布' }}</button>
@@ -1736,7 +1756,7 @@ onBeforeUnmount(() => {
 .designer-toolbar-group,.designer-toolbar-actions,.canvas-tools { display:flex; align-items:center; gap:5px; }
 .designer-toolbar button,.designer-toolbar select { height:32px; padding:0 10px; border:1px solid rgba(126,178,219,.18); border-radius:8px; color:#cfe2f1; background:rgba(12,28,43,.72); font-size:12px; cursor:pointer; transition:.15s ease; }
 .designer-toolbar button:hover:not(:disabled),.designer-toolbar button.active { color:#fff; border-color:rgba(84,188,255,.46); background:rgba(43,123,181,.28); }.designer-toolbar button:disabled{opacity:.34;cursor:not-allowed}.designer-toolbar .zoom-label{min-width:58px}.toolbar-divider{width:1px;height:20px;margin:0 3px;background:var(--line)}
-.canvas-tools { margin-left:auto; }.designer-toolbar-actions{margin-left:2px}.designer-toolbar .save-button{border-color:rgba(73,187,145,.28);color:#8ce6bf}.designer-toolbar .publish-button{border-color:rgba(66,165,245,.48);color:#fff;background:linear-gradient(135deg,#237abe,#155b91)}
+.canvas-tools { margin-left:auto; }.designer-toolbar-actions{margin-left:2px}.designer-toolbar .save-button{border-color:rgba(73,187,145,.28);color:#8ce6bf}.designer-toolbar .publish-button{border-color:rgba(66,165,245,.48);color:#fff;background:linear-gradient(135deg,#237abe,#155b91)}.designer-toolbar .acceptance-button{border-color:rgba(255,196,95,.38);color:#ffd88c}.designer-toolbar .acceptance-button.passed{border-color:rgba(69,223,155,.38);color:#8ce6bf}
 .toolbar-status{display:block;max-width:230px;overflow:hidden;padding:6px 9px;border:1px solid var(--line);border-radius:7px;color:#879bad;background:rgba(255,255,255,.04);font-size:9px;white-space:nowrap;text-overflow:ellipsis}.toolbar-status.success{color:#45c98f}.toolbar-status.warning{color:#ffc45f}.toolbar-status.danger{color:#ff6864}
 .designer-main { flex:1; min-width:1180px; min-height:0; display:grid; grid-template-columns:236px minmax(680px,1fr) 310px; overflow:hidden; }
 .designer-left-panel,.designer-right-panel { min-height:0; overflow:auto; background:linear-gradient(180deg,#0d1927,#0a1420); scrollbar-color:#29445e transparent; }.designer-left-panel{border-right:1px solid var(--line)}.designer-right-panel{border-left:1px solid var(--line)}
