@@ -1,7 +1,7 @@
 {
   "productName": "热处理数字孪生大屏",
   "productVersion": "2.3.0",
-  "configurationVersion": "1.0.3",
+  "configurationVersion": "1.0.4",
   "dashboardSchemaVersion": 3,
   "businessDataContractVersion": 1,
   "releaseChannel": "source"

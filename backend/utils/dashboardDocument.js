@@ -13,7 +13,7 @@ const DEFAULT_CANVAS = Object.freeze({
 const ALLOWED_WIDGET_TYPES = new Set([
     'text', 'value', 'status', 'trend', 'alarm_list', 'device_list', 'image',
     'container', 'metrics', 'marquee', 'navigation', 'device_label',
-    'diagnostics', 'line_overview_cards'
+    'diagnostics', 'line_overview_cards', 'business_summary'
 ]);
 const UNITY_WIDGET_TYPES = new Set(['navigation', 'device_label', 'diagnostics', 'line_overview_cards']);
 const SYSTEM_VIEW_COMPONENT_IDS = new Set([
@@ -160,7 +160,7 @@ function normalizeDataBinding(source, legacyBinding = {}) {
     const data = objectValue(source, {});
     const binding = objectValue(legacyBinding, {});
     let mode = shortText(data.mode, '', 32);
-    if (!['static', 'plc', 'database', 'runtime'].includes(mode)) {
+    if (!['static', 'plc', 'database', 'runtime', 'business'].includes(mode)) {
         mode = (data.connectionId || binding.connectionId || binding.connection_id)
             ? 'database'
             : (data.pointId || binding.pointId || binding.point_id)
@@ -179,6 +179,9 @@ function normalizeDataBinding(source, legacyBinding = {}) {
         path: mode === 'static' ? '' : shortText(data.path ?? binding.path, '', 255),
         source: mode === 'static' ? '' : shortText(data.source ?? binding.source, '', 128),
         connectionId: shortText(data.connectionId ?? binding.connectionId ?? binding.connection_id, '', 80),
+        businessSection: ['batches', 'compliance', 'oee', 'energy', 'maintenance'].includes(String(data.businessSection ?? binding.businessSection))
+            ? String(data.businessSection ?? binding.businessSection)
+            : 'batches',
         schema: shortText(data.schema ?? binding.schema, '', 255),
         table: shortText(data.table ?? binding.table, '', 255),
         field: shortText(data.field ?? binding.field, '', 255),
@@ -519,6 +522,9 @@ function validateDocument(document, options = {}) {
         if (widget?.data?.readOnly === false) errors.push(`${label} 禁止启用 PLC 写入`);
         if (widget?.data?.mode === 'plc' && (!widget.data.deviceId || !widget.data.pointId)) {
             errors.push(`${label} 的 PLC 绑定必须同时选择设备和只读点位`);
+        }
+        if (widget?.data?.mode === 'business' && !widget.data.connectionId) {
+            errors.push(`${label} 的业务只读组件必须选择外部数据库连接`);
         }
         if (widget?.data?.mode === 'database') {
             const datasets = Array.isArray(widget.data.datasets) && widget.data.datasets.length
