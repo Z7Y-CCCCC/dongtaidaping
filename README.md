@@ -342,6 +342,7 @@ http://127.0.0.1:3001/api/mcp
 - `configure_demo_site`：幂等创建南区热处理示范车间并发布运行版本
 - `upsert_workshop` / `upsert_line` / `upsert_device` / `sync_device_points`：受控写入现场配置
 - `save_dashboard_draft` / `publish_dashboard`：保存或发布低代码大屏
+- `configure_readonly_business_source`：测试并保存排产/生产数据库只读连接，可自动绑定业务摘要组件（支持 `sd_produce_batch` 与 `signal_history + rc_signal` 结构）
 - `set_data_mode`：切换模拟数据或现场 PLC
 - `run_acceptance_checks`：执行数据库、引擎、模型、视角和部件面板验收
 

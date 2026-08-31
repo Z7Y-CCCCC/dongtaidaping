@@ -10,12 +10,14 @@ const MAX_LIMIT = 200;
 const BUSINESS_SECTIONS = Object.freeze({
     batches: {
         label: '批次与工艺执行',
-        sourceTables: ['produce_batch', 'produce_batch_step', 'technology_execution'],
+        // 排产系统当前使用 sd_ 前缀；保留无前缀名称以兼容现场旧版本和
+        // 通用只读数据源。适配器会按顺序探测，不会向外部库写入任何内容。
+        sourceTables: ['sd_produce_batch', 'sd_produce_batch_step', 'produce_batch', 'produce_batch_step', 'technology_execution'],
         description: '只读读取排产系统中的批次、工艺执行和步骤状态'
     },
     compliance: {
         label: '温度/碳势曲线',
-        sourceTables: ['rc_furnace_attr_history'],
+        sourceTables: ['rc_furnace_attr_history', 'signal_history', 'rc_signal'],
         description: '只读读取排产系统归档的温度、碳势等历史信号'
     },
     oee: {
@@ -120,6 +122,16 @@ async function readOptional(connectionId, query, params = []) {
     }
 }
 
+async function readFirstAvailable(readers) {
+    let lastResult = null;
+    for (const reader of readers) {
+        const result = await reader();
+        if (result.available) return result;
+        lastResult = result;
+    }
+    return lastResult || queryError(new Error('外部数据库未提供该类标准数据表'));
+}
+
 function normalizeBatch(row) {
     return {
         id: row.id ?? null,
@@ -183,14 +195,20 @@ async function readBatches(connectionId, options = {}) {
     }
     const top = type === 'sqlserver' ? `TOP ${limit} ` : '';
     const tail = type === 'sqlserver' ? '' : ` LIMIT ${limit}`;
-    const result = await readOptional(connectionId,
+    const result = await readFirstAvailable([
+        ['produce_batch', 'produce_batch_step'],
+        ['sd_produce_batch', 'sd_produce_batch_step']
+    ].map(([batchTable, stepTable]) => () => readOptional(connectionId,
         `SELECT ${top}b.id, b.batch_no, b.batch_name, b.product_name, b.operator,
             b.workpiece_count, b.workpiece_weight, b.template_id, b.status,
             b.current_step, b.progress, b.plan_start_time, b.actual_start_time,
             b.actual_finish_time, b.update_time, b.create_time
-         FROM ${quoteIdentifier('produce_batch', type)} b${where}
+         FROM ${quoteIdentifier(batchTable, type)} b${where.replaceAll(
+             quoteIdentifier('produce_batch_step', type),
+             quoteIdentifier(stepTable, type)
+         )}
          ORDER BY COALESCE(b.update_time, b.create_time) DESC${tail}`,
-        params);
+        params)));
     if (!result.available) return result;
     return { ...result, rows: result.rows.map(normalizeBatch) };
 }
@@ -199,21 +217,22 @@ async function readBatchDetail(connectionId, batchId) {
     const type = sqlDialect(connectionId);
     const id = String(batchId || '').trim();
     if (!/^\d+$/.test(id)) throw new Error('批次ID必须是数字');
-    const batch = await readOptional(connectionId,
+    const batchCandidates = ['produce_batch', 'sd_produce_batch'];
+    const batch = await readFirstAvailable(batchCandidates.map(batchTable => () => readOptional(connectionId,
         `SELECT b.id, b.batch_no, b.batch_name, b.product_name, b.operator,
             b.workpiece_count, b.workpiece_weight, b.template_id, b.status,
             b.current_step, b.progress, b.plan_start_time, b.actual_start_time,
             b.actual_finish_time, b.update_time, b.create_time
-         FROM ${quoteIdentifier('produce_batch', type)} b
+         FROM ${quoteIdentifier(batchTable, type)} b
          WHERE b.id = ${placeholder(type, 1)}`,
-        [Number(id)]);
+        [Number(id)])));
     if (!batch.available || !batch.rows.length) return { ...batch, row: null, steps: [] };
-    const steps = await readOptional(connectionId,
+    const steps = await readFirstAvailable(['produce_batch_step', 'sd_produce_batch_step'].map(stepTable => () => readOptional(connectionId,
         `SELECT id, batch_id, step_index, step_name, furnace_id, furnace_type_id,
             technology_id, actual_begin_time, actual_end_time, status, create_time
-         FROM ${quoteIdentifier('produce_batch_step', type)}
+         FROM ${quoteIdentifier(stepTable, type)}
          WHERE batch_id = ${placeholder(type, 1)} ORDER BY step_index ASC`,
-        [Number(id)]);
+        [Number(id)])));
     return {
         available: true,
         fetchedAt: batch.fetchedAt,
@@ -244,12 +263,41 @@ async function readCompliance(connectionId, options = {}) {
     const limit = boundedLimit(options.limit);
     const top = type === 'sqlserver' ? `TOP ${limit} ` : '';
     const tail = type === 'sqlserver' ? '' : ` LIMIT ${limit}`;
-    const result = await readOptional(connectionId,
+    const canonicalResult = await readOptional(connectionId,
         `SELECT ${top}device_id, signal_id, signal_name, actual_value, batch_id, record_time
          FROM ${quoteIdentifier('rc_furnace_attr_history', type)}
          WHERE ${predicates.join(' AND ')} ORDER BY record_time DESC${tail}`,
         params);
-    return result.available ? { ...result, rows: result.rows.map(normalizeCompliance) } : result;
+    if (canonicalResult.available) {
+        return { ...canonicalResult, rows: canonicalResult.rows.map(normalizeCompliance) };
+    }
+
+    // 排产系统的真实历史表以 signal_id/furnace_id/value 存储，信号名称和
+    // 温度/碳势分类在 rc_signal 中。通过 LEFT JOIN 只读还原统一契约；该
+    // 分支不伪造 batch_id，调用方可据此知道记录没有批次关联。
+    const actualParams = [];
+    const actualPredicates = [];
+    if (options.deviceId) {
+        actualParams.push(String(options.deviceId));
+        actualPredicates.push(`CAST(h.furnace_id AS CHAR) = ${placeholder(type, actualParams.length)}`);
+    }
+    actualParams.push('%温度%');
+    const actualTemperaturePlaceholder = placeholder(type, actualParams.length);
+    actualParams.push('%碳%');
+    const actualCarbonPlaceholder = placeholder(type, actualParams.length);
+    actualPredicates.push(`(s.name LIKE ${actualTemperaturePlaceholder} OR s.name LIKE ${actualCarbonPlaceholder}
+        OR LOWER(s.name) LIKE '%temp%' OR LOWER(s.name) LIKE '%carbon%'
+        OR UPPER(s.signal_category) IN ('TEMPERATURE', 'CARBON', 'CARBON_POTENTIAL'))`);
+    const actualResult = await readOptional(connectionId,
+        `SELECT ${top}h.furnace_id AS device_id, h.signal_id, s.name AS signal_name,
+            h.value AS actual_value, NULL AS batch_id, h.record_time
+         FROM ${quoteIdentifier('signal_history', type)} h
+         LEFT JOIN ${quoteIdentifier('rc_signal', type)} s ON s.id = h.signal_id
+         WHERE ${actualPredicates.join(' AND ')} ORDER BY h.record_time DESC${tail}`,
+        actualParams);
+    return actualResult.available
+        ? { ...actualResult, rows: actualResult.rows.map(normalizeCompliance), sourceTable: 'signal_history' }
+        : canonicalResult;
 }
 
 async function readOee(connectionId, options = {}) {

@@ -11,6 +11,7 @@ const {
 const { mergeBuiltinModels } = require('../services/builtinModels');
 const { getHeatTreatmentTemplatePacks } = require('../services/heatTreatmentTemplates');
 const { getLicenseStatus } = require('../services/license');
+const { saveDataSource, testDataSource } = require('../services/dataSources');
 
 const PROTOCOL_VERSIONS = new Set(['2025-06-18', '2025-03-26', '2024-11-05']);
 const SERVER_INFO = {
@@ -221,6 +222,28 @@ function toolDefinitions() {
                 properties: {
                     category: { type: 'string', enum: ['furnace', 'washer'] }
                 },
+                additionalProperties: false
+            }
+        },
+        {
+            name: 'configure_readonly_business_source',
+            description: '测试并保存排产/生产系统的外部只读数据库连接，可自动把当前业务摘要组件绑定到该数据源；不会向外部数据库写入。',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string', description: '数据源 ID' },
+                    name: { type: 'string', description: '数据源名称' },
+                    type: { type: 'string', enum: ['mysql', 'postgres', 'sqlserver', 'sqlite'] },
+                    host: { type: 'string' },
+                    port: { type: 'integer' },
+                    user: { type: 'string' },
+                    password: { type: 'string' },
+                    database: { type: 'string' },
+                    filename: { type: 'string' },
+                    enabled: { type: 'boolean' },
+                    bindBusinessWidgets: { type: 'boolean', description: '是否自动绑定当前排产业务摘要组件，默认 true' }
+                },
+                required: ['id', 'name', 'type'],
                 additionalProperties: false
             }
         },
@@ -635,6 +658,72 @@ function createMcpRouter({ port = 3001 } = {}) {
         return { success: true, readOnly: true, contractVersion: 1, packs, count: packs.length };
     }
 
+    async function configureReadonlyBusinessSource(args = {}) {
+        const id = identifier(args.id, '数据源 ID', 80);
+        if (id === 'primary') throw new Error('排产业务数据源必须使用独立的只读连接，不能覆盖主配置库');
+        const input = {
+            ...args,
+            id,
+            name: text(args.name),
+            type: text(args.type || 'mysql').toLowerCase(),
+            enabled: args.enabled !== false,
+            readOnly: true
+        };
+        if (!input.name) throw new Error('数据源名称不能为空');
+        const tested = await testDataSource(input);
+        const connection = saveDataSource(input);
+        let binding = { changedWidgets: 0, revision: null, release: null };
+        if (args.bindBusinessWidgets !== false) {
+            const db = await getDb();
+            const designer = await loadDesignerState(db);
+            let changedWidgets = 0;
+            const document = {
+                ...designer.document,
+                widgets: (designer.document.widgets || []).map(widget => {
+                    if (widget?.data?.mode !== 'business') return widget;
+                    changedWidgets += 1;
+                    return {
+                        ...widget,
+                        data: {
+                            ...widget.data,
+                            connectionId: id,
+                            datasets: (Array.isArray(widget.data.datasets) ? widget.data.datasets : [])
+                                .map(dataset => ({ ...dataset, connectionId: id }))
+                        }
+                    };
+                })
+            };
+            if (changedWidgets > 0) {
+                const draft = await saveDraft(db, {
+                    sceneId: designer.scene?.id,
+                    document,
+                    expectedRevision: designer.revision
+                });
+                const published = await publishDraft(db, {
+                    sceneId: designer.scene?.id,
+                    notes: `MCP 绑定外部业务只读数据源：${connection.name}`
+                });
+                binding = {
+                    changedWidgets,
+                    revision: draft.revision,
+                    release: published.release
+                };
+                global.wsServer?.broadcast?.('dashboard_release_changed', {
+                    releaseId: published.release.id,
+                    version: published.release.version,
+                    timestamp: Date.now()
+                });
+            }
+        }
+        return {
+            success: true,
+            readOnly: true,
+            connection,
+            test: { success: tested.success === true },
+            binding
+        };
+    }
+
     async function installLicense(args = {}) {
         if (!args.license || typeof args.license !== 'object') throw new Error('license 必须是对象');
         return await localApi('/api/license', { method: 'PUT', body: JSON.stringify({ license: args.license }) });
@@ -657,6 +746,7 @@ function createMcpRouter({ port = 3001 } = {}) {
             case 'configure_demo_site': return result(await configureDemoSite(args));
             case 'run_acceptance_checks': return result(await runAcceptanceChecks());
             case 'get_heat_treatment_template_library': return result(await getHeatTreatmentTemplateLibrary(args));
+            case 'configure_readonly_business_source': return result(await configureReadonlyBusinessSource(args));
             case 'get_license_status': return result({ success: true, readOnly: true, ...getLicenseStatus() });
             case 'install_license': return result(await installLicense(args));
             case 'get_release_status': return result(await getReleaseStatus());

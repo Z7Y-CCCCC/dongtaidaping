@@ -22,7 +22,7 @@ async function rpc(id, method, params = {}) {
 
     const list = await rpc(2, 'tools/list');
     const toolNames = list.result.tools.map(tool => tool.name);
-    for (const name of ['get_project_state', 'configure_demo_site', 'run_acceptance_checks', 'get_license_status', 'get_release_status']) {
+    for (const name of ['get_project_state', 'configure_demo_site', 'configure_readonly_business_source', 'run_acceptance_checks', 'get_license_status', 'get_release_status']) {
         assert(toolNames.includes(name), `工具缺失：${name}`);
     }
 
